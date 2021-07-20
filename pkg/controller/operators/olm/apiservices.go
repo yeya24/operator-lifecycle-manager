@@ -110,7 +110,7 @@ func (a *Operator) checkAPIServiceResources(csv *v1alpha1.ClusterServiceVersion,
 		secretName := install.SecretName(serviceName)
 		secret, err := a.lister.CoreV1().SecretLister().Secrets(csv.GetNamespace()).Get(secretName)
 		if err != nil {
-			logger.WithField("secret", secretName).Warnf("could not retrieve generated Secret")
+			logger.WithField("secret", secretName).Warnf("could not retrieve generated Secret: %v", err)
 			errs = append(errs, err)
 			continue
 		}
@@ -349,7 +349,7 @@ func (a *Operator) updateDeploymentSpecsWithApiServiceData(csv *v1alpha1.Cluster
 		}
 
 		install.AddDefaultCertVolumeAndVolumeMounts(&depSpec, secret.GetName())
-		depSpec.Template.ObjectMeta.SetAnnotations(map[string]string{install.OLMCAHashAnnotationKey: caHash})
+		install.SetCAAnnotation(&depSpec, caHash)
 		depSpecs[desc.DeploymentName] = depSpec
 	}
 
@@ -376,7 +376,7 @@ func (a *Operator) updateDeploymentSpecsWithApiServiceData(csv *v1alpha1.Cluster
 		}
 		install.AddDefaultCertVolumeAndVolumeMounts(&depSpec, secret.GetName())
 
-		depSpec.Template.ObjectMeta.SetAnnotations(map[string]string{install.OLMCAHashAnnotationKey: caHash})
+		install.SetCAAnnotation(&depSpec, caHash)
 		depSpecs[desc.DeploymentName] = depSpec
 	}
 

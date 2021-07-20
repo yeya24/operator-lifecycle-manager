@@ -29,7 +29,6 @@ import (
 	"time"
 
 	jsonpatch "github.com/evanphx/json-patch"
-	"github.com/go-openapi/spec"
 	"github.com/google/uuid"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -65,11 +64,13 @@ import (
 	"k8s.io/apiserver/pkg/storageversion"
 	"k8s.io/apiserver/pkg/util/feature"
 	utilflowcontrol "k8s.io/apiserver/pkg/util/flowcontrol"
+	flowcontrolrequest "k8s.io/apiserver/pkg/util/flowcontrol/request"
 	"k8s.io/client-go/informers"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/component-base/logs"
 	"k8s.io/klog/v2"
 	openapicommon "k8s.io/kube-openapi/pkg/common"
+	"k8s.io/kube-openapi/pkg/validation/spec"
 	utilsnet "k8s.io/utils/net"
 
 	// install apis
@@ -112,7 +113,7 @@ type Config struct {
 	// to set values and determine whether its allowed
 	AdmissionControl      admission.Interface
 	CorsAllowedOriginList []string
-
+	HSTSDirectives        []string
 	// FlowControl, if not nil, gives priority and fairness to request handling
 	FlowControl utilflowcontrol.Interface
 
@@ -214,6 +215,9 @@ type Config struct {
 	// This is composed of genericapiserver defaultAPIResourceConfig and those parsed from flags.
 	// If not specify any in flags, then genericapiserver will only enable defaultAPIResourceConfig.
 	MergedResourceConfig *serverstore.ResourceConfig
+
+	// RequestWidthEstimator is used to estimate the "width" of the incoming request(s).
+	RequestWidthEstimator flowcontrolrequest.WidthEstimatorFunc
 
 	//===========================================================================
 	// values below here are targets for removal
@@ -338,6 +342,8 @@ func NewConfig(codecs serializer.CodecFactory) *Config {
 		// Default to treating watch as a long-running operation
 		// Generic API servers have no inherent long-running subresources
 		LongRunningFunc:       genericfilters.BasicLongRunningRequestCheck(sets.NewString("watch"), sets.NewString()),
+		RequestWidthEstimator: flowcontrolrequest.DefaultWidthEstimator,
+
 		APIServerID:           id,
 		StorageVersionManager: storageversion.NewDefaultManager(),
 	}
@@ -533,7 +539,7 @@ func (c *RecommendedConfig) Complete() CompletedConfig {
 }
 
 // New creates a new server which logically combines the handling chain with the passed server.
-// name is used to differentiate for logging. The handler chain in particular can be difficult as it starts delgating.
+// name is used to differentiate for logging. The handler chain in particular can be difficult as it starts delegating.
 // delegationTarget may not be nil.
 func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*GenericAPIServer, error) {
 	if c.Serializer == nil {
@@ -593,6 +599,8 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 
 		APIServerID:           c.APIServerID,
 		StorageVersionManager: c.StorageVersionManager,
+
+		Version: c.Version,
 	}
 
 	for {
@@ -636,7 +644,7 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 			}
 		}
 		// TODO: Once we get rid of /healthz consider changing this to post-start-hook.
-		err := s.addReadyzChecks(healthz.NewInformerSyncHealthz(c.SharedInformerFactory))
+		err := s.AddReadyzChecks(healthz.NewInformerSyncHealthz(c.SharedInformerFactory))
 		if err != nil {
 			return nil, err
 		}
@@ -726,7 +734,7 @@ func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 
 	if c.FlowControl != nil {
 		handler = filterlatency.TrackCompleted(handler)
-		handler = genericfilters.WithPriorityAndFairness(handler, c.LongRunningFunc, c.FlowControl)
+		handler = genericfilters.WithPriorityAndFairness(handler, c.LongRunningFunc, c.FlowControl, c.RequestWidthEstimator)
 		handler = filterlatency.TrackStarted(handler, "priorityandfairness")
 	} else {
 		handler = genericfilters.WithMaxInFlightLimit(handler, c.MaxRequestsInFlight, c.MaxMutatingRequestsInFlight, c.LongRunningFunc)
@@ -749,17 +757,26 @@ func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 	handler = filterlatency.TrackStarted(handler, "authentication")
 
 	handler = genericfilters.WithCORS(handler, c.CorsAllowedOriginList, nil, nil, nil, "true")
-	handler = genericfilters.WithTimeoutForNonLongRunningRequests(handler, c.LongRunningFunc, c.RequestTimeout)
+
+	// WithTimeoutForNonLongRunningRequests will call the rest of the request handling in a go-routine with the
+	// context with deadline. The go-routine can keep running, while the timeout logic will return a timeout to the client.
+	handler = genericfilters.WithTimeoutForNonLongRunningRequests(handler, c.LongRunningFunc)
+
+	handler = genericapifilters.WithRequestDeadline(handler, c.AuditBackend, c.AuditPolicyChecker,
+		c.LongRunningFunc, c.Serializer, c.RequestTimeout)
 	handler = genericfilters.WithWaitGroup(handler, c.LongRunningFunc, c.HandlerChainWaitGroup)
-	handler = genericapifilters.WithRequestInfo(handler, c.RequestInfoResolver)
 	if c.SecureServing != nil && !c.SecureServing.DisableHTTP2 && c.GoawayChance > 0 {
 		handler = genericfilters.WithProbabilisticGoaway(handler, c.GoawayChance)
 	}
 	handler = genericapifilters.WithAuditAnnotations(handler, c.AuditBackend, c.AuditPolicyChecker)
 	handler = genericapifilters.WithWarningRecorder(handler)
 	handler = genericapifilters.WithCacheControl(handler)
+	handler = genericfilters.WithHSTS(handler, c.HSTSDirectives)
+	handler = genericfilters.WithHTTPLogging(handler)
+	handler = genericapifilters.WithRequestInfo(handler, c.RequestInfoResolver)
 	handler = genericapifilters.WithRequestReceivedTimestamp(handler)
 	handler = genericfilters.WithPanicRecovery(handler, c.RequestInfoResolver)
+	handler = genericapifilters.WithAuditID(handler)
 	return handler
 }
 
@@ -849,7 +866,7 @@ func AuthorizeClientBearerToken(loopback *restclient.Config, authn *Authenticati
 		Groups: []string{user.SystemPrivilegedGroup},
 	}
 
-	tokenAuthenticator := authenticatorfactory.NewFromTokens(tokens)
+	tokenAuthenticator := authenticatorfactory.NewFromTokens(tokens, authn.APIAudiences)
 	authn.Authenticator = authenticatorunion.New(tokenAuthenticator, authn.Authenticator)
 
 	tokenAuthorizer := authorizerfactory.NewPrivilegedGroups(user.SystemPrivilegedGroup)

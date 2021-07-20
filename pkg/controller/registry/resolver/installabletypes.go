@@ -6,6 +6,7 @@ import (
 
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/resolver/solver"
+	operatorregistry "github.com/operator-framework/operator-registry/pkg/registry"
 )
 
 type BundleInstallable struct {
@@ -54,11 +55,35 @@ func bundleId(bundle, channel string, catalog registry.CatalogKey) solver.Identi
 	return solver.IdentifierFromString(fmt.Sprintf("%s/%s/%s", catalog.String(), channel, bundle))
 }
 
-func NewBundleInstallable(bundle, channel string, catalog registry.CatalogKey, constraints ...solver.Constraint) BundleInstallable {
-	return BundleInstallable{
-		identifier:  bundleId(bundle, channel, catalog),
-		constraints: constraints,
+func NewBundleInstallableFromOperator(o *Operator) (BundleInstallable, error) {
+	src := o.SourceInfo()
+	if src == nil {
+		return BundleInstallable{}, fmt.Errorf("unable to resolve the source of bundle %s", o.Identifier())
 	}
+	id := bundleId(o.Identifier(), o.Channel(), src.Catalog)
+	var constraints []solver.Constraint
+	if src.Catalog.Virtual() && src.Subscription == nil {
+		// CSVs already associated with a Subscription
+		// may be replaced, but freestanding CSVs must
+		// appear in any solution.
+		constraints = append(constraints, PrettyConstraint(
+			solver.Mandatory(),
+			fmt.Sprintf("clusterserviceversion %s exists and is not referenced by a subscription", o.Identifier()),
+		))
+	}
+	for _, p := range o.bundle.GetProperties() {
+		if p.GetType() == operatorregistry.DeprecatedType {
+			constraints = append(constraints, PrettyConstraint(
+				solver.Prohibited(),
+				fmt.Sprintf("bundle %s is deprecated", id),
+			))
+			break
+		}
+	}
+	return BundleInstallable{
+		identifier:  id,
+		constraints: constraints,
+	}, nil
 }
 
 type GenericInstallable struct {

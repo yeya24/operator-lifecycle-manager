@@ -18,11 +18,34 @@ spec:
         app: olm-operator
     spec:
       serviceAccountName: olm-operator-serviceaccount
-      {{- if and .Values.installType (eq .Values.installType "ocp") }}
-      priorityClassName: "system-cluster-critical"
+      {{- if or .Values.olm.tlsSecret .Values.olm.clientCASecret }}
+      volumes: 
+      {{- end }}
+      {{- if .Values.olm.tlsSecret }}
+      - name: srv-cert
+        secret:
+          secretName: {{ .Values.olm.tlsSecret }}
+      {{- end }}
+      {{- if .Values.olm.clientCASecret }}
+      - name: profile-collector-cert
+        secret:
+          secretName: {{ .Values.olm.clientCASecret }}
       {{- end }}
       containers:
         - name: olm-operator
+          {{- if or .Values.olm.tlsSecret .Values.olm.clientCASecret }}
+          volumeMounts:
+          {{- end }}
+          {{- if .Values.olm.tlsSecret }}
+          - name: srv-cert
+            mountPath: "/srv-cert"
+            readOnly: true
+          {{- end }}
+          {{- if .Values.olm.clientCASecret }}
+          - name: profile-collector-cert
+            mountPath: "/profile-collector-cert"
+            readOnly: true
+          {{- end }}
           command:
           - /bin/olm
           args:
@@ -46,35 +69,32 @@ spec:
           - --writePackageServerStatusName
           - {{ .Values.writePackageServerStatusName }}
           {{- end }}
-          {{- if .Values.olm.tlsCertPath }}
+         {{- if .Values.olm.tlsSecret }}
           - --tls-cert
-          - {{ .Values.olm.tlsCertPath }}
-          {{- end }}
-          {{- if .Values.olm.tlsKeyPath }}
+          - /srv-cert/tls.crt
           - --tls-key
-          - {{ .Values.olm.tlsKeyPath }}
+          - /srv-cert/tls.key
+          {{- end }}
+          {{- if .Values.olm.clientCASecret }}
+          - --client-ca
+          - /profile-collector-cert/tls.crt
           {{- end }}
           image: {{ .Values.olm.image.ref }}
           imagePullPolicy: {{ .Values.olm.image.pullPolicy }}
           ports:
             - containerPort: {{ .Values.olm.service.internalPort }}
-            - containerPort: 8081
-              name: metrics
-              protocol: TCP
           livenessProbe:
             httpGet:
               path: /healthz
               port: {{ .Values.olm.service.internalPort }}
+              scheme: {{ if or .Values.olm.tlsSecret .Values.olm.clientCASecret }}HTTPS{{ else }}HTTP{{end}}
           readinessProbe:
             httpGet:
               path: /healthz
               port: {{ .Values.olm.service.internalPort }}
+              scheme: {{ if or .Values.olm.tlsSecret .Values.olm.clientCASecret }}HTTPS{{ else }}HTTP{{end}}
           terminationMessagePolicy: FallbackToLogsOnError
           env:
-        {{ if and .Values.installType (eq .Values.installType "ocp") }}
-          - name: RELEASE_VERSION
-            value: "0.0.1-snapshot"
-        {{ end }}
           - name: OPERATOR_NAMESPACE
             valueFrom:
               fieldRef:
@@ -85,17 +105,6 @@ spec:
           resources:
 {{ toYaml .Values.olm.resources | indent 12 }}
           {{- end}}
-          {{ if and .Values.installType (eq .Values.installType "ocp") }}
-          volumeMounts:
-          - mountPath: /var/run/secrets/serving-cert
-            name: serving-cert
-          {{ end }}
-      {{ if and .Values.installType (eq .Values.installType "ocp") }}
-      volumes:
-      - name: serving-cert
-        secret:
-          secretName: olm-operator-serving-cert
-      {{ end }}
     {{- if .Values.olm.nodeSelector }}
       nodeSelector:
 {{ toYaml .Values.olm.nodeSelector | indent 8 }}

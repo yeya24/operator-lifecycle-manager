@@ -9,12 +9,13 @@ import (
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/types"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8slabels "k8s.io/apimachinery/pkg/labels"
@@ -27,6 +28,7 @@ import (
 
 	v1 "github.com/operator-framework/api/pkg/operators/v1"
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
+	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorclient"
@@ -35,17 +37,471 @@ import (
 )
 
 var _ = Describe("ClusterServiceVersion", func() {
+	HavePhase := func(goal operatorsv1alpha1.ClusterServiceVersionPhase) types.GomegaMatcher {
+		return WithTransform(func(csv *operatorsv1alpha1.ClusterServiceVersion) operatorsv1alpha1.ClusterServiceVersionPhase {
+			return csv.Status.Phase
+		}, Equal(goal))
+	}
+
 	var (
 		c   operatorclient.ClientInterface
 		crc versioned.Interface
 	)
-	BeforeEach(func() {
 
+	BeforeEach(func() {
 		c = newKubeClient()
 		crc = newCRClient()
 	})
+
 	AfterEach(func() {
 		TearDown(testNamespace)
+	})
+
+	When("a CustomResourceDefinition was installed alongside a ClusterServiceVersion", func() {
+		var (
+			ns  corev1.Namespace
+			crd apiextensionsv1.CustomResourceDefinition
+		)
+
+		BeforeEach(func() {
+			ns = corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-namespace-1",
+				},
+			}
+			Expect(ctx.Ctx().Client().Create(context.Background(), &ns)).To(Succeed())
+
+			og := v1.OperatorGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("%s-operatorgroup", ns.GetName()),
+					Namespace: ns.GetName(),
+				},
+				Spec: v1.OperatorGroupSpec{
+					TargetNamespaces: []string{ns.GetName()},
+				},
+			}
+			Expect(ctx.Ctx().Client().Create(context.TODO(), &og)).To(Succeed())
+
+			crd = apiextensionsv1.CustomResourceDefinition{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "tests.example.com",
+					Annotations: map[string]string{
+						"operatorframework.io/installed-alongside-0": fmt.Sprintf("%s/associated-csv", ns.GetName()),
+					},
+				},
+				Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+					Group: "example.com",
+					Scope: apiextensionsv1.ClusterScoped,
+					Names: apiextensionsv1.CustomResourceDefinitionNames{
+						Plural:   "tests",
+						Singular: "test",
+						Kind:     "Test",
+						ListKind: "TestList",
+					},
+					Versions: []apiextensionsv1.CustomResourceDefinitionVersion{{
+						Name:    "v1",
+						Served:  true,
+						Storage: true,
+						Schema: &apiextensionsv1.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+								Type: "object",
+							},
+						},
+					}},
+				},
+			}
+			Expect(ctx.Ctx().Client().Create(context.Background(), &crd)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			Eventually(func() error {
+				return ctx.Ctx().Client().Delete(context.Background(), &ns)
+			}).Should(WithTransform(k8serrors.IsNotFound, BeTrue()))
+
+			Eventually(func() error {
+				return ctx.Ctx().Client().Delete(context.Background(), &crd)
+			}).Should(WithTransform(k8serrors.IsNotFound, BeTrue()))
+		})
+
+		It("can satisfy an associated ClusterServiceVersion's ownership requirement", func() {
+			associated := v1alpha1.ClusterServiceVersion{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "associated-csv",
+					Namespace: ns.GetName(),
+				},
+				Spec: v1alpha1.ClusterServiceVersionSpec{
+					CustomResourceDefinitions: v1alpha1.CustomResourceDefinitions{
+						Owned: []v1alpha1.CRDDescription{{
+							Name:    "tests.example.com",
+							Version: "v1",
+							Kind:    "Test",
+						}},
+					},
+					InstallStrategy: newNginxInstallStrategy(genName("deployment-"), nil, nil),
+					InstallModes: []v1alpha1.InstallMode{
+						{
+							Type:      v1alpha1.InstallModeTypeOwnNamespace,
+							Supported: true,
+						},
+					},
+				},
+			}
+			Expect(ctx.Ctx().Client().Create(context.Background(), &associated)).To(Succeed())
+
+			Eventually(func() ([]v1alpha1.RequirementStatus, error) {
+				if err := ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(&associated), &associated); err != nil {
+					return nil, err
+				}
+				var result []v1alpha1.RequirementStatus
+				for _, s := range associated.Status.RequirementStatus {
+					result = append(result, v1alpha1.RequirementStatus{
+						Group:   s.Group,
+						Version: s.Version,
+						Kind:    s.Kind,
+						Name:    s.Name,
+						Status:  s.Status,
+					})
+				}
+				return result, nil
+			}).Should(ContainElement(
+				v1alpha1.RequirementStatus{
+					Group:   apiextensionsv1.SchemeGroupVersion.Group,
+					Version: apiextensionsv1.SchemeGroupVersion.Version,
+					Kind:    "CustomResourceDefinition",
+					Name:    crd.GetName(),
+					Status:  v1alpha1.RequirementStatusReasonPresent,
+				},
+			))
+		})
+
+		// Without this exception, upgrades can become blocked
+		// when the original CSV's CRD requirement becomes
+		// unsatisfied.
+		It("can satisfy an unassociated ClusterServiceVersion's ownership requirement if replaced by an associated ClusterServiceVersion", func() {
+			unassociated := v1alpha1.ClusterServiceVersion{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "unassociated-csv",
+					Namespace: ns.GetName(),
+				},
+				Spec: v1alpha1.ClusterServiceVersionSpec{
+					CustomResourceDefinitions: v1alpha1.CustomResourceDefinitions{
+						Owned: []v1alpha1.CRDDescription{{
+							Name:    "tests.example.com",
+							Version: "v1",
+							Kind:    "Test",
+						}},
+					},
+					InstallStrategy: newNginxInstallStrategy(genName("deployment-"), nil, nil),
+					InstallModes: []v1alpha1.InstallMode{
+						{
+							Type:      v1alpha1.InstallModeTypeOwnNamespace,
+							Supported: true,
+						},
+					},
+				},
+			}
+			Expect(ctx.Ctx().Client().Create(context.Background(), &unassociated)).To(Succeed())
+
+			associated := v1alpha1.ClusterServiceVersion{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "associated-csv",
+					Namespace: ns.GetName(),
+				},
+				Spec: v1alpha1.ClusterServiceVersionSpec{
+					CustomResourceDefinitions: v1alpha1.CustomResourceDefinitions{
+						Owned: []v1alpha1.CRDDescription{{
+							Name:    "tests.example.com",
+							Version: "v1",
+							Kind:    "Test",
+						}},
+					},
+					InstallStrategy: newNginxInstallStrategy(genName("deployment-"), nil, nil),
+					InstallModes: []v1alpha1.InstallMode{
+						{
+							Type:      v1alpha1.InstallModeTypeOwnNamespace,
+							Supported: true,
+						},
+					},
+					Replaces: unassociated.GetName(),
+				},
+			}
+			Expect(ctx.Ctx().Client().Create(context.Background(), &associated)).To(Succeed())
+
+			Eventually(func() error {
+				return ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(&unassociated), &unassociated)
+			}).Should(WithTransform(k8serrors.IsNotFound, BeTrue()))
+		})
+
+		It("can satisfy an unassociated ClusterServiceVersion's non-ownership requirement", func() {
+			unassociated := v1alpha1.ClusterServiceVersion{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "unassociated-csv",
+					Namespace: ns.GetName(),
+				},
+				Spec: v1alpha1.ClusterServiceVersionSpec{
+					CustomResourceDefinitions: v1alpha1.CustomResourceDefinitions{
+						Required: []v1alpha1.CRDDescription{{
+							Name:    "tests.example.com",
+							Version: "v1",
+							Kind:    "Test",
+						}},
+					},
+					InstallStrategy: newNginxInstallStrategy(genName("deployment-"), nil, nil),
+					InstallModes: []v1alpha1.InstallMode{
+						{
+							Type:      v1alpha1.InstallModeTypeOwnNamespace,
+							Supported: true,
+						},
+					},
+				},
+			}
+			Expect(ctx.Ctx().Client().Create(context.Background(), &unassociated)).To(Succeed())
+
+			Eventually(func() ([]v1alpha1.RequirementStatus, error) {
+				if err := ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(&unassociated), &unassociated); err != nil {
+					return nil, err
+				}
+				var result []v1alpha1.RequirementStatus
+				for _, s := range unassociated.Status.RequirementStatus {
+					result = append(result, v1alpha1.RequirementStatus{
+						Group:   s.Group,
+						Version: s.Version,
+						Kind:    s.Kind,
+						Name:    s.Name,
+						Status:  s.Status,
+					})
+				}
+				return result, nil
+			}).Should(ContainElement(
+				v1alpha1.RequirementStatus{
+					Group:   apiextensionsv1.SchemeGroupVersion.Group,
+					Version: apiextensionsv1.SchemeGroupVersion.Version,
+					Kind:    "CustomResourceDefinition",
+					Name:    crd.GetName(),
+					Status:  v1alpha1.RequirementStatusReasonPresent,
+				},
+			))
+		})
+
+		When("an unassociated ClusterServiceVersion in different namespace owns the same CRD", func() {
+			var (
+				ns corev1.Namespace
+			)
+
+			BeforeEach(func() {
+				ns = corev1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "test-namespace-2",
+					},
+				}
+				Expect(ctx.Ctx().Client().Create(context.Background(), &ns)).To(Succeed())
+
+				og := v1.OperatorGroup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      fmt.Sprintf("%s-operatorgroup", ns.GetName()),
+						Namespace: ns.GetName(),
+					},
+					Spec: v1.OperatorGroupSpec{
+						TargetNamespaces: []string{ns.GetName()},
+					},
+				}
+				Expect(ctx.Ctx().Client().Create(context.TODO(), &og)).To(Succeed())
+			})
+
+			AfterEach(func() {
+				Eventually(func() error {
+					return ctx.Ctx().Client().Delete(context.Background(), &ns)
+				}).Should(WithTransform(k8serrors.IsNotFound, BeTrue()))
+			})
+
+			It("can satisfy the unassociated ClusterServiceVersion's ownership requirement", func() {
+				associated := v1alpha1.ClusterServiceVersion{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "associated-csv",
+						Namespace: ns.GetName(),
+					},
+					Spec: v1alpha1.ClusterServiceVersionSpec{
+						CustomResourceDefinitions: v1alpha1.CustomResourceDefinitions{
+							Owned: []v1alpha1.CRDDescription{{
+								Name:    "tests.example.com",
+								Version: "v1",
+								Kind:    "Test",
+							}},
+						},
+						InstallStrategy: newNginxInstallStrategy(genName("deployment-"), nil, nil),
+						InstallModes: []v1alpha1.InstallMode{
+							{
+								Type:      v1alpha1.InstallModeTypeOwnNamespace,
+								Supported: true,
+							},
+						},
+					},
+				}
+				Expect(ctx.Ctx().Client().Create(context.Background(), &associated)).To(Succeed())
+
+				unassociated := v1alpha1.ClusterServiceVersion{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "unassociated-csv",
+						Namespace: ns.GetName(),
+					},
+					Spec: v1alpha1.ClusterServiceVersionSpec{
+						CustomResourceDefinitions: v1alpha1.CustomResourceDefinitions{
+							Owned: []v1alpha1.CRDDescription{{
+								Name:    "tests.example.com",
+								Version: "v1",
+								Kind:    "Test",
+							}},
+						},
+						InstallStrategy: newNginxInstallStrategy(genName("deployment-"), nil, nil),
+						InstallModes: []v1alpha1.InstallMode{
+							{
+								Type:      v1alpha1.InstallModeTypeOwnNamespace,
+								Supported: true,
+							},
+						},
+					},
+				}
+				Expect(ctx.Ctx().Client().Create(context.Background(), &unassociated)).To(Succeed())
+
+				Eventually(func() ([]v1alpha1.RequirementStatus, error) {
+					if err := ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(&unassociated), &unassociated); err != nil {
+						return nil, err
+					}
+					var result []v1alpha1.RequirementStatus
+					for _, s := range unassociated.Status.RequirementStatus {
+						result = append(result, v1alpha1.RequirementStatus{
+							Group:   s.Group,
+							Version: s.Version,
+							Kind:    s.Kind,
+							Name:    s.Name,
+							Status:  s.Status,
+						})
+					}
+					return result, nil
+				}).Should(ContainElement(
+					v1alpha1.RequirementStatus{
+						Group:   apiextensionsv1.SchemeGroupVersion.Group,
+						Version: apiextensionsv1.SchemeGroupVersion.Version,
+						Kind:    "CustomResourceDefinition",
+						Name:    crd.GetName(),
+						Status:  v1alpha1.RequirementStatusReasonPresent,
+					},
+				))
+			})
+		})
+	})
+
+	When("a csv exists specifying two replicas with one max unavailable", func() {
+		var (
+			csv v1alpha1.ClusterServiceVersion
+		)
+
+		const (
+			TestReadinessGate = "operatorframework.io/test-readiness-gate"
+		)
+
+		BeforeEach(func() {
+			csv = v1alpha1.ClusterServiceVersion{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "test-csv",
+					Namespace:    testNamespace,
+				},
+				Spec: v1alpha1.ClusterServiceVersionSpec{
+					InstallStrategy: operatorsv1alpha1.NamedInstallStrategy{
+						StrategyName: operatorsv1alpha1.InstallStrategyNameDeployment,
+						StrategySpec: operatorsv1alpha1.StrategyDetailsDeployment{
+							DeploymentSpecs: []operatorsv1alpha1.StrategyDeploymentSpec{
+								{
+									Name: "deployment",
+									Spec: appsv1.DeploymentSpec{
+										Strategy: appsv1.DeploymentStrategy{
+											Type: appsv1.RollingUpdateDeploymentStrategyType,
+											RollingUpdate: &appsv1.RollingUpdateDeployment{
+												MaxUnavailable: &[]intstr.IntOrString{intstr.FromInt(1)}[0],
+											},
+										},
+										Selector: &metav1.LabelSelector{
+											MatchLabels: map[string]string{"app": "foobar"},
+										},
+										Replicas: &[]int32{2}[0],
+										Template: corev1.PodTemplateSpec{
+											ObjectMeta: metav1.ObjectMeta{
+												Labels: map[string]string{"app": "foobar"},
+											},
+											Spec: corev1.PodSpec{
+												Containers: []corev1.Container{
+													{
+														Name:  "foobar",
+														Image: *dummyImage,
+													},
+												},
+												ReadinessGates: []corev1.PodReadinessGate{
+													{ConditionType: TestReadinessGate},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					InstallModes: []v1alpha1.InstallMode{{
+						Type:      v1alpha1.InstallModeTypeAllNamespaces,
+						Supported: true,
+					}},
+				},
+			}
+			Expect(ctx.Ctx().Client().Create(context.Background(), &csv)).To(Succeed())
+
+			Eventually(func() (*v1alpha1.ClusterServiceVersion, error) {
+				var ps corev1.PodList
+				if err := ctx.Ctx().Client().List(context.Background(), &ps, client.MatchingLabels{"app": "foobar"}); err != nil {
+					return nil, err
+				}
+
+				if len(ps.Items) != 2 {
+					return nil, fmt.Errorf("%d pods match deployment selector, want %d", len(ps.Items), 2)
+				}
+
+				for _, pod := range ps.Items {
+					index := -1
+					for i, c := range pod.Status.Conditions {
+						if c.Type == TestReadinessGate {
+							index = i
+							break
+						}
+					}
+					if index == -1 {
+						index = len(pod.Status.Conditions)
+						pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{Type: TestReadinessGate})
+					}
+					if pod.Status.Conditions[index].Status == corev1.ConditionTrue {
+						continue
+					}
+					pod.Status.Conditions[index].Status = corev1.ConditionTrue
+					if err := ctx.Ctx().Client().Status().Update(context.Background(), &pod); err != nil {
+						return nil, err
+					}
+				}
+
+				if err := ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(&csv), &csv); err != nil {
+					return nil, err
+				}
+				return &csv, nil
+			}).Should(HavePhase(operatorsv1alpha1.CSVPhaseSucceeded))
+		})
+
+		It("remains in phase Succeeded when only one pod is available", func() {
+			var ps corev1.PodList
+			Expect(ctx.Ctx().Client().List(context.Background(), &ps, client.MatchingLabels{"app": "foobar"})).To(Succeed())
+			Expect(ps.Items).To(Not(BeEmpty()))
+
+			Expect(ctx.Ctx().Client().Delete(context.Background(), &ps.Items[0])).To(Succeed())
+
+			Consistently(func() (*operatorsv1alpha1.ClusterServiceVersion, error) {
+				return &csv, ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(&csv), &csv)
+			}).Should(HavePhase(operatorsv1alpha1.CSVPhaseSucceeded))
+		})
 	})
 
 	When("a copied csv exists", func() {
@@ -423,15 +879,27 @@ var _ = Describe("ClusterServiceVersion", func() {
 				Name: crdName,
 			},
 			Spec: apiextensions.CustomResourceDefinitionSpec{
-				Group:   "cluster.com",
-				Version: "v1alpha1",
+				Group: "cluster.com",
+				Versions: []apiextensions.CustomResourceDefinitionVersion{
+					{
+						Name:    "v1alpha1",
+						Served:  true,
+						Storage: true,
+						Schema: &apiextensions.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+								Type:        "object",
+								Description: "my crd schema",
+							},
+						},
+					},
+				},
 				Names: apiextensions.CustomResourceDefinitionNames{
 					Plural:   crdPlural,
 					Singular: crdPlural,
 					Kind:     crdPlural,
 					ListKind: "list" + crdPlural,
 				},
-				Scope: "Namespaced",
+				Scope: apiextensions.NamespaceScoped,
 			},
 		})
 		Expect(err).ShouldNot(HaveOccurred())
@@ -750,15 +1218,27 @@ var _ = Describe("ClusterServiceVersion", func() {
 				Name: crdName,
 			},
 			Spec: apiextensions.CustomResourceDefinitionSpec{
-				Group:   "cluster.com",
-				Version: "v1alpha1",
+				Group: "cluster.com",
+				Versions: []apiextensions.CustomResourceDefinitionVersion{
+					{
+						Name:    "v1alpha1",
+						Served:  true,
+						Storage: true,
+						Schema: &apiextensions.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+								Type:        "object",
+								Description: "my crd schema",
+							},
+						},
+					},
+				},
 				Names: apiextensions.CustomResourceDefinitionNames{
 					Plural:   crdPlural,
 					Singular: crdPlural,
 					Kind:     crdPlural,
 					ListKind: "list" + crdPlural,
 				},
-				Scope: "Namespaced",
+				Scope: apiextensions.NamespaceScoped,
 			},
 		}
 		crd.SetOwnerReferences([]metav1.OwnerReference{{
@@ -1881,15 +2361,27 @@ var _ = Describe("ClusterServiceVersion", func() {
 				Name: crdName,
 			},
 			Spec: apiextensions.CustomResourceDefinitionSpec{
-				Group:   "cluster.com",
-				Version: "v1alpha1",
+				Group: "cluster.com",
+				Versions: []apiextensions.CustomResourceDefinitionVersion{
+					{
+						Name:    "v1alpha1",
+						Served:  true,
+						Storage: true,
+						Schema: &apiextensions.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+								Type:        "object",
+								Description: "my crd schema",
+							},
+						},
+					},
+				},
 				Names: apiextensions.CustomResourceDefinitionNames{
 					Plural:   crdPlural,
 					Singular: crdPlural,
 					Kind:     crdPlural,
 					ListKind: "list" + crdPlural,
 				},
-				Scope: "Namespaced",
+				Scope: apiextensions.NamespaceScoped,
 			},
 		})
 
@@ -2061,15 +2553,27 @@ var _ = Describe("ClusterServiceVersion", func() {
 				Name: crdName,
 			},
 			Spec: apiextensions.CustomResourceDefinitionSpec{
-				Group:   "cluster.com",
-				Version: "v1alpha1",
+				Group: "cluster.com",
+				Versions: []apiextensions.CustomResourceDefinitionVersion{
+					{
+						Name:    "v1alpha1",
+						Served:  true,
+						Storage: true,
+						Schema: &apiextensions.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+								Type:        "object",
+								Description: "my crd schema",
+							},
+						},
+					},
+				},
 				Names: apiextensions.CustomResourceDefinitionNames{
 					Plural:   crdPlural,
 					Singular: crdPlural,
 					Kind:     crdPlural,
 					ListKind: "list" + crdPlural,
 				},
-				Scope: "Namespaced",
+				Scope: apiextensions.NamespaceScoped,
 			},
 		})
 		Expect(err).ShouldNot(HaveOccurred())
@@ -2245,6 +2749,12 @@ var _ = Describe("ClusterServiceVersion", func() {
 						Name:    "v1alpha1",
 						Served:  true,
 						Storage: true,
+						Schema: &apiextensions.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+								Type:        "object",
+								Description: "my crd schema",
+							},
+						},
 					},
 				},
 				Names: apiextensions.CustomResourceDefinitionNames{
@@ -2253,7 +2763,7 @@ var _ = Describe("ClusterServiceVersion", func() {
 					Kind:     crdPlural,
 					ListKind: "list" + crdPlural,
 				},
-				Scope: "Namespaced",
+				Scope: apiextensions.NamespaceScoped,
 			},
 		})
 		Expect(err).ShouldNot(HaveOccurred())
@@ -2423,15 +2933,27 @@ var _ = Describe("ClusterServiceVersion", func() {
 				Name: crdName,
 			},
 			Spec: apiextensions.CustomResourceDefinitionSpec{
-				Group:   "cluster.com",
-				Version: "v1alpha1",
+				Group: "cluster.com",
+				Versions: []apiextensions.CustomResourceDefinitionVersion{
+					{
+						Name:    "v1alpha1",
+						Served:  true,
+						Storage: true,
+						Schema: &apiextensions.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+								Type:        "object",
+								Description: "my crd schema",
+							},
+						},
+					},
+				},
 				Names: apiextensions.CustomResourceDefinitionNames{
 					Plural:   crdPlural,
 					Singular: crdPlural,
 					Kind:     crdPlural,
 					ListKind: "list" + crdPlural,
 				},
-				Scope: "Namespaced",
+				Scope: apiextensions.NamespaceScoped,
 			},
 		})
 
@@ -2577,11 +3099,23 @@ var _ = Describe("ClusterServiceVersion", func() {
 						Name:    "v1alpha1",
 						Served:  true,
 						Storage: true,
+						Schema: &apiextensions.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+								Type:        "object",
+								Description: "my crd schema",
+							},
+						},
 					},
 					{
 						Name:    "v1alpha2",
 						Served:  true,
 						Storage: false,
+						Schema: &apiextensions.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+								Type:        "object",
+								Description: "my crd schema",
+							},
+						},
 					},
 				},
 				Names: apiextensions.CustomResourceDefinitionNames{
@@ -2590,7 +3124,7 @@ var _ = Describe("ClusterServiceVersion", func() {
 					Kind:     crdPlural,
 					ListKind: "list" + crdPlural,
 				},
-				Scope: "Namespaced",
+				Scope: apiextensions.NamespaceScoped,
 			},
 		})
 		Expect(err).ShouldNot(HaveOccurred())
@@ -2848,15 +3382,27 @@ var _ = Describe("ClusterServiceVersion", func() {
 				Name: crdName,
 			},
 			Spec: apiextensions.CustomResourceDefinitionSpec{
-				Group:   "cluster.com",
-				Version: "v1alpha1",
+				Group: "cluster.com",
+				Versions: []apiextensions.CustomResourceDefinitionVersion{
+					{
+						Name:    "v1alpha1",
+						Served:  true,
+						Storage: true,
+						Schema: &apiextensions.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+								Type:        "object",
+								Description: "my crd schema",
+							},
+						},
+					},
+				},
 				Names: apiextensions.CustomResourceDefinitionNames{
 					Plural:   crdPlural,
 					Singular: crdPlural,
 					Kind:     crdPlural,
 					ListKind: "list" + crdPlural,
 				},
-				Scope: "Namespaced",
+				Scope: apiextensions.NamespaceScoped,
 			},
 		})
 		Expect(err).ShouldNot(HaveOccurred())
@@ -3000,15 +3546,27 @@ var _ = Describe("ClusterServiceVersion", func() {
 				Name: crdName,
 			},
 			Spec: apiextensions.CustomResourceDefinitionSpec{
-				Group:   "cluster.com",
-				Version: "v1alpha1",
+				Group: "cluster.com",
+				Versions: []apiextensions.CustomResourceDefinitionVersion{
+					{
+						Name:    "v1alpha1",
+						Served:  true,
+						Storage: true,
+						Schema: &apiextensions.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+								Type:        "object",
+								Description: "my crd schema",
+							},
+						},
+					},
+				},
 				Names: apiextensions.CustomResourceDefinitionNames{
 					Plural:   crdPlural,
 					Singular: crdPlural,
 					Kind:     crdPlural,
 					ListKind: "list" + crdPlural,
 				},
-				Scope: "Namespaced",
+				Scope: apiextensions.NamespaceScoped,
 			},
 		})
 		defer cleanupCRD()
@@ -3218,15 +3776,27 @@ var _ = Describe("ClusterServiceVersion", func() {
 				Name: crdName,
 			},
 			Spec: apiextensions.CustomResourceDefinitionSpec{
-				Group:   "cluster.com",
-				Version: "v1alpha1",
+				Group: "cluster.com",
+				Versions: []apiextensions.CustomResourceDefinitionVersion{
+					{
+						Name:    "v1alpha1",
+						Served:  true,
+						Storage: true,
+						Schema: &apiextensions.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+								Type:        "object",
+								Description: "my crd schema",
+							},
+						},
+					},
+				},
 				Names: apiextensions.CustomResourceDefinitionNames{
 					Plural:   crdPlural,
 					Singular: crdPlural,
 					Kind:     crdPlural,
 					ListKind: "list" + crdPlural,
 				},
-				Scope: "Namespaced",
+				Scope: apiextensions.NamespaceScoped,
 			},
 		})
 		Expect(err).ShouldNot(HaveOccurred())
@@ -3663,13 +4233,13 @@ func createCSV(c operatorclient.ClientInterface, crc versioned.Interface, csv v1
 
 func buildCRDCleanupFunc(c operatorclient.ClientInterface, crdName string) cleanupFunc {
 	return func() {
-		err := c.ApiextensionsInterface().ApiextensionsV1beta1().CustomResourceDefinitions().Delete(context.TODO(), crdName, *metav1.NewDeleteOptions(immediateDeleteGracePeriod))
+		err := c.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Delete(context.TODO(), crdName, *metav1.NewDeleteOptions(immediateDeleteGracePeriod))
 		if err != nil {
 			fmt.Println(err)
 		}
 
 		waitForDelete(func() error {
-			_, err := c.ApiextensionsInterface().ApiextensionsV1beta1().CustomResourceDefinitions().Get(context.TODO(), crdName, metav1.GetOptions{})
+			_, err := c.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), crdName, metav1.GetOptions{})
 			return err
 		})
 	}
@@ -3690,18 +4260,18 @@ func buildAPIServiceCleanupFunc(c operatorclient.ClientInterface, apiServiceName
 }
 
 func createCRD(c operatorclient.ClientInterface, crd apiextensions.CustomResourceDefinition) (cleanupFunc, error) {
-	out := &v1beta1.CustomResourceDefinition{}
+	out := &apiextensionsv1.CustomResourceDefinition{}
 	scheme := runtime.NewScheme()
 	if err := apiextensions.AddToScheme(scheme); err != nil {
 		return nil, err
 	}
-	if err := v1beta1.AddToScheme(scheme); err != nil {
+	if err := apiextensionsv1.AddToScheme(scheme); err != nil {
 		return nil, err
 	}
 	if err := scheme.Convert(&crd, out, nil); err != nil {
 		return nil, err
 	}
-	_, err := c.ApiextensionsInterface().ApiextensionsV1beta1().CustomResourceDefinitions().Create(context.TODO(), out, metav1.CreateOptions{})
+	_, err := c.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Create(context.TODO(), out, metav1.CreateOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -3775,7 +4345,7 @@ func newMockExtServerDeployment(labelName string, mGVKs []mockGroupVersionKind) 
 	for _, mGVK := range mGVKs {
 		containers = append(containers, corev1.Container{
 			Name:    genName(mGVK.Name),
-			Image:   "quay.io/coreos/mock-extension-apiserver:master",
+			Image:   "quay.io/operator-framework/mock-extension-apiserver:master",
 			Command: []string{"/bin/mock-extension-apiserver"},
 			Args: []string{
 				"-v=4",

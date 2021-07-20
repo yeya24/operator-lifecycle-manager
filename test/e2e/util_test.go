@@ -16,7 +16,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	extScheme "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/scheme"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -521,6 +520,30 @@ func buildServiceAccountCleanupFunc(t GinkgoTInterface, c operatorclient.ClientI
 	}
 }
 
+func createInvalidGRPCCatalogSource(crc versioned.Interface, name, namespace string) (*v1alpha1.CatalogSource, cleanupFunc) {
+
+	catalogSource := &v1alpha1.CatalogSource{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       v1alpha1.CatalogSourceKind,
+			APIVersion: v1alpha1.CatalogSourceCRDAPIVersion,
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: v1alpha1.CatalogSourceSpec{
+			SourceType: "grpc",
+			Image:      "localhost:0/not/exists:catsrc",
+		},
+	}
+
+	ctx.Ctx().Logf("Creating catalog source %s in namespace %s...", name, namespace)
+	catalogSource, err := crc.OperatorsV1alpha1().CatalogSources(namespace).Create(context.TODO(), catalogSource, metav1.CreateOptions{})
+	Expect(err).ToNot(HaveOccurred())
+	ctx.Ctx().Logf("Catalog source %s created", name)
+	return catalogSource, buildCatalogSourceCleanupFunc(crc, namespace, catalogSource)
+}
+
 func createInternalCatalogSource(c operatorclient.ClientInterface, crc versioned.Interface, name, namespace string, manifests []registry.PackageManifest, crds []apiextensions.CustomResourceDefinition, csvs []v1alpha1.ClusterServiceVersion) (*v1alpha1.CatalogSource, cleanupFunc) {
 	configMap, configMapCleanup := createConfigMapForCatalogData(c, name, namespace, manifests, crds, csvs)
 
@@ -539,7 +562,6 @@ func createInternalCatalogSource(c operatorclient.ClientInterface, crc versioned
 			ConfigMap:  configMap.GetName(),
 		},
 	}
-	catalogSource.SetNamespace(namespace)
 
 	ctx.Ctx().Logf("Creating catalog source %s in namespace %s...", name, namespace)
 	catalogSource, err := crc.OperatorsV1alpha1().CatalogSources(namespace).Create(context.TODO(), catalogSource, metav1.CreateOptions{})
@@ -723,13 +745,13 @@ func serializeCRD(crd apiextensions.CustomResourceDefinition) string {
 
 	Expect(extScheme.AddToScheme(scheme)).Should(Succeed())
 	Expect(k8sscheme.AddToScheme(scheme)).Should(Succeed())
-	Expect(v1beta1.AddToScheme(scheme)).Should(Succeed())
+	Expect(apiextensionsv1.AddToScheme(scheme)).Should(Succeed())
 
-	out := &v1beta1.CustomResourceDefinition{}
+	out := &apiextensionsv1.CustomResourceDefinition{}
 	Expect(scheme.Convert(&crd, out, nil)).To(Succeed())
 	out.TypeMeta = metav1.TypeMeta{
 		Kind:       "CustomResourceDefinition",
-		APIVersion: "apiextensions.k8s.io/v1beta1",
+		APIVersion: "apiextensions.k8s.io/v1",
 	}
 
 	// set up object serializer

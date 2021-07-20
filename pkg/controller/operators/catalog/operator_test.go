@@ -13,6 +13,8 @@ import (
 	"testing/quick"
 	"time"
 
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/time/rate"
@@ -30,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilclock "k8s.io/apimachinery/pkg/util/clock"
+	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/apiserver/pkg/storage/names"
 	fakedynamic "k8s.io/client-go/dynamic/fake"
@@ -163,12 +166,12 @@ func TestSyncInstallPlanUnhappy(t *testing.T) {
 	)
 
 	tests := []struct {
-		testName      string
-		err           error
-		in            *v1alpha1.InstallPlan
-		expectedPhase v1alpha1.InstallPlanPhase
-
-		clientObjs []runtime.Object
+		testName          string
+		err               error
+		in                *v1alpha1.InstallPlan
+		expectedPhase     v1alpha1.InstallPlanPhase
+		expectedCondition *v1alpha1.InstallPlanCondition
+		clientObjs        []runtime.Object
 	}{
 		{
 			testName:      "NoStatus",
@@ -177,18 +180,22 @@ func TestSyncInstallPlanUnhappy(t *testing.T) {
 			in:            installPlan("p", namespace, v1alpha1.InstallPlanPhaseNone),
 		},
 		{
-			// This checks that an installplan is marked as failed when no operatorgroup is present
+			// This checks that an installplan's status.Condition contains a condition with error message when no operatorgroup is present
 			testName:      "HasSteps/NoOperatorGroup",
-			err:           nil,
-			expectedPhase: v1alpha1.InstallPlanPhaseFailed,
-			in:            ipWithSteps,
+			err:           fmt.Errorf("attenuated service account query failed - no operator group found that is managing this namespace"),
+			expectedPhase: v1alpha1.InstallPlanPhaseInstalling,
+			expectedCondition: &v1alpha1.InstallPlanCondition{Type: v1alpha1.InstallPlanInstalled, Status: corev1.ConditionFalse, Reason: v1alpha1.InstallPlanReasonInstallCheckFailed,
+				Message: "no operator group found that is managing this namespace"},
+			in: ipWithSteps,
 		},
 		{
-			// This checks that an installplan is marked as failed when multiple operator groups are present for the same namespace
+			// This checks that an installplan's status.Condition contains a condition with error message when multiple operator groups are present for the same namespace
 			testName:      "HasSteps/TooManyOperatorGroups",
-			err:           nil,
-			expectedPhase: v1alpha1.InstallPlanPhaseFailed,
+			err:           fmt.Errorf("attenuated service account query failed - more than one operator group(s) are managing this namespace count=2"),
+			expectedPhase: v1alpha1.InstallPlanPhaseInstalling,
 			in:            ipWithSteps,
+			expectedCondition: &v1alpha1.InstallPlanCondition{Type: v1alpha1.InstallPlanInstalled, Status: corev1.ConditionFalse, Reason: v1alpha1.InstallPlanReasonInstallCheckFailed,
+				Message: "more than one operator group(s) are managing this namespace count=2"},
 			clientObjs: []runtime.Object{
 				operatorGroup("og1", "sa", namespace,
 					&corev1.ObjectReference{
@@ -205,11 +212,13 @@ func TestSyncInstallPlanUnhappy(t *testing.T) {
 			},
 		},
 		{
-			// This checks that an installplan is marked as failed when no service account is synced for the operator group, i.e the service account ref doesn't exist
+			// This checks that an installplan's status.Condition contains a condition with error message when no service account is synced for the operator group, i.e the service account ref doesn't exist
 			testName:      "HasSteps/NonExistentServiceAccount",
-			err:           nil,
-			expectedPhase: v1alpha1.InstallPlanPhaseFailed,
-			in:            ipWithSteps,
+			err:           fmt.Errorf("attenuated service account query failed - please make sure the service account exists. sa=sa1 operatorgroup=ns/og"),
+			expectedPhase: v1alpha1.InstallPlanPhaseInstalling,
+			expectedCondition: &v1alpha1.InstallPlanCondition{Type: v1alpha1.InstallPlanInstalled, Status: corev1.ConditionFalse, Reason: v1alpha1.InstallPlanReasonInstallCheckFailed,
+				Message: "please make sure the service account exists. sa=sa1 operatorgroup=ns/og"},
+			in: ipWithSteps,
 			clientObjs: []runtime.Object{
 				operatorGroup("og", "sa1", namespace, nil),
 			},
@@ -233,6 +242,11 @@ func TestSyncInstallPlanUnhappy(t *testing.T) {
 			require.NoError(t, err)
 
 			require.Equal(t, tt.expectedPhase, ip.Status.Phase)
+
+			if tt.expectedCondition != nil {
+				require.True(t, hasExpectedCondition(ip, *tt.expectedCondition))
+			}
+
 		})
 	}
 }
@@ -1284,6 +1298,70 @@ func TestCompetingCRDOwnersExist(t *testing.T) {
 	}
 }
 
+func TestValidateExistingCRs(t *testing.T) {
+	unstructuredForFile := func(file string) *unstructured.Unstructured {
+		data, err := ioutil.ReadFile(file)
+		require.NoError(t, err)
+		dec := k8syaml.NewYAMLOrJSONDecoder(strings.NewReader(string(data)), 30)
+		k8sFile := &unstructured.Unstructured{}
+		require.NoError(t, dec.Decode(k8sFile))
+		return k8sFile
+	}
+
+	unversionedCRDForV1beta1File := func(file string) *apiextensions.CustomResourceDefinition {
+		data, err := ioutil.ReadFile(file)
+		require.NoError(t, err)
+		dec := k8syaml.NewYAMLOrJSONDecoder(strings.NewReader(string(data)), 30)
+		k8sFile := &apiextensionsv1beta1.CustomResourceDefinition{}
+		require.NoError(t, dec.Decode(k8sFile))
+		convertedCRD := &apiextensions.CustomResourceDefinition{}
+		require.NoError(t, apiextensionsv1beta1.Convert_v1beta1_CustomResourceDefinition_To_apiextensions_CustomResourceDefinition(k8sFile, convertedCRD, nil))
+		return convertedCRD
+	}
+
+	tests := []struct {
+		name            string
+		existingObjects []runtime.Object
+		gvr             schema.GroupVersionResource
+		newCRD          *apiextensions.CustomResourceDefinition
+		want            error
+	}{
+		{
+			name: "label validation",
+			existingObjects: []runtime.Object{
+				unstructuredForFile("testdata/hivebug/cr.yaml"),
+			},
+			gvr: schema.GroupVersionResource{
+				Group:    "hive.openshift.io",
+				Version:  "v1",
+				Resource: "machinepools",
+			},
+			newCRD: unversionedCRDForV1beta1File("testdata/hivebug/crd.yaml"),
+		},
+		{
+			name: "fail validation",
+			existingObjects: []runtime.Object{
+				unstructuredForFile("testdata/hivebug/fail.yaml"),
+			},
+			gvr: schema.GroupVersionResource{
+				Group:    "hive.openshift.io",
+				Version:  "v1",
+				Resource: "machinepools",
+			},
+			newCRD: unversionedCRDForV1beta1File("testdata/hivebug/crd.yaml"),
+			want:   fmt.Errorf("error validating custom resource against new schema for MachinePool /test: [[].spec.clusterDeploymentRef: Invalid value: \"null\": spec.clusterDeploymentRef in body must be of type object: \"null\", [].spec.name: Required value, [].spec.platform: Required value]"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := fakedynamic.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+				tt.gvr: "UnstructuredList",
+			}, tt.existingObjects...)
+			require.Equal(t, tt.want, validateExistingCRs(client, tt.gvr, tt.newCRD))
+		})
+	}
+}
+
 func fakeConfigMapData() map[string]string {
 	data := make(map[string]string)
 	yaml, err := yaml.Marshal([]apiextensionsv1beta1.CustomResourceDefinition{crd("fake-crd")})
@@ -1448,9 +1526,14 @@ func NewFakeOperator(ctx context.Context, namespace string, namespaces []string,
 		resolver:              config.resolver,
 		reconciler:            config.reconciler,
 		recorder:              config.recorder,
-		clientAttenuator:      scoped.NewClientAttenuator(logger, &rest.Config{}, opClientFake, clientFake, dynamicClientFake),
+		clientAttenuator:      scoped.NewClientAttenuator(logger, &rest.Config{}, opClientFake),
 		serviceAccountQuerier: scoped.NewUserDefinedServiceAccountQuerier(logger, clientFake),
 		catsrcQueueSet:        queueinformer.NewEmptyResourceQueueSet(),
+		clientFactory: &stubClientFactory{
+			operatorClient:   opClientFake,
+			kubernetesClient: clientFake,
+			dynamicClient:    dynamicClientFake,
+		},
 	}
 	op.sources = grpc.NewSourceStore(config.logger, 1*time.Second, 5*time.Second, op.syncSourceState)
 	if op.reconciler == nil {
@@ -1757,4 +1840,13 @@ func operatorGroup(ogName, saName, namespace string, saRef *corev1.ObjectReferen
 			ServiceAccountRef: saRef,
 		},
 	}
+}
+
+func hasExpectedCondition(ip *v1alpha1.InstallPlan, expectedCondition v1alpha1.InstallPlanCondition) bool {
+	for _, cond := range ip.Status.Conditions {
+		if cond.Type == expectedCondition.Type && cond.Message == expectedCondition.Message && cond.Status == expectedCondition.Status {
+			return true
+		}
+	}
+	return false
 }

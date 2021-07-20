@@ -15,6 +15,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	extinf "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	meta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -36,6 +37,7 @@ import (
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/operators/olm/overrides"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/resolver"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/clients"
 	csvutility "github.com/operator-framework/operator-lifecycle-manager/pkg/lib/csv"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/event"
 	index "github.com/operator-framework/operator-lifecycle-manager/pkg/lib/index"
@@ -82,6 +84,7 @@ type Operator struct {
 	serviceAccountSyncer  *scoped.UserDefinedServiceAccountSyncer
 	clientAttenuator      *scoped.ClientAttenuator
 	serviceAccountQuerier *scoped.UserDefinedServiceAccountQuerier
+	clientFactory         clients.Factory
 }
 
 func NewOperator(ctx context.Context, options ...OperatorOption) (*Operator, error) {
@@ -134,8 +137,9 @@ func newOperatorWithConfig(ctx context.Context, config *operatorConfig) (*Operat
 		csvSetGenerator:       csvutility.NewSetGenerator(config.logger, lister),
 		csvReplaceFinder:      csvutility.NewReplaceFinder(config.logger, config.externalClient),
 		serviceAccountSyncer:  scoped.NewUserDefinedServiceAccountSyncer(config.logger, scheme, config.operatorClient, config.externalClient),
-		clientAttenuator:      scoped.NewClientAttenuator(config.logger, config.restConfig, config.operatorClient, config.externalClient, nil),
+		clientAttenuator:      scoped.NewClientAttenuator(config.logger, config.restConfig, config.operatorClient),
 		serviceAccountQuerier: scoped.NewUserDefinedServiceAccountQuerier(config.logger, config.externalClient),
+		clientFactory:         clients.NewFactory(config.restConfig),
 	}
 
 	// Set up syncing for namespace-scoped resources
@@ -221,8 +225,8 @@ func newOperatorWithConfig(ctx context.Context, config *operatorConfig) (*Operat
 		}
 
 		// Register OperatorCondition QueueInformer
-		opConditionInformer := extInformerFactory.Operators().V1().OperatorConditions()
-		op.lister.OperatorsV1().RegisterOperatorConditionLister(namespace, opConditionInformer.Lister())
+		opConditionInformer := extInformerFactory.Operators().V2().OperatorConditions()
+		op.lister.OperatorsV2().RegisterOperatorConditionLister(namespace, opConditionInformer.Lister())
 		opConditionQueueInformer, err := queueinformer.NewQueueInformer(
 			ctx,
 			queueinformer.WithLogger(op.logger),
@@ -300,7 +304,9 @@ func newOperatorWithConfig(ctx context.Context, config *operatorConfig) (*Operat
 		}
 
 		// Register Secret QueueInformer
-		secretInformer := k8sInformerFactory.Core().V1().Secrets()
+		secretInformer := informers.NewSharedInformerFactoryWithOptions(op.opClient.KubernetesInterface(), config.resyncPeriod(), informers.WithNamespace(namespace), informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = labels.SelectorFromValidatedSet(map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue}).String()
+		})).Core().V1().Secrets()
 		op.lister.CoreV1().RegisterSecretLister(namespace, secretInformer.Lister())
 		secretQueueInformer, err := queueinformer.NewQueueInformer(
 			ctx,
@@ -822,6 +828,41 @@ func (a *Operator) syncNamespace(obj interface{}) error {
 	if err != nil {
 		logger.WithError(err).Warn("lister failed")
 		return err
+	}
+
+	// Query OG in this namespace
+	groups, err := a.lister.OperatorsV1().OperatorGroupLister().OperatorGroups(namespace.GetName()).List(labels.Everything())
+	if err != nil {
+		logger.WithError(err).Warn("failed to list OperatorGroups in the namespace")
+		return err
+	}
+
+	// Check if there is a stale multiple OG condition and clear it if existed.
+	if len(groups) == 1 {
+		og := groups[0]
+		if c := meta.FindStatusCondition(og.Status.Conditions, v1.MutlipleOperatorGroupCondition); c != nil {
+			meta.RemoveStatusCondition(&og.Status.Conditions, v1.MutlipleOperatorGroupCondition)
+			_, err = a.client.OperatorsV1().OperatorGroups(namespace.GetName()).UpdateStatus(context.TODO(), og, metav1.UpdateOptions{})
+			if err != nil {
+				logger.Warnf("fail to upgrade operator group status og=%s with condition %+v: %s", og.GetName(), c, err.Error())
+			}
+		}
+	} else if len(groups) > 1 {
+		// Add to all OG's status conditions to indicate they're multiple OGs in the
+		// same namespace which is not allowed.
+		cond := metav1.Condition{
+			Type:    v1.MutlipleOperatorGroupCondition,
+			Status:  metav1.ConditionTrue,
+			Reason:  v1.MultipleOperatorGroupsReason,
+			Message: "Multiple OperatorGroup found in the same namespace",
+		}
+		for _, og := range groups {
+			meta.SetStatusCondition(&og.Status.Conditions, cond)
+			_, err = a.client.OperatorsV1().OperatorGroups(namespace.GetName()).UpdateStatus(context.TODO(), og, metav1.UpdateOptions{})
+			if err != nil {
+				logger.Warnf("fail to upgrade operator group status og=%s with condition %+v: %s", og.GetName(), cond, err.Error())
+			}
+		}
 	}
 
 	for _, group := range operatorGroupList {
@@ -1886,11 +1927,12 @@ func (a *Operator) parseStrategiesAndUpdateStatus(csv *v1alpha1.ClusterServiceVe
 	// associated with the namespace then we should use a scoped client that is
 	// bound to the service account.
 	querierFunc := a.serviceAccountQuerier.NamespaceQuerier(csv.GetNamespace())
-	kubeclient, err := a.clientAttenuator.AttenuateOperatorClient(querierFunc)
+	attenuate, err := a.clientAttenuator.AttenuateToServiceAccount(querierFunc)
 	if err != nil {
 		a.logger.Errorf("failed to get a client for operator deployment- %v", err)
 		return nil, nil
 	}
+	kubeclient, err := a.clientFactory.WithConfigTransformer(attenuate).NewOperatorClient()
 
 	strName := strategy.GetStrategyName()
 	installer := a.resolver.InstallerForStrategy(strName, kubeclient, a.lister, csv, csv.GetAnnotations(), csv.GetAllAPIServiceDescriptions(), csv.Spec.WebhookDefinitions, previousStrategy)

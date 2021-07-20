@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,12 +15,14 @@ import (
 	. "github.com/onsi/ginkgo"
 	"github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
+	. "github.com/onsi/gomega/gstruct"
 	"github.com/onsi/gomega/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -30,14 +33,17 @@ import (
 	k8sjson "k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	opver "github.com/operator-framework/api/pkg/lib/version"
 	operatorsv1 "github.com/operator-framework/api/pkg/operators/v1"
+	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/bundle"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/operators/catalog"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/kubernetes/pkg/apis/rbac"
@@ -55,6 +61,303 @@ var _ = Describe("Install Plan", func() {
 
 	AfterEach(func() {
 		TearDown(testNamespace)
+	})
+
+	When("an InstallPlan step contains a deprecated resource version", func() {
+		var (
+			pdb      policyv1beta1.PodDisruptionBudget
+			manifest string
+			counter  float64
+		)
+
+		BeforeEach(func() {
+			dc, err := discovery.NewDiscoveryClientForConfig(ctx.Ctx().RESTConfig())
+			Expect(err).ToNot(HaveOccurred())
+
+			v, err := dc.ServerVersion()
+			Expect(err).ToNot(HaveOccurred())
+
+			if minor, err := strconv.Atoi(v.Minor); err == nil && minor < 21 {
+				// This is a tactical can-kick with
+				// the expectation that the
+				// event-emitting behavior being
+				// tested in this context will have
+				// moved by the time 1.25 arrives.
+				Skip("hack: test is dependent on 1.21+ behavior")
+			}
+		})
+
+		BeforeEach(func() {
+			counter = 0
+			for _, metric := range getMetricsFromPod(ctx.Ctx().KubeClient(), getPodWithLabel(ctx.Ctx().KubeClient(), "app=catalog-operator"), "8080") {
+				if metric.Family == "installplan_warnings_total" {
+					counter = metric.Value
+				}
+			}
+
+			csv := newCSV("test-csv", testNamespace, "", semver.Version{}, nil, nil, nil)
+			Expect(ctx.Ctx().Client().Create(context.TODO(), &csv)).To(Succeed())
+
+			pdb = policyv1beta1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-pdb",
+				},
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "PodDisruptionBudget",
+					APIVersion: policyv1beta1.SchemeGroupVersion.String(),
+				},
+				Spec: policyv1beta1.PodDisruptionBudgetSpec{},
+			}
+
+			scheme := runtime.NewScheme()
+			Expect(policyv1beta1.AddToScheme(scheme)).To(Succeed())
+			{
+				var b bytes.Buffer
+				Expect(k8sjson.NewSerializer(k8sjson.DefaultMetaFactory, scheme, scheme, false).Encode(&pdb, &b)).To(Succeed())
+				manifest = b.String()
+			}
+
+			plan := operatorsv1alpha1.InstallPlan{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: testNamespace,
+					Name:      "test-plan",
+				},
+				Spec: operatorsv1alpha1.InstallPlanSpec{
+					Approval:                   operatorsv1alpha1.ApprovalAutomatic,
+					Approved:                   true,
+					ClusterServiceVersionNames: []string{},
+				},
+				Status: operatorsv1alpha1.InstallPlanStatus{
+					Phase:          operatorsv1alpha1.InstallPlanPhaseInstalling,
+					CatalogSources: []string{},
+					Plan: []*operatorsv1alpha1.Step{
+						{
+							Resolving: "test-csv",
+							Status:    operatorsv1alpha1.StepStatusUnknown,
+							Resource: operatorsv1alpha1.StepResource{
+								Name:     pdb.GetName(),
+								Version:  pdb.APIVersion,
+								Kind:     pdb.Kind,
+								Manifest: manifest,
+							},
+						},
+					},
+				},
+			}
+			Expect(ctx.Ctx().Client().Create(context.Background(), &plan)).To(Succeed())
+			Expect(ctx.Ctx().Client().Status().Update(context.Background(), &plan)).To(Succeed())
+			Eventually(func() (*operatorsv1alpha1.InstallPlan, error) {
+				return &plan, ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(&plan), &plan)
+			}).Should(HavePhase(operatorsv1alpha1.InstallPlanPhaseComplete))
+
+		})
+
+		It("creates an Event surfacing the deprecation warning", func() {
+			Eventually(func() ([]corev1.Event, error) {
+				var events corev1.EventList
+				if err := ctx.Ctx().Client().List(context.Background(), &events, client.InNamespace(testNamespace)); err != nil {
+					return nil, err
+				}
+				var result []corev1.Event
+				for _, item := range events.Items {
+					result = append(result, corev1.Event{
+						InvolvedObject: corev1.ObjectReference{
+							APIVersion: item.InvolvedObject.APIVersion,
+							Kind:       item.InvolvedObject.Kind,
+							Namespace:  item.InvolvedObject.Namespace,
+							Name:       item.InvolvedObject.Name,
+							FieldPath:  item.InvolvedObject.FieldPath,
+						},
+						Reason:  item.Reason,
+						Message: item.Message,
+					})
+				}
+				return result, nil
+			}).Should(ContainElement(corev1.Event{
+				InvolvedObject: corev1.ObjectReference{
+					APIVersion: operatorsv1alpha1.InstallPlanAPIVersion,
+					Kind:       operatorsv1alpha1.InstallPlanKind,
+					Namespace:  testNamespace,
+					Name:       "test-plan",
+					FieldPath:  "status.plan[0]",
+				},
+				Reason:  "AppliedWithWarnings",
+				Message: "1 warning(s) generated during installation of operator \"test-csv\" (PodDisruptionBudget \"test-pdb\"): policy/v1beta1 PodDisruptionBudget is deprecated in v1.21+, unavailable in v1.25+; use policy/v1 PodDisruptionBudget",
+			}))
+
+		})
+
+		It("increments a metric counting the warning", func() {
+			Eventually(func() []Metric {
+				return getMetricsFromPod(ctx.Ctx().KubeClient(), getPodWithLabel(ctx.Ctx().KubeClient(), "app=catalog-operator"), "8080")
+			}).Should(ContainElement(LikeMetric(
+				WithFamily("installplan_warnings_total"),
+				WithValueGreaterThan(counter),
+			)))
+		})
+	})
+
+	When("a CustomResourceDefinition step resolved from a bundle is applied", func() {
+		var (
+			crd      apiextensionsv1.CustomResourceDefinition
+			manifest string
+		)
+
+		BeforeEach(func() {
+			csv := newCSV("test-csv", testNamespace, "", semver.Version{}, nil, nil, nil)
+			Expect(ctx.Ctx().Client().Create(context.TODO(), &csv)).To(Succeed())
+
+			crd = apiextensionsv1.CustomResourceDefinition{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "tests.example.com",
+				},
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "CustomResourceDefinition",
+					APIVersion: apiextensionsv1.SchemeGroupVersion.String(),
+				},
+				Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+					Group: "example.com",
+					Scope: apiextensionsv1.ClusterScoped,
+					Names: apiextensionsv1.CustomResourceDefinitionNames{
+						Plural:   "tests",
+						Singular: "test",
+						Kind:     "Test",
+						ListKind: "TestList",
+					},
+					Versions: []apiextensionsv1.CustomResourceDefinitionVersion{{
+						Name:    "v1",
+						Served:  true,
+						Storage: true,
+						Schema: &apiextensionsv1.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+								Type: "object",
+							},
+						},
+					}},
+				},
+			}
+
+			scheme := runtime.NewScheme()
+			Expect(corev1.AddToScheme(scheme)).To(Succeed())
+			{
+				var b bytes.Buffer
+				Expect(k8sjson.NewSerializer(k8sjson.DefaultMetaFactory, scheme, scheme, false).Encode(&crd, &b)).To(Succeed())
+				manifest = b.String()
+			}
+
+			plan := operatorsv1alpha1.InstallPlan{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: testNamespace,
+					Name:      "test-plan",
+				},
+				Spec: operatorsv1alpha1.InstallPlanSpec{
+					Approval:                   operatorsv1alpha1.ApprovalAutomatic,
+					Approved:                   true,
+					ClusterServiceVersionNames: []string{},
+				},
+				Status: operatorsv1alpha1.InstallPlanStatus{
+					Phase:          operatorsv1alpha1.InstallPlanPhaseInstalling,
+					CatalogSources: []string{},
+					Plan: []*operatorsv1alpha1.Step{
+						{
+							Resolving: "test-csv",
+							Status:    operatorsv1alpha1.StepStatusUnknown,
+							Resource: operatorsv1alpha1.StepResource{
+								Name:     crd.GetName(),
+								Version:  apiextensionsv1.SchemeGroupVersion.String(),
+								Kind:     "CustomResourceDefinition",
+								Manifest: manifest,
+							},
+						},
+					},
+				},
+			}
+			Expect(ctx.Ctx().Client().Create(context.Background(), &plan)).To(Succeed())
+			Expect(ctx.Ctx().Client().Status().Update(context.Background(), &plan)).To(Succeed())
+			Eventually(func() (*operatorsv1alpha1.InstallPlan, error) {
+				return &plan, ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(&plan), &plan)
+			}).Should(HavePhase(operatorsv1alpha1.InstallPlanPhaseComplete))
+		})
+
+		AfterEach(func() {
+			Eventually(func() error {
+				return ctx.Ctx().Client().Delete(context.Background(), &crd)
+			}).Should(WithTransform(k8serrors.IsNotFound, BeTrue()))
+		})
+
+		It("is annotated with a reference to its associated ClusterServiceVersion", func() {
+			Eventually(func() (map[string]string, error) {
+				if err := ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(&crd), &crd); err != nil {
+					return nil, err
+				}
+				return crd.GetAnnotations(), nil
+			}).Should(HaveKeyWithValue(
+				HavePrefix("operatorframework.io/installed-alongside-"),
+				fmt.Sprintf("%s/test-csv", testNamespace),
+			))
+		})
+
+		When("a second plan includes the same CustomResourceDefinition", func() {
+			BeforeEach(func() {
+				csv := newCSV("test-csv-two", testNamespace, "", semver.Version{}, nil, nil, nil)
+				Expect(ctx.Ctx().Client().Create(context.TODO(), &csv)).To(Succeed())
+
+				plan := operatorsv1alpha1.InstallPlan{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: testNamespace,
+						Name:      "test-plan-two",
+					},
+					Spec: operatorsv1alpha1.InstallPlanSpec{
+						Approval:                   operatorsv1alpha1.ApprovalAutomatic,
+						Approved:                   true,
+						ClusterServiceVersionNames: []string{},
+					},
+					Status: operatorsv1alpha1.InstallPlanStatus{
+						Phase:          operatorsv1alpha1.InstallPlanPhaseInstalling,
+						CatalogSources: []string{},
+						Plan: []*operatorsv1alpha1.Step{
+							{
+								Resolving: "test-csv-two",
+								Status:    operatorsv1alpha1.StepStatusUnknown,
+								Resource: operatorsv1alpha1.StepResource{
+									Name:     crd.GetName(),
+									Version:  apiextensionsv1.SchemeGroupVersion.String(),
+									Kind:     "CustomResourceDefinition",
+									Manifest: manifest,
+								},
+							},
+						},
+					},
+				}
+				Expect(ctx.Ctx().Client().Create(context.Background(), &plan)).To(Succeed())
+				Expect(ctx.Ctx().Client().Status().Update(context.Background(), &plan)).To(Succeed())
+				Eventually(func() (*operatorsv1alpha1.InstallPlan, error) {
+					return &plan, ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(&plan), &plan)
+				}).Should(HavePhase(operatorsv1alpha1.InstallPlanPhaseComplete))
+			})
+
+			It("has one annotation for each ClusterServiceVersion", func() {
+				Eventually(func() ([]struct{ Key, Value string }, error) {
+					if err := ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(&crd), &crd); err != nil {
+						return nil, err
+					}
+					var pairs []struct{ Key, Value string }
+					for k, v := range crd.GetAnnotations() {
+						pairs = append(pairs, struct{ Key, Value string }{Key: k, Value: v})
+					}
+					return pairs, nil
+				}).Should(ConsistOf(
+					MatchFields(IgnoreExtras, Fields{
+						"Key":   HavePrefix("operatorframework.io/installed-alongside-"),
+						"Value": Equal(fmt.Sprintf("%s/test-csv", testNamespace)),
+					}),
+					MatchFields(IgnoreExtras, Fields{
+						"Key":   HavePrefix("operatorframework.io/installed-alongside-"),
+						"Value": Equal(fmt.Sprintf("%s/test-csv-two", testNamespace)),
+					}),
+				))
+			})
+		})
 	})
 
 	When("an error is encountered during InstallPlan step execution", func() {
@@ -763,27 +1066,26 @@ var _ = Describe("Install Plan", func() {
 				expectedPhase: operatorsv1alpha1.InstallPlanPhaseComplete,
 				oldCRD: func() *apiextensions.CustomResourceDefinition {
 					oldCRD := newCRD(mainCRDPlural + "a")
-					oldCRD.Spec.Version = ""
 					oldCRD.Spec.Versions = []apiextensions.CustomResourceDefinitionVersion{
 						{
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: true,
-						},
-					}
-					oldCRD.Spec.Validation = &apiextensions.CustomResourceValidation{
-						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
-							Type: "object",
-							Properties: map[string]apiextensions.JSONSchemaProps{
-								"spec": {
-									Type:        "object",
-									Description: "Spec of a test object.",
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type: "object",
 									Properties: map[string]apiextensions.JSONSchemaProps{
-										"scalar": {
-											Type:        "number",
-											Description: "Scalar value that should have a min and max.",
-											Minimum:     &min,
-											Maximum:     &max,
+										"spec": {
+											Type:        "object",
+											Description: "Spec of a test object.",
+											Properties: map[string]apiextensions.JSONSchemaProps{
+												"scalar": {
+													Type:        "number",
+													Description: "Scalar value that should have a min and max.",
+													Minimum:     &min,
+													Maximum:     &max,
+												},
+											},
 										},
 									},
 								},
@@ -794,32 +1096,50 @@ var _ = Describe("Install Plan", func() {
 				}(),
 				newCRD: func() *apiextensions.CustomResourceDefinition {
 					newCRD := newCRD(mainCRDPlural + "a")
-					newCRD.Spec.Version = ""
 					newCRD.Spec.Versions = []apiextensions.CustomResourceDefinitionVersion{
 						{
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: false,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type: "object",
+									Properties: map[string]apiextensions.JSONSchemaProps{
+										"spec": {
+											Type:        "object",
+											Description: "Spec of a test object.",
+											Properties: map[string]apiextensions.JSONSchemaProps{
+												"scalar": {
+													Type:        "number",
+													Description: "Scalar value that should have a min and max.",
+													Minimum:     &min,
+													Maximum:     &max,
+												},
+											},
+										},
+									},
+								},
+							},
 						},
 						{
 							Name:    "v1alpha2",
 							Served:  true,
 							Storage: true,
-						},
-					}
-					newCRD.Spec.Validation = &apiextensions.CustomResourceValidation{
-						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
-							Type: "object",
-							Properties: map[string]apiextensions.JSONSchemaProps{
-								"spec": {
-									Type:        "object",
-									Description: "Spec of a test object.",
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type: "object",
 									Properties: map[string]apiextensions.JSONSchemaProps{
-										"scalar": {
-											Type:        "number",
-											Description: "Scalar value that should have a min and max.",
-											Minimum:     &min,
-											Maximum:     &max,
+										"spec": {
+											Type:        "object",
+											Description: "Spec of a test object.",
+											Properties: map[string]apiextensions.JSONSchemaProps{
+												"scalar": {
+													Type:        "number",
+													Description: "Scalar value that should have a min and max.",
+													Minimum:     &min,
+													Maximum:     &max,
+												},
+											},
 										},
 									},
 								},
@@ -833,39 +1153,54 @@ var _ = Describe("Install Plan", func() {
 				expectedPhase: operatorsv1alpha1.InstallPlanPhaseFailed,
 				oldCRD: func() *apiextensions.CustomResourceDefinition {
 					oldCRD := newCRD(mainCRDPlural + "b")
-					oldCRD.Spec.Version = ""
 					oldCRD.Spec.Versions = []apiextensions.CustomResourceDefinitionVersion{
 						{
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: true,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type: "object",
+									Properties: map[string]apiextensions.JSONSchemaProps{
+										"spec": {
+											Type:        "object",
+											Description: "Spec of a test object.",
+											Properties: map[string]apiextensions.JSONSchemaProps{
+												"scalar": {
+													Type:        "number",
+													Description: "Scalar value that should have a min and max.",
+												},
+											},
+										},
+									},
+								},
+							},
 						},
 					}
 					return &oldCRD
 				}(),
 				newCRD: func() *apiextensions.CustomResourceDefinition {
 					newCRD := newCRD(mainCRDPlural + "b")
-					newCRD.Spec.Version = ""
 					newCRD.Spec.Versions = []apiextensions.CustomResourceDefinitionVersion{
 						{
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: true,
-						},
-					}
-					newCRD.Spec.Validation = &apiextensions.CustomResourceValidation{
-						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
-							Type: "object",
-							Properties: map[string]apiextensions.JSONSchemaProps{
-								"spec": {
-									Type:        "object",
-									Description: "Spec of a test object.",
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type: "object",
 									Properties: map[string]apiextensions.JSONSchemaProps{
-										"scalar": {
-											Type:        "number",
-											Description: "Scalar value that should have a min and max.",
-											Minimum:     &min,
-											Maximum:     &newMax,
+										"spec": {
+											Type:        "object",
+											Description: "Spec of a test object.",
+											Properties: map[string]apiextensions.JSONSchemaProps{
+												"scalar": {
+													Type:        "number",
+													Description: "Scalar value that should have a min and max.",
+													Minimum:     &min,
+													Maximum:     &newMax,
+												},
+											},
 										},
 									},
 								},
@@ -879,49 +1214,78 @@ var _ = Describe("Install Plan", func() {
 				expectedPhase: operatorsv1alpha1.InstallPlanPhaseComplete,
 				oldCRD: func() *apiextensions.CustomResourceDefinition {
 					oldCRD := newCRD(mainCRDPlural + "c")
-					oldCRD.Spec.Version = ""
 					oldCRD.Spec.Versions = []apiextensions.CustomResourceDefinitionVersion{
 						{
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: true,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 						{
 							Name:    "v1alpha2",
 							Served:  true,
 							Storage: false,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 					}
 					return &oldCRD
 				}(),
 				newCRD: func() *apiextensions.CustomResourceDefinition {
 					newCRD := newCRD(mainCRDPlural + "c")
-					newCRD.Spec.Version = ""
 					newCRD.Spec.Versions = []apiextensions.CustomResourceDefinitionVersion{
 						{
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: true,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type: "object",
+									Properties: map[string]apiextensions.JSONSchemaProps{
+										"spec": {
+											Type:        "object",
+											Description: "Spec of a test object.",
+											Properties: map[string]apiextensions.JSONSchemaProps{
+												"scalar": {
+													Type:        "number",
+													Description: "Scalar value that should have a min and max.",
+													Minimum:     &min,
+													Maximum:     &max,
+												},
+											},
+										},
+									},
+								},
+							},
 						},
 						{
 							Name:    "v1",
 							Served:  true,
 							Storage: false,
-						},
-					}
-					newCRD.Spec.Validation = &apiextensions.CustomResourceValidation{
-						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
-							Type: "object",
-							Properties: map[string]apiextensions.JSONSchemaProps{
-								"spec": {
-									Type:        "object",
-									Description: "Spec of a test object.",
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type: "object",
 									Properties: map[string]apiextensions.JSONSchemaProps{
-										"scalar": {
-											Type:        "number",
-											Description: "Scalar value that should have a min and max.",
-											Minimum:     &min,
-											Maximum:     &max,
+										"spec": {
+											Type:        "object",
+											Description: "Spec of a test object.",
+											Properties: map[string]apiextensions.JSONSchemaProps{
+												"scalar": {
+													Type:        "number",
+													Description: "Scalar value that should have a min and max.",
+													Minimum:     &min,
+													Maximum:     &max,
+												},
+											},
 										},
 									},
 								},
@@ -934,12 +1298,10 @@ var _ = Describe("Install Plan", func() {
 				expectedPhase: operatorsv1alpha1.InstallPlanPhaseComplete,
 				oldCRD: func() *apiextensions.CustomResourceDefinition {
 					oldCRD := newCRD(mainCRDPlural + "d")
-					oldCRD.Spec.Version = "v1alpha1"
 					return &oldCRD
 				}(),
 				newCRD: func() *apiextensions.CustomResourceDefinition {
 					newCRD := newCRD(mainCRDPlural + "d")
-					newCRD.Spec.Version = "v1alpha1"
 					newCRD.Spec.Versions = []apiextensions.CustomResourceDefinitionVersion{
 						{
 							Name:    "v1alpha1",
@@ -1108,7 +1470,7 @@ var _ = Describe("Install Plan", func() {
 			require.Equal(GinkgoT(), tt.expectedPhase, fetchedInstallPlan.Status.Phase)
 
 			// Ensure correct in-cluster resource(s)
-			fetchedCSV, err := fetchCSV(crc, mainBetaCSV.GetName(), testNamespace, csvSucceededChecker)
+			fetchedCSV, err := fetchCSV(crc, mainBetaCSV.GetName(), testNamespace, csvAnyChecker)
 			require.NoError(GinkgoT(), err)
 
 			GinkgoT().Logf("All expected resources resolved %s", fetchedCSV.Status.Phase)
@@ -1137,51 +1499,84 @@ var _ = Describe("Install Plan", func() {
 				expectedPhase: operatorsv1alpha1.InstallPlanPhaseComplete,
 				oldCRD: func() *apiextensions.CustomResourceDefinition {
 					oldCRD := newCRD(mainCRDPlural)
-					oldCRD.Spec.Version = "v1alpha1"
 					oldCRD.Spec.Versions = []apiextensions.CustomResourceDefinitionVersion{
 						{
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: true,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 					}
 					return &oldCRD
 				}(),
 				intermediateCRD: func() *apiextensions.CustomResourceDefinition {
 					intermediateCRD := newCRD(mainCRDPlural)
-					intermediateCRD.Spec.Version = "v1alpha2"
 					intermediateCRD.Spec.Versions = []apiextensions.CustomResourceDefinitionVersion{
 						{
 							Name:    "v1alpha2",
 							Served:  true,
 							Storage: true,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 						{
 							Name:    "v1alpha1",
 							Served:  false,
 							Storage: false,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 					}
 					return &intermediateCRD
 				}(),
 				newCRD: func() *apiextensions.CustomResourceDefinition {
 					newCRD := newCRD(mainCRDPlural)
-					newCRD.Spec.Version = "v1alpha2"
 					newCRD.Spec.Versions = []apiextensions.CustomResourceDefinitionVersion{
 						{
 							Name:    "v1alpha2",
 							Served:  true,
 							Storage: true,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 						{
 							Name:    "v1beta1",
 							Served:  true,
 							Storage: false,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 						{
 							Name:    "v1alpha1",
 							Served:  false,
 							Storage: false,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 					}
 					return &newCRD
@@ -1369,6 +1764,12 @@ var _ = Describe("Install Plan", func() {
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: true,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 					},
 					Names: apiextensions.CustomResourceDefinitionNames{
@@ -1377,7 +1778,7 @@ var _ = Describe("Install Plan", func() {
 						Kind:     crdPlural,
 						ListKind: "list" + crdPlural,
 					},
-					Scope: "Namespaced",
+					Scope: apiextensions.NamespaceScoped,
 				},
 			}
 
@@ -1545,6 +1946,12 @@ var _ = Describe("Install Plan", func() {
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: true,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 					},
 					Names: apiextensions.CustomResourceDefinitionNames{
@@ -1553,7 +1960,7 @@ var _ = Describe("Install Plan", func() {
 						Kind:     crdPlural,
 						ListKind: "list" + crdPlural,
 					},
-					Scope: "Namespaced",
+					Scope: apiextensions.NamespaceScoped,
 				},
 			}
 
@@ -1759,6 +2166,12 @@ var _ = Describe("Install Plan", func() {
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: true,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 					},
 					Names: apiextensions.CustomResourceDefinitionNames{
@@ -1767,7 +2180,7 @@ var _ = Describe("Install Plan", func() {
 						Kind:     crdPlural,
 						ListKind: "list" + crdPlural,
 					},
-					Scope: "Namespaced",
+					Scope: apiextensions.NamespaceScoped,
 				},
 			}
 
@@ -1964,6 +2377,12 @@ var _ = Describe("Install Plan", func() {
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: true,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 					},
 					Names: apiextensions.CustomResourceDefinitionNames{
@@ -1972,7 +2391,7 @@ var _ = Describe("Install Plan", func() {
 						Kind:     crdPlural,
 						ListKind: "list" + crdPlural,
 					},
-					Scope: "Namespaced",
+					Scope: apiextensions.NamespaceScoped,
 				},
 			}
 
@@ -1987,11 +2406,23 @@ var _ = Describe("Install Plan", func() {
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: true,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 						{
 							Name:    "v1alpha2",
 							Served:  true,
 							Storage: false,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 					},
 					Names: apiextensions.CustomResourceDefinitionNames{
@@ -2000,7 +2431,7 @@ var _ = Describe("Install Plan", func() {
 						Kind:     crdPlural,
 						ListKind: "list" + crdPlural,
 					},
-					Scope: "Namespaced",
+					Scope: apiextensions.NamespaceScoped,
 				},
 			}
 
@@ -2087,7 +2518,7 @@ var _ = Describe("Install Plan", func() {
 			require.NoError(GinkgoT(), err)
 
 			// Get the CRD to see if it is updated
-			fetchedCRD, err := c.ApiextensionsInterface().ApiextensionsV1beta1().CustomResourceDefinitions().Get(context.TODO(), crdName, metav1.GetOptions{})
+			fetchedCRD, err := c.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), crdName, metav1.GetOptions{})
 			require.NoError(GinkgoT(), err)
 			require.Equal(GinkgoT(), len(fetchedCRD.Spec.Versions), len(updatedCRD.Spec.Versions), "The CRD versions counts don't match")
 
@@ -2138,6 +2569,12 @@ var _ = Describe("Install Plan", func() {
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: true,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 					},
 					Names: apiextensions.CustomResourceDefinitionNames{
@@ -2146,7 +2583,7 @@ var _ = Describe("Install Plan", func() {
 						Kind:     crdPlural,
 						ListKind: "list" + crdPlural,
 					},
-					Scope: "Namespaced",
+					Scope: apiextensions.NamespaceScoped,
 				},
 			}
 
@@ -2161,11 +2598,23 @@ var _ = Describe("Install Plan", func() {
 							Name:    "v1alpha1",
 							Served:  true,
 							Storage: true,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 						{
 							Name:    "v1alpha2",
 							Served:  true,
 							Storage: false,
+							Schema: &apiextensions.CustomResourceValidation{
+								OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+									Type:        "object",
+									Description: "my crd schema",
+								},
+							},
 						},
 					},
 					Names: apiextensions.CustomResourceDefinitionNames{
@@ -2174,7 +2623,7 @@ var _ = Describe("Install Plan", func() {
 						Kind:     crdPlural,
 						ListKind: "list" + crdPlural,
 					},
-					Scope: "Namespaced",
+					Scope: apiextensions.NamespaceScoped,
 				},
 			}
 
@@ -2246,7 +2695,7 @@ var _ = Describe("Install Plan", func() {
 			require.NoError(GinkgoT(), err)
 
 			// Get the CRD to see if it is updated
-			fetchedCRD, err := c.ApiextensionsInterface().ApiextensionsV1beta1().CustomResourceDefinitions().Get(context.TODO(), crdName, metav1.GetOptions{})
+			fetchedCRD, err := c.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), crdName, metav1.GetOptions{})
 			require.NoError(GinkgoT(), err)
 			require.Equal(GinkgoT(), len(fetchedCRD.Spec.Versions), len(mainCRD.Spec.Versions), "The CRD versions counts don't match")
 
@@ -2534,21 +2983,27 @@ var _ = Describe("Install Plan", func() {
 				Name: crdName,
 			},
 			Spec: apiextensions.CustomResourceDefinitionSpec{
-				Group:   "cluster.com",
-				Version: "v1alpha1",
-				Validation: &apiextensions.CustomResourceValidation{
-					OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
-						Type: "object",
-						Properties: map[string]apiextensions.JSONSchemaProps{
-							"spec": {
-								Type:        "object",
-								Description: "Spec of a test object.",
+				Group: "cluster.com",
+				Versions: []apiextensions.CustomResourceDefinitionVersion{
+					{
+						Name:    "v1alpha1",
+						Served:  true,
+						Storage: true,
+						Schema: &apiextensions.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+								Type: "object",
 								Properties: map[string]apiextensions.JSONSchemaProps{
-									"scalar": {
-										Type:        "number",
-										Description: "Scalar value that should have a min and max.",
-										Minimum:     &min,
-										Maximum:     &max,
+									"spec": {
+										Type:        "object",
+										Description: "Spec of a test object.",
+										Properties: map[string]apiextensions.JSONSchemaProps{
+											"scalar": {
+												Type:        "number",
+												Description: "Scalar value that should have a min and max.",
+												Minimum:     &min,
+												Maximum:     &max,
+											},
+										},
 									},
 								},
 							},
@@ -2561,7 +3016,7 @@ var _ = Describe("Install Plan", func() {
 					Kind:     crdPlural,
 					ListKind: "list" + crdPlural,
 				},
-				Scope: "Namespaced",
+				Scope: apiextensions.NamespaceScoped,
 			},
 		}
 
@@ -2640,7 +3095,7 @@ var _ = Describe("Install Plan", func() {
 				Labels:    map[string]string{"olm.catalogSource": "kaili-catalog"},
 			},
 			Spec: operatorsv1alpha1.CatalogSourceSpec{
-				Image:      "quay.io/olmtest/single-bundle-index:1.0.0",
+				Image:      "quay.io/operator-framework/ci-index:latest",
 				SourceType: operatorsv1alpha1.SourceTypeGrpc,
 			},
 		}
@@ -2833,7 +3288,7 @@ var _ = Describe("Install Plan", func() {
 
 		// Make sure to clean up the installed CRD
 		defer func() {
-			require.NoError(GinkgoT(), c.ApiextensionsInterface().ApiextensionsV1beta1().CustomResourceDefinitions().Delete(context.TODO(), dependentCRD.GetName(), *deleteOpts))
+			require.NoError(GinkgoT(), c.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Delete(context.TODO(), dependentCRD.GetName(), *deleteOpts))
 		}()
 
 		// ensure there is only one installplan
@@ -2842,160 +3297,281 @@ var _ = Describe("Install Plan", func() {
 		require.Equal(GinkgoT(), 1, len(ips.Items), "If this test fails it should be taken seriously and not treated as a flake. \n%v", ips.Items)
 	})
 
-	It("should fail an InstallPlan when no OperatorGroup is present", func() {
+	When("an InstallPlan is created with no valid OperatorGroup present", func() {
 
-		ns := &corev1.Namespace{}
-		ns.SetName(genName("ns-"))
+		var (
+			c               operatorclient.ClientInterface
+			crc             versioned.Interface
+			installPlanName string
+			ns              *corev1.Namespace
+		)
+		BeforeEach(func() {
+			c = newKubeClient()
+			crc = newCRClient()
 
-		c := newKubeClient()
-		crc := newCRClient()
+			ns = &corev1.Namespace{}
+			ns.SetName(genName("ns-"))
 
-		// Create a namespace
-		ns, err := c.KubernetesInterface().CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
+			// Create a namespace
+			Eventually(func() error {
+				return ctx.Ctx().Client().Create(context.Background(), ns)
+			}, timeout, interval).Should(Succeed(), "could not create Namespace")
 
-		deleteOpts := &metav1.DeleteOptions{}
-		defer func() {
-			err := c.KubernetesInterface().CoreV1().Namespaces().Delete(context.TODO(), ns.GetName(), *deleteOpts)
+			// Create InstallPlan
+			installPlanName = "ip"
+			ip := newInstallPlanWithDummySteps(installPlanName, ns.GetName(), operatorsv1alpha1.InstallPlanPhaseInstalling)
+			outIP, err := crc.OperatorsV1alpha1().InstallPlans(ns.GetName()).Create(context.TODO(), ip, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
-		}()
+			Expect(outIP).NotTo(BeNil())
 
-		// Create InstallPlan
-		installPlanName := "ip"
-		ip := newInstallPlanWithDummySteps(installPlanName, ns.GetName(), operatorsv1alpha1.InstallPlanPhaseNone)
-		outIP, err := crc.OperatorsV1alpha1().InstallPlans(ns.GetName()).Create(context.TODO(), ip, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-		Expect(outIP).NotTo(BeNil())
+			// The status gets ignored on create so we need to update it else the InstallPlan sync ignores
+			// InstallPlans without any steps or bundle lookups
+			outIP.Status = ip.Status
+			_, err = crc.OperatorsV1alpha1().InstallPlans(ns.GetName()).UpdateStatus(context.TODO(), outIP, metav1.UpdateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+		})
 
-		// The status gets ignored on create so we need to update it else the InstallPlan sync ignores
-		// InstallPlans without any steps or bundle lookups
-		outIP.Status = ip.Status
-		_, err = crc.OperatorsV1alpha1().InstallPlans(ns.GetName()).UpdateStatus(context.TODO(), outIP, metav1.UpdateOptions{})
-		Expect(err).NotTo(HaveOccurred())
+		It("should clear clear up the condition in the InstallPlan status that contains an error message when a valid OperatorGroup is created", func() {
 
-		fetchedInstallPlan, err := fetchInstallPlanWithNamespace(GinkgoT(), crc, installPlanName, ns.GetName(), buildInstallPlanPhaseCheckFunc(operatorsv1alpha1.InstallPlanPhaseFailed))
-		Expect(err).NotTo(HaveOccurred())
-		Expect(fetchedInstallPlan).NotTo(BeNil())
-		ctx.Ctx().Logf(fmt.Sprintf("Install plan %s fetched with phase %s", fetchedInstallPlan.GetName(), fetchedInstallPlan.Status.Phase))
-		ctx.Ctx().Logf(fmt.Sprintf("Install plan %s fetched with conditions %+v", fetchedInstallPlan.GetName(), fetchedInstallPlan.Status.Conditions))
+			// first check that a condition with a message exists
+			fetchedInstallPlan, err := fetchInstallPlanWithNamespace(GinkgoT(), crc, installPlanName, ns.GetName(), buildInstallPlanPhaseCheckFunc(operatorsv1alpha1.InstallPlanPhaseInstalling))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fetchedInstallPlan).NotTo(BeNil())
+			cond := v1alpha1.InstallPlanCondition{Type: v1alpha1.InstallPlanInstalled, Status: corev1.ConditionFalse, Reason: v1alpha1.InstallPlanReasonInstallCheckFailed,
+				Message: "no operator group found that is managing this namespace"}
+			Expect(fetchedInstallPlan.Status.Phase).To(Equal(v1alpha1.InstallPlanPhaseInstalling))
+			Expect(hasCondition(fetchedInstallPlan, cond)).To(BeTrue())
+
+			// Create an operatorgroup for the same namespace
+			og := &operatorsv1.OperatorGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "og",
+					Namespace: ns.GetName(),
+				},
+				Spec: operatorsv1.OperatorGroupSpec{
+					TargetNamespaces: []string{ns.GetName()},
+				},
+			}
+			Eventually(func() error {
+				return ctx.Ctx().Client().Create(context.Background(), og)
+			}, timeout, interval).Should(Succeed(), "could not create OperatorGroup")
+
+			// Wait for the OperatorGroup to be synced
+			Eventually(
+				func() ([]string, error) {
+					err := ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(og), og)
+					ctx.Ctx().Logf("Waiting for OperatorGroup(%v) to be synced with status.namespaces: %v", og.Name, og.Status.Namespaces)
+					return og.Status.Namespaces, err
+				},
+				1*time.Minute,
+				interval,
+			).Should(ContainElement(ns.GetName()))
+
+			// check that the condition has been cleared up
+			Eventually(func() (bool, error) {
+				fetchedInstallPlan, err := fetchInstallPlanWithNamespace(GinkgoT(), crc, installPlanName, ns.GetName(), buildInstallPlanPhaseCheckFunc(operatorsv1alpha1.InstallPlanPhaseInstalling))
+				if err != nil {
+					return false, err
+				}
+				if fetchedInstallPlan == nil {
+					return false, err
+				}
+				if hasCondition(fetchedInstallPlan, cond) {
+					return false, nil
+				}
+				return true, nil
+			}).Should(BeTrue())
+		})
+
+		AfterEach(func() {
+			err := c.KubernetesInterface().CoreV1().Namespaces().Delete(context.TODO(), ns.GetName(), metav1.DeleteOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			err = crc.OperatorsV1alpha1().InstallPlans(ns.GetName()).Delete(context.TODO(), installPlanName, metav1.DeleteOptions{})
+			Expect(err).NotTo(HaveOccurred())
+		})
 	})
 
-	It("should fail an InstallPlan when multiple OperatorGroups are present", func() {
+	When("waiting on the bundle unpacking job", func() {
+		var (
+			ns         *corev1.Namespace
+			catsrcName string
+			ip         *operatorsv1alpha1.InstallPlan
+		)
+		BeforeEach(func() {
+			ns = &corev1.Namespace{}
+			ns.SetName(genName("ns-"))
+			Eventually(func() error {
+				return ctx.Ctx().Client().Create(context.Background(), ns)
+			}, timeout, interval).Should(Succeed(), "could not create Namespace")
 
-		ns := &corev1.Namespace{}
-		ns.SetName(genName("ns-"))
+			// Create a dummy CatalogSource to bypass the bundle unpacker's check for a CatalogSource
+			catsrc := &operatorsv1alpha1.CatalogSource{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      genName("dummy-catsrc-"),
+					Namespace: ns.GetName(),
+				},
+				Spec: operatorsv1alpha1.CatalogSourceSpec{
+					Image:      "localhost:0/not/exist:catsrc",
+					SourceType: operatorsv1alpha1.SourceTypeGrpc,
+				},
+			}
+			Eventually(func() error {
+				return ctx.Ctx().Client().Create(context.Background(), catsrc)
+			}, timeout, interval).Should(Succeed(), "could not create CatalogSource")
 
-		c := newKubeClient()
-		crc := newCRClient()
+			catsrcName = catsrc.GetName()
 
-		// Create a namespace
-		ns, err := c.KubernetesInterface().CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-		deleteOpts := &metav1.DeleteOptions{}
-		defer func() {
-			err = c.KubernetesInterface().CoreV1().Namespaces().Delete(context.TODO(), ns.GetName(), *deleteOpts)
-			Expect(err).ToNot(HaveOccurred())
-		}()
+			// Create the OperatorGroup
+			og := &operatorsv1.OperatorGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "og",
+					Namespace: ns.GetName(),
+				},
+				Spec: operatorsv1.OperatorGroupSpec{
+					TargetNamespaces: []string{ns.GetName()},
+				},
+			}
+			Eventually(func() error {
+				return ctx.Ctx().Client().Create(context.Background(), og)
+			}, timeout, interval).Should(Succeed(), "could not create OperatorGroup")
 
-		// Create 2 operatorgroups in the same namespace
-		og1 := &operatorsv1.OperatorGroup{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "og1",
-			},
-			Spec: operatorsv1.OperatorGroupSpec{
-				TargetNamespaces: []string{ns.GetName()},
-			},
-		}
-		og2 := &operatorsv1.OperatorGroup{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "og2",
-			},
-			Spec: operatorsv1.OperatorGroupSpec{
-				TargetNamespaces: []string{ns.GetName()},
-			},
-		}
-		_, err = crc.OperatorsV1().OperatorGroups(ns.GetName()).Create(context.TODO(), og1, metav1.CreateOptions{})
-		Expect(err).ToNot(HaveOccurred())
-		_, err = crc.OperatorsV1().OperatorGroups(ns.GetName()).Create(context.TODO(), og2, metav1.CreateOptions{})
-		Expect(err).ToNot(HaveOccurred())
+			// Wait for the OperatorGroup to be synced so the InstallPlan doesn't have to be resynced due to an invalid OperatorGroup
+			Eventually(
+				func() ([]string, error) {
+					err := ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(og), og)
+					ctx.Ctx().Logf("Waiting for OperatorGroup(%v) to be synced with status.namespaces: %v", og.Name, og.Status.Namespaces)
+					return og.Status.Namespaces, err
+				},
+				1*time.Minute,
+				interval,
+			).Should(ContainElement(ns.GetName()))
 
-		installPlanName := "ip"
-		ip := newInstallPlanWithDummySteps(installPlanName, ns.GetName(), operatorsv1alpha1.InstallPlanPhaseNone)
-		outIP, err := crc.OperatorsV1alpha1().InstallPlans(ns.GetName()).Create(context.TODO(), ip, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-		Expect(outIP).NotTo(BeNil())
+			now := metav1.Now()
+			ip = &operatorsv1alpha1.InstallPlan{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ip",
+					Namespace: ns.GetName(),
+				},
+				Spec: operatorsv1alpha1.InstallPlanSpec{
+					ClusterServiceVersionNames: []string{"foobar"},
+					Approval:                   v1alpha1.ApprovalAutomatic,
+					Approved:                   true,
+				},
+				Status: operatorsv1alpha1.InstallPlanStatus{
+					Phase:          operatorsv1alpha1.InstallPlanPhaseInstalling,
+					CatalogSources: []string{},
+					BundleLookups: []operatorsv1alpha1.BundleLookup{
+						{
+							Identifier: "foobar.v0.0.1",
+							CatalogSourceRef: &corev1.ObjectReference{
+								Namespace: ns.GetName(),
+								Name:      catsrcName,
+							},
+							Conditions: []operatorsv1alpha1.BundleLookupCondition{
+								{
+									Type:               operatorsv1alpha1.BundleLookupPending,
+									Status:             corev1.ConditionTrue,
+									Reason:             "JobIncomplete",
+									Message:            "unpack job not completed",
+									LastTransitionTime: &now,
+								},
+							},
+						},
+					},
+				},
+			}
+		})
 
-		// The status gets ignored on create so we need to update it else the InstallPlan sync ignores
-		// InstallPlans without any steps or bundle lookups
-		outIP.Status = ip.Status
-		_, err = crc.OperatorsV1alpha1().InstallPlans(ns.GetName()).UpdateStatus(context.TODO(), outIP, metav1.UpdateOptions{})
-		Expect(err).NotTo(HaveOccurred())
+		AfterEach(func() {
+			Eventually(func() error {
+				return ctx.Ctx().Client().Delete(context.Background(), ns)
+			}, timeout, interval).Should(Succeed(), "could not delete Namespace")
+		})
 
-		fetchedInstallPlan, err := fetchInstallPlanWithNamespace(GinkgoT(), crc, installPlanName, ns.GetName(), buildInstallPlanPhaseCheckFunc(operatorsv1alpha1.InstallPlanPhaseFailed))
-		Expect(err).ToNot(HaveOccurred())
-		Expect(fetchedInstallPlan).NotTo(BeNil())
-		ctx.Ctx().Logf(fmt.Sprintf("Install plan %s fetched with status %s", fetchedInstallPlan.GetName(), fetchedInstallPlan.Status.Phase))
-		ctx.Ctx().Logf(fmt.Sprintf("Install plan %s fetched with conditions %+v", fetchedInstallPlan.GetName(), fetchedInstallPlan.Status.Conditions))
-	})
+		It("should show an error on the bundlelookup condition for a non-existent bundle image", func() {
+			// Create an InstallPlan status.bundleLookups.Path specified for a non-existent bundle image
+			ip.Status.BundleLookups[0].Path = "localhost:0/not/exist:v0.0.1"
 
-	It("should fail an InstallPlan when an OperatorGroup specifies an unsynced ServiceAccount with no ServiceAccountRef", func() {
+			// We wait for some time over the bundle unpack timeout (i.e ActiveDeadlineSeconds) so that the Job can eventually fail
+			// Since the default --bundle-unpack-timeout=10m, we override with a shorter timeout via the
+			// unpack timeout annotation on the InstallPlan
+			annotations := make(map[string]string)
+			annotations[bundle.BundleUnpackTimeoutAnnotationKey] = "1m"
+			ip.SetAnnotations(annotations)
+			waitFor := 1*time.Minute + 30*time.Second
 
-		ns := &corev1.Namespace{}
-		ns.SetName(genName("ns-"))
+			Eventually(func() error {
+				return ctx.Ctx().Client().Create(context.Background(), ip)
+			}, timeout, interval).Should(Succeed(), "could not create InstallPlan")
 
-		c := newKubeClient()
-		crc := newCRClient()
+			// The status gets ignored on create so we need to update it else the InstallPlan sync ignores
+			// InstallPlans without any steps or bundle lookups
+			Eventually(func() error {
+				return ctx.Ctx().Client().Status().Update(context.Background(), ip)
+			}, timeout, interval).Should(Succeed(), "could not update InstallPlan status")
 
-		// Create a namespace
-		ns, err := c.KubernetesInterface().CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-		deleteOpts := &metav1.DeleteOptions{}
-		defer func() {
-			err = c.KubernetesInterface().CoreV1().Namespaces().Delete(context.TODO(), ns.GetName(), *deleteOpts)
-			Expect(err).ToNot(HaveOccurred())
-		}()
+			// The InstallPlan's status.bundleLookup.conditions should have a BundleLookupPending condition
+			// with the container status from unpack pod that mentions an image pull failure for the non-existent
+			// image, e.g ErrImagePull or ImagePullBackOff
+			Eventually(
+				func() (string, error) {
+					err := ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(ip), ip)
+					if err != nil {
+						return "", err
+					}
+					for _, bl := range ip.Status.BundleLookups {
+						for _, cond := range bl.Conditions {
+							if cond.Type != operatorsv1alpha1.BundleLookupPending {
+								continue
+							}
+							return cond.Message, nil
+						}
+					}
+					return "", fmt.Errorf("%s condition not found", operatorsv1alpha1.BundleLookupPending)
+				},
+				1*time.Minute,
+				interval,
+			).Should(ContainSubstring("ErrImagePull"))
 
-		// OperatorGroup with serviceaccount specified
-		og := &operatorsv1.OperatorGroup{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "og",
-			},
-			Spec: operatorsv1.OperatorGroupSpec{
-				TargetNamespaces:   []string{ns.GetName()},
-				ServiceAccountName: "foobar",
-			},
-		}
-		og, err = crc.OperatorsV1().OperatorGroups(ns.GetName()).Create(context.TODO(), og, metav1.CreateOptions{})
-		Expect(err).ToNot(HaveOccurred())
-		Expect(og).NotTo(BeNil())
+			// The InstallPlan should eventually fail due to the ActiveDeadlineSeconds limit
+			Eventually(
+				func() (*operatorsv1alpha1.InstallPlan, error) {
+					err := ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(ip), ip)
+					return ip, err
+				},
+				waitFor,
+				interval,
+			).Should(HavePhase(operatorsv1alpha1.InstallPlanPhaseFailed))
+		})
 
-		// Update OperatorGroup status with namespace but no service account reference
-		now := metav1.Now()
-		og.Status = operatorsv1.OperatorGroupStatus{
-			Namespaces:        []string{ns.GetName()},
-			ServiceAccountRef: nil,
-			LastUpdated:       &now,
-		}
-		_, err = crc.OperatorsV1().OperatorGroups(ns.GetName()).UpdateStatus(context.TODO(), og, metav1.UpdateOptions{})
-		Expect(err).ToNot(HaveOccurred())
+		It("should timeout and fail the InstallPlan for an invalid bundle image", func() {
+			// Create an InstallPlan status.bundleLookups.Path specified for an invalid bundle image
+			ip.Status.BundleLookups[0].Path = "alpine:3.13"
 
-		installPlanName := "ip"
-		ip := newInstallPlanWithDummySteps(installPlanName, ns.GetName(), operatorsv1alpha1.InstallPlanPhaseNone)
-		outIP, err := crc.OperatorsV1alpha1().InstallPlans(ns.GetName()).Create(context.TODO(), ip, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-		Expect(outIP).NotTo(BeNil())
+			Eventually(func() error {
+				return ctx.Ctx().Client().Create(context.Background(), ip)
+			}, timeout, interval).Should(Succeed(), "could not create InstallPlan")
 
-		// The status gets ignored on create so we need to update it else the InstallPlan sync ignores
-		// InstallPlans without any steps or bundle lookups
-		outIP.Status = ip.Status
-		_, err = crc.OperatorsV1alpha1().InstallPlans(ns.GetName()).UpdateStatus(context.TODO(), outIP, metav1.UpdateOptions{})
-		Expect(err).NotTo(HaveOccurred())
+			// The status gets ignored on create so we need to update it else the InstallPlan sync ignores
+			// InstallPlans without any steps or bundle lookups
+			Eventually(func() error {
+				return ctx.Ctx().Client().Status().Update(context.Background(), ip)
+			}, timeout, interval).Should(Succeed(), "could not update InstallPlan status")
 
-		fetchedInstallPlan, err := fetchInstallPlanWithNamespace(GinkgoT(), crc, installPlanName, ns.GetName(), buildInstallPlanPhaseCheckFunc(operatorsv1alpha1.InstallPlanPhaseFailed))
-		Expect(err).NotTo(HaveOccurred())
-		Expect(fetchedInstallPlan).NotTo(BeNil())
-		ctx.Ctx().Logf(fmt.Sprintf("Install plan %s fetched with status %s", fetchedInstallPlan.GetName(), fetchedInstallPlan.Status.Phase))
-		ctx.Ctx().Logf(fmt.Sprintf("Install plan %s fetched with conditions %+v", fetchedInstallPlan.GetName(), fetchedInstallPlan.Status.Conditions))
+			// The InstallPlan should fail after the unpack pod keeps failing and exceeds the job's
+			// BackoffLimit(set to 3), which for 4 failures is an exponential backoff (10s + 20s + 40s + 80s)= 2m30s
+			// so we wait a little over that.
+			Eventually(
+				func() (*operatorsv1alpha1.InstallPlan, error) {
+					err := ctx.Ctx().Client().Get(context.Background(), client.ObjectKeyFromObject(ip), ip)
+					return ip, err
+				},
+				5*time.Minute,
+				interval,
+			).Should(HavePhase(operatorsv1alpha1.InstallPlanPhaseFailed))
+		})
+
 	})
 
 	It("compresses installplan step resource manifests to configmap references", func() {
@@ -3027,7 +3603,7 @@ var _ = Describe("Install Plan", func() {
 				Labels:    map[string]string{"olm.catalogSource": "kaili-catalog"},
 			},
 			Spec: operatorsv1alpha1.CatalogSourceSpec{
-				Image:      "quay.io/olmtest/single-bundle-index:1.0.0",
+				Image:      "quay.io/operator-framework/ci-index:latest",
 				SourceType: operatorsv1alpha1.SourceTypeGrpc,
 			},
 		}
@@ -3156,7 +3732,7 @@ var _ = Describe("Install Plan", func() {
 
 		// Wait for the OperatorGroup to be synced and have a status.ServiceAccountRef
 		// before moving on. Otherwise the catalog operator treats it as an invalid OperatorGroup
-		// and fails the InstallPlan
+		// and the InstallPlan is resynced
 		Eventually(func() (*corev1.ObjectReference, error) {
 			outOG, err := crc.OperatorsV1().OperatorGroups(ns.GetName()).Get(context.TODO(), og.Name, metav1.GetOptions{})
 			if err != nil {
@@ -3182,7 +3758,7 @@ var _ = Describe("Install Plan", func() {
 					Kind:     "ins",
 					ListKind: "ins" + "list",
 				},
-				Scope: "Namespaced",
+				Scope: apiextensionsv1.NamespaceScoped,
 				Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
 					{
 						Name:    "v1alpha1",
@@ -3412,7 +3988,7 @@ var _ = Describe("Install Plan", func() {
 
 		// Wait for the OperatorGroup to be synced and have a status.ServiceAccountRef
 		// before moving on. Otherwise the catalog operator treats it as an invalid OperatorGroup
-		// and fails the InstallPlan
+		// and the InstallPlan is resynced
 		Eventually(func() (*corev1.ObjectReference, error) {
 			outOG, err := crc.OperatorsV1().OperatorGroups(ns.GetName()).Get(context.TODO(), og.Name, metav1.GetOptions{})
 			if err != nil {
@@ -3440,7 +4016,7 @@ var _ = Describe("Install Plan", func() {
 					Kind:     "ins",
 					ListKind: "ins" + "list",
 				},
-				Scope: "Namespaced",
+				Scope: apiextensionsv1.NamespaceScoped,
 				Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
 					{
 						Name:    "v1alpha1",
@@ -3568,7 +4144,7 @@ type checkInstallPlanFunc func(fip *operatorsv1alpha1.InstallPlan) bool
 
 func validateCRDVersions(t GinkgoTInterface, c operatorclient.ClientInterface, name string, expectedVersions map[string]struct{}) {
 	// Retrieve CRD information
-	crd, err := c.ApiextensionsInterface().ApiextensionsV1beta1().CustomResourceDefinitions().Get(context.TODO(), name, metav1.GetOptions{})
+	crd, err := c.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), name, metav1.GetOptions{})
 	require.NoError(t, err)
 
 	require.Equal(t, len(expectedVersions), len(crd.Spec.Versions), "number of CRD versions don't not match installed")
@@ -3587,7 +4163,7 @@ func validateCRDVersions(t GinkgoTInterface, c operatorclient.ClientInterface, n
 
 func buildInstallPlanPhaseCheckFunc(phases ...operatorsv1alpha1.InstallPlanPhase) checkInstallPlanFunc {
 	return func(fip *operatorsv1alpha1.InstallPlan) bool {
-		ctx.Ctx().Logf("installplan is %s", fip.Status.Phase)
+		ctx.Ctx().Logf("installplan %v is in phase %v", fip.GetName(), fip.Status.Phase)
 		satisfiesAny := false
 		for _, phase := range phases {
 			satisfiesAny = satisfiesAny || fip.Status.Phase == phase
@@ -3701,15 +4277,27 @@ func newCRD(plural string) apiextensions.CustomResourceDefinition {
 			Name: plural + ".cluster.com",
 		},
 		Spec: apiextensions.CustomResourceDefinitionSpec{
-			Group:   "cluster.com",
-			Version: "v1alpha1",
+			Group: "cluster.com",
+			Versions: []apiextensions.CustomResourceDefinitionVersion{
+				{
+					Name:    "v1alpha1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type:        "object",
+							Description: "my crd schema",
+						},
+					},
+				},
+			},
 			Names: apiextensions.CustomResourceDefinitionNames{
 				Plural:   plural,
 				Singular: plural,
 				Kind:     plural,
 				ListKind: plural + "list",
 			},
-			Scope: "Namespaced",
+			Scope: apiextensions.NamespaceScoped,
 		},
 	}
 
@@ -3769,14 +4357,10 @@ func newCSV(name, namespace, replaces string, version semver.Version, owned []ap
 	// Populate owned and required
 	for _, crd := range owned {
 		crdVersion := "v1alpha1"
-		if crd.Spec.Version != "" {
-			crdVersion = crd.Spec.Version
-		} else {
-			for _, v := range crd.Spec.Versions {
-				if v.Served && v.Storage {
-					crdVersion = v.Name
-					break
-				}
+		for _, v := range crd.Spec.Versions {
+			if v.Served && v.Storage {
+				crdVersion = v.Name
+				break
 			}
 		}
 		desc := operatorsv1alpha1.CRDDescription{
@@ -3791,14 +4375,10 @@ func newCSV(name, namespace, replaces string, version semver.Version, owned []ap
 
 	for _, crd := range required {
 		crdVersion := "v1alpha1"
-		if crd.Spec.Version != "" {
-			crdVersion = crd.Spec.Version
-		} else {
-			for _, v := range crd.Spec.Versions {
-				if v.Served && v.Storage {
-					crdVersion = v.Name
-					break
-				}
+		for _, v := range crd.Spec.Versions {
+			if v.Served && v.Storage {
+				crdVersion = v.Name
+				break
 			}
 		}
 		desc := operatorsv1alpha1.CRDDescription{
@@ -3843,4 +4423,13 @@ func newInstallPlanWithDummySteps(name, namespace string, phase operatorsv1alpha
 			},
 		},
 	}
+}
+
+func hasCondition(ip *v1alpha1.InstallPlan, expectedCondition v1alpha1.InstallPlanCondition) bool {
+	for _, cond := range ip.Status.Conditions {
+		if cond.Type == expectedCondition.Type && cond.Message == expectedCondition.Message && cond.Status == expectedCondition.Status {
+			return true
+		}
+	}
+	return false
 }
