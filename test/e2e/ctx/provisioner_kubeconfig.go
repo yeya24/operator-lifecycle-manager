@@ -1,5 +1,3 @@
-// +build !kind
-
 package ctx
 
 import (

@@ -8,12 +8,14 @@ import (
 
 	"github.com/operator-framework/api/pkg/validation/errors"
 	interfaces "github.com/operator-framework/api/pkg/validation/interfaces"
+
 	"github.com/operator-framework/operator-registry/pkg/registry"
 )
 
 var RegistryBundleValidator interfaces.Validator = interfaces.ValidatorFunc(validateBundles)
 
-func validateBundles(objs ...interface{}) (results []errors.ManifestResult) {
+func validateBundles(objs ...interface{}) []errors.ManifestResult {
+	var results []errors.ManifestResult
 	for _, obj := range objs {
 		switch v := obj.(type) {
 		case *registry.Bundle:
@@ -23,7 +25,8 @@ func validateBundles(objs ...interface{}) (results []errors.ManifestResult) {
 	return results
 }
 
-func validateBundle(bundle *registry.Bundle) (result errors.ManifestResult) {
+func validateBundle(bundle *registry.Bundle) errors.ManifestResult {
+	var result errors.ManifestResult
 	csv, err := bundle.ClusterServiceVersion()
 	if err != nil {
 		result.Add(errors.ErrInvalidParse("error getting bundle CSV", err))
@@ -36,10 +39,23 @@ func validateBundle(bundle *registry.Bundle) (result errors.ManifestResult) {
 		result.Add(errors.ErrInvalidParse("error getting bundle CSV version", err))
 		return result
 	}
+	release, err := csv.GetRelease()
+	if err != nil {
+		result.Add(errors.ErrInvalidParse("error getting bundle CSV release version", err))
+		return result
+	}
+	substitutesFor := csv.GetSubstitutesFor()
+	if release != "" && substitutesFor != "" {
+		result.Add(errors.ErrInvalidBundle(
+			fmt.Sprintf("bundle %q cannot have both a release version (%q) and olm.substitutesFor annotation (%q)", bundle.Name, release, substitutesFor),
+			registry.DefinitionKey{},
+		))
+	}
 	return result
 }
 
-func validateOwnedCRDs(bundle *registry.Bundle, csv *registry.ClusterServiceVersion) (result errors.ManifestResult) {
+func validateOwnedCRDs(bundle *registry.Bundle, csv *registry.ClusterServiceVersion) errors.ManifestResult {
+	var result errors.ManifestResult
 	ownedKeys, _, err := csv.GetCustomResourceDefintions()
 	if err != nil {
 		result.Add(errors.ErrInvalidParse("error getting CSV CRDs", err))

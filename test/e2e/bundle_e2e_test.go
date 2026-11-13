@@ -6,11 +6,12 @@ import (
 	"encoding/json"
 
 	"github.com/ghodss/yaml"
+	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -25,24 +26,29 @@ import (
 //go:embed testdata/vpa/crd.yaml
 var vpaCRDRaw []byte
 
-var _ = Describe("Installing bundles with new object types", func() {
+var _ = Describe("Installing bundles with new object types", Label("ObjectTypes"), func() {
 	var (
-		kubeClient     operatorclient.ClientInterface
-		operatorClient versioned.Interface
-		dynamicClient  dynamic.Interface
+		kubeClient         operatorclient.ClientInterface
+		operatorClient     versioned.Interface
+		dynamicClient      dynamic.Interface
+		generatedNamespace corev1.Namespace
 	)
 
 	BeforeEach(func() {
 		kubeClient = ctx.Ctx().KubeClient()
 		operatorClient = ctx.Ctx().OperatorClient()
 		dynamicClient = ctx.Ctx().DynamicClient()
+
+		By("creating a test namespace")
+		generatedNamespace = SetupGeneratedTestNamespace(genName("bundle-e2e-"))
 	})
 
 	AfterEach(func() {
-		TearDown(testNamespace)
+		TeardownNamespace(generatedNamespace.GetName())
 	})
 
-	When("a bundle with a pdb, priorityclass, and VPA object is installed", func() {
+	When("a bundle that includes supported resources is installed", func() {
+		// Supported resources installed are a NetworkPolicy, pdb, priorityclass, and VPA object
 		const (
 			packageName = "busybox"
 			channelName = "alpha"
@@ -54,10 +60,10 @@ var _ = Describe("Installing bundles with new object types", func() {
 			By("first installing the VPA CRD on cluster")
 			const (
 				sourceName = "test-catalog"
-				imageName  = "quay.io/olmtest/single-bundle-index:pdb"
+				imageName  = "quay.io/olmtest/single-bundle-index:pdb-v2"
 			)
 
-			// create VPA CRD on cluster
+			By("create VPA CRD on cluster")
 			Expect(vpaCRDRaw).ToNot(BeEmpty(), "could not read vpa bindata")
 			data, err := yaml.YAMLToJSON(vpaCRDRaw)
 			Expect(err).ToNot(HaveOccurred(), "could not convert vpa crd to json")
@@ -66,25 +72,24 @@ var _ = Describe("Installing bundles with new object types", func() {
 			Expect(err).ToNot(HaveOccurred(), "could not convert vpa crd to unstructured")
 
 			Eventually(func() error {
-				err := ctx.Ctx().Client().Create(context.TODO(), &vpaCRD)
+				err := ctx.Ctx().Client().Create(context.Background(), &vpaCRD)
 				if err != nil {
-					if !k8serrors.IsAlreadyExists(err) {
+					if !apierrors.IsAlreadyExists(err) {
 						return err
 					}
 				}
 				return nil
 			}).Should(Succeed())
 
-			// ensure vpa crd is established and accepted on the cluster before continuing
+			By("ensure vpa crd is established and accepted on the cluster before continuing")
 			Eventually(func() (bool, error) {
-				crd, err := kubeClient.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), vpaCRD.GetName(), metav1.GetOptions{})
+				crd, err := kubeClient.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Get(context.Background(), vpaCRD.GetName(), metav1.GetOptions{})
 				if err != nil {
 					return false, err
 				}
 				return crdReady(&crd.Status), nil
 			}).Should(BeTrue())
 
-			var installPlanRef string
 			source := &v1alpha1.CatalogSource{
 				TypeMeta: metav1.TypeMeta{
 					Kind:       v1alpha1.CatalogSourceKind,
@@ -92,31 +97,38 @@ var _ = Describe("Installing bundles with new object types", func() {
 				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      sourceName,
-					Namespace: testNamespace,
+					Namespace: generatedNamespace.GetName(),
 					Labels:    map[string]string{"olm.catalogSource": sourceName},
 				},
 				Spec: v1alpha1.CatalogSourceSpec{
 					SourceType: v1alpha1.SourceTypeGrpc,
 					Image:      imageName,
+					GrpcPodConfig: &v1alpha1.GrpcPodConfig{
+						SecurityContextConfig: v1alpha1.Restricted,
+					},
 				},
 			}
 
 			Eventually(func() error {
-				source, err = operatorClient.OperatorsV1alpha1().CatalogSources(source.GetNamespace()).Create(context.TODO(), source, metav1.CreateOptions{})
+				source, err = operatorClient.OperatorsV1alpha1().CatalogSources(source.GetNamespace()).Create(context.Background(), source, metav1.CreateOptions{})
 				return err
 			}).Should(Succeed())
 
-			// Create a Subscription for package
+			By("Wait for the CatalogSource to be ready")
+			_, err = fetchCatalogSourceOnStatus(operatorClient, source.GetName(), source.GetNamespace(), catalogSourceRegistryPodSynced())
+			Expect(err).ToNot(HaveOccurred(), "catalog source did not become ready")
+
+			By("Create a Subscription for package")
 			_ = createSubscriptionForCatalog(operatorClient, source.GetNamespace(), subName, source.GetName(), packageName, channelName, "", v1alpha1.ApprovalAutomatic)
 
-			// Wait for the Subscription to succeed
-			sub, err := fetchSubscription(operatorClient, testNamespace, subName, subscriptionStateAtLatestChecker)
+			By("Wait for the Subscription to succeed")
+			sub, err := fetchSubscription(operatorClient, generatedNamespace.GetName(), subName, subscriptionStateAtLatestChecker())
 			Expect(err).ToNot(HaveOccurred(), "could not get subscription at latest status")
 
-			installPlanRef = sub.Status.InstallPlanRef.Name
+			installPlanRef := sub.Status.InstallPlanRef
 
-			// Wait for the installplan to complete (5 minute timeout)
-			_, err = fetchInstallPlan(GinkgoT(), operatorClient, installPlanRef, buildInstallPlanPhaseCheckFunc(v1alpha1.InstallPlanPhaseComplete))
+			By("Wait for the installplan to complete (5 minute timeout)")
+			_, err = fetchInstallPlanWithNamespace(GinkgoT(), operatorClient, installPlanRef.Name, installPlanRef.Namespace, buildInstallPlanPhaseCheckFunc(v1alpha1.InstallPlanPhaseComplete))
 			Expect(err).ToNot(HaveOccurred(), "could not get installplan at complete phase")
 
 			ctx.Ctx().Logf("install plan %s completed", installPlanRef)
@@ -130,6 +142,7 @@ var _ = Describe("Installing bundles with new object types", func() {
 				pdbName           = "busybox-pdb"
 				priorityClassName = "super-priority"
 				vpaName           = "busybox-vpa"
+				networkPolicyName = "busybox-networkpolicy"
 			)
 
 			var resource = schema.GroupVersionResource{
@@ -138,28 +151,33 @@ var _ = Describe("Installing bundles with new object types", func() {
 				Resource: vpaResource,
 			}
 
-			// confirm extra bundle objects are installed
+			By("confirm extra bundle objects are installed")
 			Eventually(func() error {
-				_, err := kubeClient.KubernetesInterface().PolicyV1beta1().PodDisruptionBudgets(testNamespace).Get(context.TODO(), pdbName, metav1.GetOptions{})
-				return err
-			}).Should(Succeed(), "expected no error getting pdb object associated with CSV")
-
-			Eventually(func() error {
-				_, err := kubeClient.KubernetesInterface().SchedulingV1().PriorityClasses().Get(context.TODO(), priorityClassName, metav1.GetOptions{})
+				_, err := kubeClient.KubernetesInterface().SchedulingV1().PriorityClasses().Get(context.Background(), priorityClassName, metav1.GetOptions{})
 				return err
 			}).Should(Succeed(), "expected no error getting priorityclass object associated with CSV")
 
 			Eventually(func() error {
-				_, err := dynamicClient.Resource(resource).Namespace(testNamespace).Get(context.TODO(), vpaName, metav1.GetOptions{})
+				_, err := dynamicClient.Resource(resource).Namespace(generatedNamespace.GetName()).Get(context.Background(), vpaName, metav1.GetOptions{})
 				return err
 			}).Should(Succeed(), "expected no error finding vpa object associated with csv")
+
+			Eventually(func() error {
+				_, err := kubeClient.KubernetesInterface().PolicyV1().PodDisruptionBudgets(generatedNamespace.GetName()).Get(context.Background(), pdbName, metav1.GetOptions{})
+				return err
+			}).Should(Succeed(), "expected no error getting pdb object associated with CSV")
+
+			Eventually(func() error {
+				_, err := kubeClient.KubernetesInterface().NetworkingV1().NetworkPolicies(generatedNamespace.GetName()).Get(context.Background(), networkPolicyName, metav1.GetOptions{})
+				return err
+			}).Should(Succeed(), "expected no error finding networkpolicy object associated with CSV")
 		})
 
 		AfterEach(func() {
 			By("Deleting the VPA CRD")
 			Eventually(func() error {
-				err := ctx.Ctx().Client().Delete(context.TODO(), &vpaCRD)
-				if k8serrors.IsNotFound(err) {
+				err := ctx.Ctx().Client().Delete(context.Background(), &vpaCRD)
+				if apierrors.IsNotFound(err) {
 					return nil
 				}
 				return err

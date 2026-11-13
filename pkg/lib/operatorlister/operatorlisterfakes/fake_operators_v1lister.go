@@ -4,16 +4,15 @@ package operatorlisterfakes
 import (
 	"sync"
 
-	v1 "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorlister"
 )
 
 type FakeOperatorsV1Lister struct {
 	OperatorGroupListerStub        func() v1.OperatorGroupLister
 	operatorGroupListerMutex       sync.RWMutex
-	operatorGroupListerArgsForCall []struct {
-	}
-	operatorGroupListerReturns struct {
+	operatorGroupListerArgsForCall []struct{}
+	operatorGroupListerReturns     struct {
 		result1 v1.OperatorGroupLister
 	}
 	operatorGroupListerReturnsOnCall map[int]struct {
@@ -21,28 +20,32 @@ type FakeOperatorsV1Lister struct {
 	}
 	RegisterOperatorGroupListerStub        func(string, v1.OperatorGroupLister)
 	registerOperatorGroupListerMutex       sync.RWMutex
-	registerOperatorGroupListerArgsForCall []struct {
-		arg1 string
-		arg2 v1.OperatorGroupLister
-	}
-	invocations      map[string][][]interface{}
-	invocationsMutex sync.RWMutex
+	registerOperatorGroupListerArgsForCall []FakeOperatorsV1ListerRegisterOperatorGroupListerArgs
+	invocations                            map[string][][]interface{}
+	callOrder                              []string
+	invocationsMutex                       sync.RWMutex
+}
+
+// FakeOperatorsV1ListerRegisterOperatorGroupListerArgs holds the arguments of one call to RegisterOperatorGroupLister.
+type FakeOperatorsV1ListerRegisterOperatorGroupListerArgs struct {
+	Arg1 string
+	Arg2 v1.OperatorGroupLister
 }
 
 func (fake *FakeOperatorsV1Lister) OperatorGroupLister() v1.OperatorGroupLister {
 	fake.operatorGroupListerMutex.Lock()
 	ret, specificReturn := fake.operatorGroupListerReturnsOnCall[len(fake.operatorGroupListerArgsForCall)]
-	fake.operatorGroupListerArgsForCall = append(fake.operatorGroupListerArgsForCall, struct {
-	}{})
+	fake.operatorGroupListerArgsForCall = append(fake.operatorGroupListerArgsForCall, struct{}{})
+	stub := fake.OperatorGroupListerStub
+	fakeReturns := fake.operatorGroupListerReturns
 	fake.recordInvocation("OperatorGroupLister", []interface{}{})
 	fake.operatorGroupListerMutex.Unlock()
-	if fake.OperatorGroupListerStub != nil {
-		return fake.OperatorGroupListerStub()
+	if stub != nil {
+		return stub()
 	}
 	if specificReturn {
 		return ret.result1
 	}
-	fakeReturns := fake.operatorGroupListerReturns
 	return fakeReturns.result1
 }
 
@@ -83,14 +86,12 @@ func (fake *FakeOperatorsV1Lister) OperatorGroupListerReturnsOnCall(i int, resul
 
 func (fake *FakeOperatorsV1Lister) RegisterOperatorGroupLister(arg1 string, arg2 v1.OperatorGroupLister) {
 	fake.registerOperatorGroupListerMutex.Lock()
-	fake.registerOperatorGroupListerArgsForCall = append(fake.registerOperatorGroupListerArgsForCall, struct {
-		arg1 string
-		arg2 v1.OperatorGroupLister
-	}{arg1, arg2})
+	fake.registerOperatorGroupListerArgsForCall = append(fake.registerOperatorGroupListerArgsForCall, FakeOperatorsV1ListerRegisterOperatorGroupListerArgs{arg1, arg2})
+	stub := fake.RegisterOperatorGroupListerStub
 	fake.recordInvocation("RegisterOperatorGroupLister", []interface{}{arg1, arg2})
 	fake.registerOperatorGroupListerMutex.Unlock()
-	if fake.RegisterOperatorGroupListerStub != nil {
-		fake.RegisterOperatorGroupListerStub(arg1, arg2)
+	if stub != nil {
+		stub(arg1, arg2)
 	}
 }
 
@@ -110,16 +111,20 @@ func (fake *FakeOperatorsV1Lister) RegisterOperatorGroupListerArgsForCall(i int)
 	fake.registerOperatorGroupListerMutex.RLock()
 	defer fake.registerOperatorGroupListerMutex.RUnlock()
 	argsForCall := fake.registerOperatorGroupListerArgsForCall[i]
-	return argsForCall.arg1, argsForCall.arg2
+	return argsForCall.Arg1, argsForCall.Arg2
+}
+
+func (fake *FakeOperatorsV1Lister) RegisterOperatorGroupListerArgs() []FakeOperatorsV1ListerRegisterOperatorGroupListerArgs {
+	fake.registerOperatorGroupListerMutex.RLock()
+	defer fake.registerOperatorGroupListerMutex.RUnlock()
+	args := make([]FakeOperatorsV1ListerRegisterOperatorGroupListerArgs, len(fake.registerOperatorGroupListerArgsForCall))
+	copy(args, fake.registerOperatorGroupListerArgsForCall)
+	return args
 }
 
 func (fake *FakeOperatorsV1Lister) Invocations() map[string][][]interface{} {
 	fake.invocationsMutex.RLock()
 	defer fake.invocationsMutex.RUnlock()
-	fake.operatorGroupListerMutex.RLock()
-	defer fake.operatorGroupListerMutex.RUnlock()
-	fake.registerOperatorGroupListerMutex.RLock()
-	defer fake.registerOperatorGroupListerMutex.RUnlock()
 	copiedInvocations := map[string][][]interface{}{}
 	for key, value := range fake.invocations {
 		copiedInvocations[key] = value
@@ -127,9 +132,18 @@ func (fake *FakeOperatorsV1Lister) Invocations() map[string][][]interface{} {
 	return copiedInvocations
 }
 
+func (fake *FakeOperatorsV1Lister) CallOrder() []string {
+	fake.invocationsMutex.RLock()
+	defer fake.invocationsMutex.RUnlock()
+	order := make([]string, len(fake.callOrder))
+	copy(order, fake.callOrder)
+	return order
+}
+
 func (fake *FakeOperatorsV1Lister) recordInvocation(key string, args []interface{}) {
 	fake.invocationsMutex.Lock()
 	defer fake.invocationsMutex.Unlock()
+	fake.callOrder = append(fake.callOrder, key)
 	if fake.invocations == nil {
 		fake.invocations = map[string][][]interface{}{}
 	}

@@ -3,16 +3,15 @@ package configmap
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"regexp"
 
-	"github.com/ghodss/yaml"
 	"github.com/sirupsen/logrus"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/yaml"
 
 	"github.com/operator-framework/operator-registry/pkg/client"
 	"github.com/operator-framework/operator-registry/pkg/lib/bundle"
@@ -68,7 +67,7 @@ func NewConfigMapLoaderWithClient(configMapName, namespace, manifestsDir string,
 }
 
 func TranslateInvalidChars(input string) string {
-	validConfigMapKey := unallowedKeyChars.ReplaceAllString(input, "~")
+	validConfigMapKey := unallowedKeyChars.ReplaceAllString(input, "-")
 	return validConfigMapKey
 }
 
@@ -85,7 +84,7 @@ func (c *ConfigMapWriter) Populate(maxDataSizeLimit uint64) error {
 	var totalSize uint64
 	for _, dir := range subDirs {
 		completePath := c.manifestsDir + dir
-		files, err := ioutil.ReadDir(completePath)
+		files, err := os.ReadDir(completePath)
 		if err != nil {
 			logrus.Errorf("read dir failed: %v", err)
 			return err
@@ -95,7 +94,7 @@ func (c *ConfigMapWriter) Populate(maxDataSizeLimit uint64) error {
 			log := logrus.WithField("file", completePath+file.Name())
 			log.Info("Reading file")
 
-			content, err := ioutil.ReadFile(completePath + file.Name())
+			content, err := os.ReadFile(completePath + file.Name())
 			if err != nil {
 				log.Errorf("read failed: %v", err)
 				return err
@@ -140,7 +139,7 @@ func (c *ConfigMapWriter) Populate(maxDataSizeLimit uint64) error {
 				logrus.WithFields(logrus.Fields{
 					"file.Name":         file.Name(),
 					"validConfigMapKey": validConfigMapKey,
-				}).Info("translated filename for configmap comptability")
+				}).Info("translated filename for configmap compatibility")
 			}
 
 			if c.gzip {

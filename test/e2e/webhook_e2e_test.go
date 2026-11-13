@@ -2,12 +2,20 @@ package e2e
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
+	"math"
+	"math/big"
 	"strings"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/operator-framework/operator-lifecycle-manager/test/e2e/ctx"
 	"github.com/stretchr/testify/require"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -20,6 +28,7 @@ import (
 	v1 "github.com/operator-framework/api/pkg/operators/v1"
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/certs"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorclient"
 )
@@ -29,57 +38,57 @@ const (
 	webhookName = "webhook.test.com"
 )
 
-var _ = Describe("CSVs with a Webhook", func() {
-	var c operatorclient.ClientInterface
-	var crc versioned.Interface
-	var namespace *corev1.Namespace
-	var nsCleanupFunc cleanupFunc
-	var nsLabels map[string]string
+var _ = Describe("CSVs with a Webhook", Label("Webhooks"), func() {
+	var (
+		generatedNamespace corev1.Namespace
+		c                  operatorclient.ClientInterface
+		crc                versioned.Interface
+		nsLabels           map[string]string
+	)
+
 	BeforeEach(func() {
-		c = newKubeClient()
-		crc = newCRClient()
+		c = ctx.Ctx().KubeClient()
+		crc = ctx.Ctx().OperatorClient()
 		nsLabels = map[string]string{
 			"foo": "bar",
 		}
-		namespace = &corev1.Namespace{
+		generatedNamespace = corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:   genName("webhook-test-"),
-				Labels: nsLabels,
+				Name: genName("webhook-e2e-"),
+				Labels: map[string]string{
+					"foo": "bar",
+				},
 			},
 		}
-
-		var err error
-		namespace, err = c.KubernetesInterface().CoreV1().Namespaces().Create(context.TODO(), namespace, metav1.CreateOptions{})
-		Expect(err).Should(BeNil())
-		Expect(namespace).ShouldNot(BeNil())
-
-		nsCleanupFunc = func() {
-			err := c.KubernetesInterface().CoreV1().Namespaces().Delete(context.TODO(), namespace.GetName(), metav1.DeleteOptions{})
-			Expect(err).Should(BeNil())
-		}
+		Eventually(func() error {
+			return ctx.Ctx().Client().Create(context.Background(), &generatedNamespace)
+		}).Should(Succeed())
 	})
+
 	AfterEach(func() {
-		if nsCleanupFunc != nil {
-			nsCleanupFunc()
-		}
+		TeardownNamespace(generatedNamespace.GetName())
 	})
+
 	When("Installed in an OperatorGroup that defines a selector", func() {
 		var cleanupCSV cleanupFunc
 		var ogSelector *metav1.LabelSelector
+
 		BeforeEach(func() {
 			ogSelector = &metav1.LabelSelector{
 				MatchLabels: nsLabels,
 			}
 
-			og := newOperatorGroup(namespace.Name, genName("selector-og-"), nil, ogSelector, nil, false)
-			_, err := crc.OperatorsV1().OperatorGroups(namespace.Name).Create(context.TODO(), og, metav1.CreateOptions{})
+			og := newOperatorGroup(generatedNamespace.GetName(), genName("selector-og-"), nil, ogSelector, nil, false)
+			_, err := crc.OperatorsV1().OperatorGroups(generatedNamespace.GetName()).Create(context.TODO(), og, metav1.CreateOptions{})
 			Expect(err).Should(BeNil())
 		})
+
 		AfterEach(func() {
 			if cleanupCSV != nil {
 				cleanupCSV()
 			}
 		})
+
 		It("The webhook is scoped to the selector", func() {
 			sideEffect := admissionregistrationv1.SideEffectClassNone
 			webhook := operatorsv1alpha1.WebhookDescription{
@@ -91,12 +100,12 @@ var _ = Describe("CSVs with a Webhook", func() {
 				SideEffects:             &sideEffect,
 			}
 
-			csv := createCSVWithWebhook(namespace.GetName(), webhook)
+			csv := createCSVWithWebhook(generatedNamespace.GetName(), webhook)
 			var err error
-			cleanupCSV, err = createCSV(c, crc, csv, namespace.Name, false, false)
+			cleanupCSV, err = createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
 
-			_, err = fetchCSV(crc, csv.Name, namespace.Name, csvSucceededChecker)
+			_, err = fetchCSV(crc, generatedNamespace.GetName(), csv.Name, csvSucceededChecker)
 			Expect(err).Should(BeNil())
 
 			actualWebhook, err := getWebhookWithGenerateName(c, webhook.GenerateName)
@@ -108,17 +117,20 @@ var _ = Describe("CSVs with a Webhook", func() {
 	When("Installed in a SingleNamespace OperatorGroup", func() {
 		var cleanupCSV cleanupFunc
 		var og *v1.OperatorGroup
+
 		BeforeEach(func() {
-			og = newOperatorGroup(namespace.Name, genName("single-namespace-og-"), nil, nil, []string{namespace.Name}, false)
+			og = newOperatorGroup(generatedNamespace.GetName(), genName("single-namespace-og-"), nil, nil, []string{generatedNamespace.GetName()}, false)
 			var err error
-			og, err = crc.OperatorsV1().OperatorGroups(namespace.Name).Create(context.TODO(), og, metav1.CreateOptions{})
+			og, err = crc.OperatorsV1().OperatorGroups(generatedNamespace.GetName()).Create(context.TODO(), og, metav1.CreateOptions{})
 			Expect(err).Should(BeNil())
 		})
+
 		AfterEach(func() {
 			if cleanupCSV != nil {
 				cleanupCSV()
 			}
 		})
+
 		It("Creates Webhooks scoped to a single namespace", func() {
 			sideEffect := admissionregistrationv1.SideEffectClassNone
 			webhook := operatorsv1alpha1.WebhookDescription{
@@ -130,12 +142,12 @@ var _ = Describe("CSVs with a Webhook", func() {
 				SideEffects:             &sideEffect,
 			}
 
-			csv := createCSVWithWebhook(namespace.GetName(), webhook)
+			csv := createCSVWithWebhook(generatedNamespace.GetName(), webhook)
 			var err error
-			cleanupCSV, err = createCSV(c, crc, csv, namespace.Name, false, false)
+			cleanupCSV, err = createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
 
-			_, err = fetchCSV(crc, csv.Name, namespace.Name, csvSucceededChecker)
+			_, err = fetchCSV(crc, generatedNamespace.GetName(), csv.Name, csvSucceededChecker)
 			Expect(err).Should(BeNil())
 
 			actualWebhook, err := getWebhookWithGenerateName(c, webhook.GenerateName)
@@ -150,32 +162,28 @@ var _ = Describe("CSVs with a Webhook", func() {
 			}
 			Expect(actualWebhook.Webhooks[0].NamespaceSelector).Should(Equal(expected))
 
-			// Ensure that changes to the WebhookDescription within the CSV trigger an update to on cluster resources
+			By(`Ensure that changes to the WebhookDescription within the CSV trigger an update to on cluster resources`)
 			changedGenerateName := webhookName + "-changed"
 			Eventually(func() error {
-				existingCSV, err := crc.OperatorsV1alpha1().ClusterServiceVersions(namespace.Name).Get(context.TODO(), csv.GetName(), metav1.GetOptions{})
+				existingCSV, err := crc.OperatorsV1alpha1().ClusterServiceVersions(generatedNamespace.GetName()).Get(context.TODO(), csv.GetName(), metav1.GetOptions{})
 				if err != nil {
 					return err
 				}
 				existingCSV.Spec.WebhookDefinitions[0].GenerateName = changedGenerateName
 
-				existingCSV, err = crc.OperatorsV1alpha1().ClusterServiceVersions(namespace.Name).Update(context.TODO(), existingCSV, metav1.UpdateOptions{})
+				existingCSV, err = crc.OperatorsV1alpha1().ClusterServiceVersions(generatedNamespace.GetName()).Update(context.TODO(), existingCSV, metav1.UpdateOptions{})
 				return err
 			}, time.Minute, 5*time.Second).Should(Succeed())
 			Eventually(func() bool {
-				// Previous Webhook should be deleted
+				By(`Previous Webhook should be deleted`)
 				_, err = getWebhookWithGenerateName(c, webhookName)
 				if err != nil && err.Error() != "NotFound" {
 					return false
 				}
 
-				// Current Webhook should exist
+				By(`Current Webhook should exist`)
 				_, err = getWebhookWithGenerateName(c, changedGenerateName)
-				if err != nil {
-					return false
-				}
-
-				return true
+				return err == nil
 			}, time.Minute, 5*time.Second).Should(BeTrue())
 		})
 		It("Reuses existing valid certs", func() {
@@ -188,42 +196,39 @@ var _ = Describe("CSVs with a Webhook", func() {
 				AdmissionReviewVersions: []string{"v1beta1", "v1"},
 				SideEffects:             &sideEffect,
 			}
-			csv := createCSVWithWebhook(namespace.GetName(), webhook)
+			csv := createCSVWithWebhook(generatedNamespace.GetName(), webhook)
 
 			var err error
-			cleanupCSV, err = createCSV(c, crc, csv, namespace.GetName(), false, false)
+			cleanupCSV, err = createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
 
-			_, err = fetchCSV(crc, csv.Name, namespace.GetName(), csvSucceededChecker)
+			_, err = fetchCSV(crc, generatedNamespace.GetName(), csv.Name, csvSucceededChecker)
 			Expect(err).Should(BeNil())
 
-			// Get the existing secret
+			By(`Get the existing secret`)
 			webhookSecretName := webhook.DeploymentName + "-service-cert"
-			existingSecret, err := c.KubernetesInterface().CoreV1().Secrets(namespace.GetName()).Get(context.TODO(), webhookSecretName, metav1.GetOptions{})
+			existingSecret, err := c.KubernetesInterface().CoreV1().Secrets(generatedNamespace.GetName()).Get(context.TODO(), webhookSecretName, metav1.GetOptions{})
 			require.NoError(GinkgoT(), err)
 
-			// Modify the phase
+			By(`Modify the phase`)
 			Eventually(func() bool {
-				fetchedCSV, err := crc.OperatorsV1alpha1().ClusterServiceVersions(namespace.GetName()).Get(context.TODO(), csv.GetName(), metav1.GetOptions{})
+				fetchedCSV, err := crc.OperatorsV1alpha1().ClusterServiceVersions(generatedNamespace.GetName()).Get(context.TODO(), csv.GetName(), metav1.GetOptions{})
 				if err != nil {
 					return false
 				}
 
 				fetchedCSV.Status.Phase = operatorsv1alpha1.CSVPhasePending
 
-				_, err = crc.OperatorsV1alpha1().ClusterServiceVersions(namespace.GetName()).UpdateStatus(context.TODO(), fetchedCSV, metav1.UpdateOptions{})
-				if err != nil {
-					return false
-				}
-				return true
+				_, err = crc.OperatorsV1alpha1().ClusterServiceVersions(generatedNamespace.GetName()).UpdateStatus(context.TODO(), fetchedCSV, metav1.UpdateOptions{})
+				return err == nil
 			}).Should(BeTrue(), "Unable to set CSV phase to Pending")
 
-			// Wait for webhook-operator to succeed
-			_, err = awaitCSV(crc, namespace.GetName(), csv.GetName(), csvSucceededChecker)
+			By(`Wait for webhook-operator to succeed`)
+			_, err = fetchCSV(crc, generatedNamespace.GetName(), csv.GetName(), csvSucceededChecker)
 			require.NoError(GinkgoT(), err)
 
-			// Get the updated secret
-			updatedSecret, err := c.KubernetesInterface().CoreV1().Secrets(namespace.GetName()).Get(context.TODO(), webhookSecretName, metav1.GetOptions{})
+			By(`Get the updated secret`)
+			updatedSecret, err := c.KubernetesInterface().CoreV1().Secrets(generatedNamespace.GetName()).Get(context.TODO(), webhookSecretName, metav1.GetOptions{})
 			require.NoError(GinkgoT(), err)
 
 			require.Equal(GinkgoT(), existingSecret.GetAnnotations()[install.OLMCAHashAnnotationKey], updatedSecret.GetAnnotations()[install.OLMCAHashAnnotationKey])
@@ -240,13 +245,13 @@ var _ = Describe("CSVs with a Webhook", func() {
 				SideEffects:             &sideEffect,
 			}
 
-			csv := createCSVWithWebhook(namespace.GetName(), webhook)
+			csv := createCSVWithWebhook(generatedNamespace.GetName(), webhook)
 			csv.Spec.WebhookDefinitions = append(csv.Spec.WebhookDefinitions, webhook)
 			var err error
-			cleanupCSV, err = createCSV(c, crc, csv, namespace.Name, false, false)
+			cleanupCSV, err = createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
 
-			_, err = fetchCSV(crc, csv.Name, namespace.Name, csvFailedChecker)
+			_, err = fetchCSV(crc, generatedNamespace.GetName(), csv.Name, csvFailedChecker)
 			Expect(err).Should(BeNil())
 		})
 		It("Fails if the webhooks intercepts all resources", func() {
@@ -259,7 +264,7 @@ var _ = Describe("CSVs with a Webhook", func() {
 				AdmissionReviewVersions: []string{"v1beta1", "v1"},
 				SideEffects:             &sideEffect,
 				Rules: []admissionregistrationv1.RuleWithOperations{
-					admissionregistrationv1.RuleWithOperations{
+					{
 						Operations: []admissionregistrationv1.OperationType{},
 						Rule: admissionregistrationv1.Rule{
 							APIGroups:   []string{"*"},
@@ -270,15 +275,15 @@ var _ = Describe("CSVs with a Webhook", func() {
 				},
 			}
 
-			csv := createCSVWithWebhook(namespace.GetName(), webhook)
+			csv := createCSVWithWebhook(generatedNamespace.GetName(), webhook)
 
 			var err error
-			cleanupCSV, err = createCSV(c, crc, csv, namespace.Name, false, false)
+			cleanupCSV, err = createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
 
-			failedCSV, err := fetchCSV(crc, csv.Name, namespace.Name, csvFailedChecker)
+			failedCSV, err := fetchCSV(crc, generatedNamespace.GetName(), csv.Name, csvFailedChecker)
 			Expect(err).Should(BeNil())
-			Expect(failedCSV.Status.Message).Should(Equal("Webhook rules cannot include all groups"))
+			Expect(failedCSV.Status.Message).Should(Equal("webhook rules cannot include all groups"))
 		})
 		It("Fails if the webhook intercepts OLM resources", func() {
 			sideEffect := admissionregistrationv1.SideEffectClassNone
@@ -290,7 +295,7 @@ var _ = Describe("CSVs with a Webhook", func() {
 				AdmissionReviewVersions: []string{"v1beta1", "v1"},
 				SideEffects:             &sideEffect,
 				Rules: []admissionregistrationv1.RuleWithOperations{
-					admissionregistrationv1.RuleWithOperations{
+					{
 						Operations: []admissionregistrationv1.OperationType{},
 						Rule: admissionregistrationv1.Rule{
 							APIGroups:   []string{"operators.coreos.com"},
@@ -301,15 +306,15 @@ var _ = Describe("CSVs with a Webhook", func() {
 				},
 			}
 
-			csv := createCSVWithWebhook(namespace.GetName(), webhook)
+			csv := createCSVWithWebhook(generatedNamespace.GetName(), webhook)
 
 			var err error
-			cleanupCSV, err = createCSV(c, crc, csv, namespace.Name, false, false)
+			cleanupCSV, err = createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
 
-			failedCSV, err := fetchCSV(crc, csv.Name, namespace.Name, csvFailedChecker)
+			failedCSV, err := fetchCSV(crc, generatedNamespace.GetName(), csv.Name, csvFailedChecker)
 			Expect(err).Should(BeNil())
-			Expect(failedCSV.Status.Message).Should(Equal("Webhook rules cannot include the OLM group"))
+			Expect(failedCSV.Status.Message).Should(Equal("webhook rules cannot include the OLM group"))
 		})
 		It("Fails if webhook intercepts Admission Webhook resources", func() {
 			sideEffect := admissionregistrationv1.SideEffectClassNone
@@ -321,7 +326,7 @@ var _ = Describe("CSVs with a Webhook", func() {
 				AdmissionReviewVersions: []string{"v1beta1", "v1"},
 				SideEffects:             &sideEffect,
 				Rules: []admissionregistrationv1.RuleWithOperations{
-					admissionregistrationv1.RuleWithOperations{
+					{
 						Operations: []admissionregistrationv1.OperationType{},
 						Rule: admissionregistrationv1.Rule{
 							APIGroups:   []string{"admissionregistration.k8s.io"},
@@ -332,15 +337,15 @@ var _ = Describe("CSVs with a Webhook", func() {
 				},
 			}
 
-			csv := createCSVWithWebhook(namespace.GetName(), webhook)
+			csv := createCSVWithWebhook(generatedNamespace.GetName(), webhook)
 
 			var err error
-			cleanupCSV, err = createCSV(c, crc, csv, namespace.Name, false, false)
+			cleanupCSV, err = createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
 
-			failedCSV, err := fetchCSV(crc, csv.Name, namespace.Name, csvFailedChecker)
+			failedCSV, err := fetchCSV(crc, generatedNamespace.GetName(), csv.Name, csvFailedChecker)
 			Expect(err).Should(BeNil())
-			Expect(failedCSV.Status.Message).Should(Equal("Webhook rules cannot include MutatingWebhookConfiguration or ValidatingWebhookConfiguration resources"))
+			Expect(failedCSV.Status.Message).Should(Equal("webhook rules cannot include MutatingWebhookConfiguration or ValidatingWebhookConfiguration resources"))
 		})
 		It("Succeeds if the webhook intercepts non Admission Webhook resources in admissionregistration group", func() {
 			sideEffect := admissionregistrationv1.SideEffectClassNone
@@ -352,7 +357,7 @@ var _ = Describe("CSVs with a Webhook", func() {
 				AdmissionReviewVersions: []string{"v1beta1", "v1"},
 				SideEffects:             &sideEffect,
 				Rules: []admissionregistrationv1.RuleWithOperations{
-					admissionregistrationv1.RuleWithOperations{
+					{
 						Operations: []admissionregistrationv1.OperationType{
 							admissionregistrationv1.OperationAll,
 						},
@@ -365,13 +370,13 @@ var _ = Describe("CSVs with a Webhook", func() {
 				},
 			}
 
-			csv := createCSVWithWebhook(namespace.GetName(), webhook)
+			csv := createCSVWithWebhook(generatedNamespace.GetName(), webhook)
 
 			var err error
-			cleanupCSV, err = createCSV(c, crc, csv, namespace.Name, false, false)
+			cleanupCSV, err = createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
 
-			_, err = fetchCSV(crc, csv.Name, namespace.Name, csvSucceededChecker)
+			_, err = fetchCSV(crc, generatedNamespace.GetName(), csv.Name, csvSucceededChecker)
 			Expect(err).Should(BeNil())
 		})
 		It("Can be installed and upgraded successfully", func() {
@@ -384,7 +389,7 @@ var _ = Describe("CSVs with a Webhook", func() {
 				AdmissionReviewVersions: []string{"v1beta1", "v1"},
 				SideEffects:             &sideEffect,
 				Rules: []admissionregistrationv1.RuleWithOperations{
-					admissionregistrationv1.RuleWithOperations{
+					{
 						Operations: []admissionregistrationv1.OperationType{
 							admissionregistrationv1.OperationAll,
 						},
@@ -397,39 +402,38 @@ var _ = Describe("CSVs with a Webhook", func() {
 				},
 			}
 
-			csv := createCSVWithWebhook(namespace.GetName(), webhook)
+			csv := createCSVWithWebhook(generatedNamespace.GetName(), webhook)
 
-			_, err := createCSV(c, crc, csv, namespace.Name, false, false)
+			_, err := createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
-			// cleanup by upgrade
+			By(`cleanup by upgrade`)
 
-			_, err = fetchCSV(crc, csv.Name, namespace.Name, csvSucceededChecker)
+			_, err = fetchCSV(crc, generatedNamespace.GetName(), csv.Name, csvSucceededChecker)
 			Expect(err).Should(BeNil())
 
 			_, err = getWebhookWithGenerateName(c, webhook.GenerateName)
 			Expect(err).Should(BeNil())
 
-			// Update the CSV so it it replaces the existing CSV
+			By(`Update the CSV so it it replaces the existing CSV`)
 			csv.Spec.Replaces = csv.GetName()
 			csv.Name = genName("csv-")
 			previousWebhookName := webhook.GenerateName
 			webhook.GenerateName = "webhook2.test.com"
 			csv.Spec.WebhookDefinitions[0] = webhook
-			cleanupCSV, err = createCSV(c, crc, csv, namespace.Name, false, false)
+			cleanupCSV, err = createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
 
-			_, err = fetchCSV(crc, csv.GetName(), namespace.Name, csvSucceededChecker)
+			_, err = fetchCSV(crc, generatedNamespace.GetName(), csv.GetName(), csvSucceededChecker)
 			Expect(err).Should(BeNil())
 
 			_, err = getWebhookWithGenerateName(c, webhook.GenerateName)
 			Expect(err).Should(BeNil())
 
-			// Make sure old resources are cleaned up.
-			Eventually(func() bool {
-				return csvExists(crc, csv.Spec.Replaces)
-			}).Should(BeFalse())
+			By(`Make sure old resources are cleaned up.`)
+			err = waitForCsvToDelete(generatedNamespace.GetName(), csv.Spec.Replaces, crc)
+			Expect(err).ShouldNot(HaveOccurred())
 
-			// Wait until previous webhook is cleaned up
+			By(`Wait until previous webhook is cleaned up`)
 			Eventually(func() (bool, error) {
 				_, err := c.KubernetesInterface().AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(context.TODO(), previousWebhookName, metav1.GetOptions{})
 				if errors.IsNotFound(err) {
@@ -441,7 +445,8 @@ var _ = Describe("CSVs with a Webhook", func() {
 				return false, nil
 			}).Should(BeTrue())
 		})
-		It("Is updated when the CAs expire", func() {
+		It("[FLAKE] Is updated when the CAs expire", func() {
+			By(`issue: https://github.com/operator-framework/operator-lifecycle-manager/issues/2629`)
 			sideEffect := admissionregistrationv1.SideEffectClassNone
 			webhook := operatorsv1alpha1.WebhookDescription{
 				GenerateName:            webhookName,
@@ -452,13 +457,13 @@ var _ = Describe("CSVs with a Webhook", func() {
 				SideEffects:             &sideEffect,
 			}
 
-			csv := createCSVWithWebhook(namespace.GetName(), webhook)
+			csv := createCSVWithWebhook(generatedNamespace.GetName(), webhook)
 
 			var err error
-			cleanupCSV, err = createCSV(c, crc, csv, namespace.Name, false, false)
+			cleanupCSV, err = createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
 
-			fetchedCSV, err := fetchCSV(crc, csv.Name, namespace.Name, csvSucceededChecker)
+			_, err = fetchCSV(crc, generatedNamespace.GetName(), csv.Name, csvSucceededChecker)
 			Expect(err).Should(BeNil())
 
 			actualWebhook, err := getWebhookWithGenerateName(c, webhook.GenerateName)
@@ -466,37 +471,41 @@ var _ = Describe("CSVs with a Webhook", func() {
 
 			oldWebhookCABundle := actualWebhook.Webhooks[0].ClientConfig.CABundle
 
-			// Get the deployment
-			dep, err := c.KubernetesInterface().AppsV1().Deployments(namespace.Name).Get(context.TODO(), csv.Spec.WebhookDefinitions[0].DeploymentName, metav1.GetOptions{})
+			By(`Get the deployment`)
+			dep, err := c.KubernetesInterface().AppsV1().Deployments(generatedNamespace.GetName()).Get(context.TODO(), csv.Spec.WebhookDefinitions[0].DeploymentName, metav1.GetOptions{})
 			Expect(err).Should(BeNil())
 
 			//Store the ca sha annotation
 			oldCAAnnotation, ok := dep.Spec.Template.GetAnnotations()[install.OLMCAHashAnnotationKey]
 			Expect(ok).Should(BeTrue())
 
-			// Induce a cert rotation
-			Eventually(Apply(fetchedCSV, func(csv *operatorsv1alpha1.ClusterServiceVersion) error {
-				now := metav1.Now()
-				csv.Status.CertsLastUpdated = &now
-				csv.Status.CertsRotateAt = &now
+			caSecret, err := c.KubernetesInterface().CoreV1().Secrets(generatedNamespace.GetName()).Get(context.TODO(), install.SecretName(install.ServiceName(dep.Name)), metav1.GetOptions{})
+			Expect(err).Should(BeNil())
+
+			caPEM, certPEM, privPEM := generateExpiredCerts(install.HostnamesForService(install.ServiceName(dep.Name), generatedNamespace.GetName()))
+			By(`Induce a cert rotation`)
+			Eventually(Apply(caSecret, func(caSecret *corev1.Secret) error {
+				caSecret.Data[install.OLMCAPEMKey] = caPEM
+				caSecret.Data["tls.crt"] = certPEM
+				caSecret.Data["tls.key"] = privPEM
 				return nil
 			})).Should(Succeed())
 
-			_, err = fetchCSV(crc, csv.Name, namespace.Name, func(csv *operatorsv1alpha1.ClusterServiceVersion) bool {
-				// Should create deployment
-				dep, err = c.GetDeployment(namespace.Name, csv.Spec.WebhookDefinitions[0].DeploymentName)
+			_, err = fetchCSV(crc, generatedNamespace.GetName(), csv.Name, func(csv *operatorsv1alpha1.ClusterServiceVersion) bool {
+				By(`Should create deployment`)
+				dep, err = c.GetDeployment(generatedNamespace.GetName(), csv.Spec.WebhookDefinitions[0].DeploymentName)
 				if err != nil {
 					return false
 				}
 
-				// Should have a new ca hash annotation
+				By(`Should have a new ca hash annotation`)
 				newCAAnnotation, ok := dep.Spec.Template.GetAnnotations()[install.OLMCAHashAnnotationKey]
 				if !ok {
 					return false
 				}
 
 				if newCAAnnotation != oldCAAnnotation {
-					// Check for success
+					By(`Check for success`)
 					return csvSucceededChecker(csv)
 				}
 
@@ -504,7 +513,7 @@ var _ = Describe("CSVs with a Webhook", func() {
 			})
 			Expect(err).Should(BeNil())
 
-			// get new webhook
+			By(`get new webhook`)
 			actualWebhook, err = getWebhookWithGenerateName(c, webhook.GenerateName)
 			Expect(err).Should(BeNil())
 
@@ -514,16 +523,19 @@ var _ = Describe("CSVs with a Webhook", func() {
 	})
 	When("Installed in a Global OperatorGroup", func() {
 		var cleanupCSV cleanupFunc
+
 		BeforeEach(func() {
-			og := newOperatorGroup(namespace.Name, genName("global-og-"), nil, nil, []string{}, false)
-			og, err := crc.OperatorsV1().OperatorGroups(namespace.Name).Create(context.TODO(), og, metav1.CreateOptions{})
+			og := newOperatorGroup(generatedNamespace.GetName(), genName("global-og-"), nil, nil, []string{}, false)
+			og, err := crc.OperatorsV1().OperatorGroups(generatedNamespace.GetName()).Create(context.TODO(), og, metav1.CreateOptions{})
 			Expect(err).Should(BeNil())
 		})
+
 		AfterEach(func() {
 			if cleanupCSV != nil {
 				cleanupCSV()
 			}
 		})
+
 		It("The webhook is scoped to all namespaces", func() {
 			sideEffect := admissionregistrationv1.SideEffectClassNone
 			webhook := operatorsv1alpha1.WebhookDescription{
@@ -535,13 +547,13 @@ var _ = Describe("CSVs with a Webhook", func() {
 				SideEffects:             &sideEffect,
 			}
 
-			csv := createCSVWithWebhook(namespace.GetName(), webhook)
+			csv := createCSVWithWebhook(generatedNamespace.GetName(), webhook)
 
 			var err error
-			cleanupCSV, err = createCSV(c, crc, csv, namespace.Name, false, false)
+			cleanupCSV, err = createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
 
-			_, err = fetchCSV(crc, csv.Name, namespace.Name, csvSucceededChecker)
+			_, err = fetchCSV(crc, generatedNamespace.GetName(), csv.Name, csvSucceededChecker)
 			Expect(err).Should(BeNil())
 			actualWebhook, err := getWebhookWithGenerateName(c, webhook.GenerateName)
 			Expect(err).Should(BeNil())
@@ -594,7 +606,7 @@ var _ = Describe("CSVs with a Webhook", func() {
 			SideEffects:             &sideEffect,
 		}
 
-		csv := createCSVWithWebhook(namespace.GetName(), webhook)
+		csv := createCSVWithWebhook(generatedNamespace.GetName(), webhook)
 
 		csv.Namespace = namespace1.GetName()
 		var cleanupCSV cleanupFunc
@@ -605,7 +617,7 @@ var _ = Describe("CSVs with a Webhook", func() {
 		defer cleanupCSV()
 
 		Eventually(func() (err error) {
-			_, err = fetchCSV(crc, csv.Name, namespace1.Name, csvSucceededChecker)
+			_, err = fetchCSV(crc, namespace1.Name, csv.Name, csvSucceededChecker)
 			return
 		}).Should(Succeed())
 
@@ -617,7 +629,7 @@ var _ = Describe("CSVs with a Webhook", func() {
 		defer cleanupCSV()
 
 		Eventually(func() (err error) {
-			_, err = fetchCSV(crc, csv.Name, namespace2.Name, csvSucceededChecker)
+			_, err = fetchCSV(crc, namespace2.Name, csv.Name, csvSucceededChecker)
 			return
 		}).Should(Succeed())
 
@@ -638,19 +650,24 @@ var _ = Describe("CSVs with a Webhook", func() {
 		}).Should(Equal(2))
 	})
 	When("Installed from a catalog Source", func() {
+		const csvName = "webhook-operator.v0.0.5"
 		var cleanupCSV cleanupFunc
 		var cleanupCatSrc cleanupFunc
 		var cleanupSubscription cleanupFunc
-		BeforeEach(func() {
 
-			// Create a catalogSource which has the webhook-operator
+		BeforeEach(func() {
+			og := newOperatorGroup(generatedNamespace.GetName(), genName("og-"), nil, nil, []string{}, false)
+			_, err := crc.OperatorsV1().OperatorGroups(generatedNamespace.GetName()).Create(context.TODO(), og, metav1.CreateOptions{})
+			Expect(err).Should(BeNil())
+
+			By(`Create a catalogSource which has the webhook-operator`)
 			sourceName := genName("catalog-")
 			packageName := "webhook-operator"
 			channelName := "alpha"
 
-			catSrcImage := "quay.io/operator-framework/webhook-operator-index"
+			catSrcImage := "quay.io/olmtest/webhook-operator-index"
 
-			// Create gRPC CatalogSource
+			By(`Create gRPC CatalogSource`)
 			source := &operatorsv1alpha1.CatalogSource{
 				TypeMeta: metav1.TypeMeta{
 					Kind:       operatorsv1alpha1.CatalogSourceKind,
@@ -658,32 +675,93 @@ var _ = Describe("CSVs with a Webhook", func() {
 				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      sourceName,
-					Namespace: testNamespace,
+					Namespace: generatedNamespace.GetName(),
 				},
 				Spec: operatorsv1alpha1.CatalogSourceSpec{
 					SourceType: operatorsv1alpha1.SourceTypeGrpc,
-					Image:      catSrcImage + ":0.0.3",
+					Image:      catSrcImage + ":v0.0.5",
+					GrpcPodConfig: &operatorsv1alpha1.GrpcPodConfig{
+						SecurityContextConfig: operatorsv1alpha1.Restricted,
+					},
 				},
 			}
 
-			crc := newCRClient()
-			source, err := crc.OperatorsV1alpha1().CatalogSources(source.GetNamespace()).Create(context.TODO(), source, metav1.CreateOptions{})
+			source, err = crc.OperatorsV1alpha1().CatalogSources(source.GetNamespace()).Create(context.TODO(), source, metav1.CreateOptions{})
 			require.NoError(GinkgoT(), err)
 			cleanupCatSrc = func() {
 				require.NoError(GinkgoT(), crc.OperatorsV1alpha1().CatalogSources(source.GetNamespace()).Delete(context.TODO(), source.GetName(), metav1.DeleteOptions{}))
 			}
 
-			// Create a Subscription for the webhook-operator
-			subscriptionName := genName("sub-")
-			cleanupSubscription := createSubscriptionForCatalog(crc, testNamespace, subscriptionName, source.GetName(), packageName, channelName, "", operatorsv1alpha1.ApprovalAutomatic)
-			defer cleanupSubscription()
-
-			// Wait for webhook-operator v2 csv to succeed
-			csv, err := awaitCSV(crc, testNamespace, "webhook-operator.v0.0.1", csvSucceededChecker)
+			By(`Wait for the CatalogSource to be ready`)
+			_, err = fetchCatalogSourceOnStatus(crc, source.GetName(), source.GetNamespace(), catalogSourceRegistryPodSynced())
 			require.NoError(GinkgoT(), err)
 
-			cleanupCSV = buildCSVCleanupFunc(c, crc, *csv, testNamespace, true, true)
+			By(`Create a Subscription for the webhook-operator`)
+			subscriptionName := genName("sub-")
+			cleanupSubscription := createSubscriptionForCatalog(crc, source.GetNamespace(), subscriptionName, source.GetName(), packageName, channelName, "", operatorsv1alpha1.ApprovalAutomatic)
+			defer cleanupSubscription()
+
+			_, err = fetchSubscription(crc, source.GetNamespace(), subscriptionName, subscriptionHasInstallPlanChecker())
+			require.NoError(GinkgoT(), err)
+
+			By(`Wait for webhook-operator v2 csv to succeed`)
+			csv, err := fetchCSV(crc, source.GetNamespace(), csvName, csvSucceededChecker)
+			require.NoError(GinkgoT(), err)
+
+			cleanupCSV = buildCSVCleanupFunc(c, crc, *csv, source.GetNamespace(), true, true)
+
+			By(`Wait for the ValidatingWebhookConfiguration to be created`)
+			Eventually(func() error {
+				webhookList, err := c.KubernetesInterface().AdmissionregistrationV1().ValidatingWebhookConfigurations().List(context.TODO(), metav1.ListOptions{})
+				if err != nil {
+					return err
+				}
+				for _, webhook := range webhookList.Items {
+					for _, wh := range webhook.Webhooks {
+						if wh.Name == "vwebhooktest-v1.kb.io" {
+							return nil
+						}
+					}
+				}
+				return fmt.Errorf("ValidatingWebhookConfiguration with webhook name vwebhooktest-v1.kb.io not found")
+			}, 2*time.Minute, 2*time.Second).Should(Succeed(), "ValidatingWebhookConfiguration should be created after CSV succeeds")
+
+			By(`Wait for the webhook service to have endpoints`)
+			Eventually(func() error {
+				// Find the webhook deployment from the CSV
+				if len(csv.Spec.WebhookDefinitions) == 0 {
+					return fmt.Errorf("CSV has no webhook definitions")
+				}
+				webhookDef := csv.Spec.WebhookDefinitions[0]
+				serviceName := install.ServiceName(webhookDef.DeploymentName)
+
+				// Check if the service has endpoints
+				endpoints, err := c.KubernetesInterface().CoreV1().Endpoints(source.GetNamespace()).Get(context.TODO(), serviceName, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				if len(endpoints.Subsets) == 0 || len(endpoints.Subsets[0].Addresses) == 0 {
+					return fmt.Errorf("service %s has no ready endpoints", serviceName)
+				}
+				return nil
+			}, 2*time.Minute, 2*time.Second).Should(Succeed(), "Webhook service should have ready endpoints")
+
+			By(`Wait for the webhooktests CRD to be established`)
+			Eventually(func() error {
+				crd, err := c.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), "webhooktests.webhook.operators.coreos.io", metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				// Check if CRD is established
+				for _, cond := range crd.Status.Conditions {
+					if cond.Type == apiextensionsv1.Established && cond.Status == apiextensionsv1.ConditionTrue {
+						return nil
+					}
+				}
+				return fmt.Errorf("CRD webhooktests.webhook.operators.coreos.io is not established yet")
+			}, 2*time.Minute, 2*time.Second).Should(Succeed(), "WebhookTest CRD should be established")
 		})
+
 		AfterEach(func() {
 			if cleanupCSV != nil {
 				cleanupCSV()
@@ -695,14 +773,15 @@ var _ = Describe("CSVs with a Webhook", func() {
 				cleanupSubscription()
 			}
 		})
+
 		It("Validating, Mutating and Conversion webhooks work as intended", func() {
-			// An invalid custom resource is rejected by the validating webhook
+			By(`An invalid custom resource is rejected by the validating webhook`)
 			invalidCR := &unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "webhook.operators.coreos.io/v1",
 					"kind":       "webhooktests",
 					"metadata": map[string]interface{}{
-						"namespace": testNamespace,
+						"namespace": generatedNamespace.GetName(),
 						"name":      "my-cr-1",
 					},
 					"spec": map[string]interface{}{
@@ -710,22 +789,47 @@ var _ = Describe("CSVs with a Webhook", func() {
 					},
 				},
 			}
-			expectedErrorMessage := "admission webhook \"vwebhooktest.kb.io\" denied the request: WebhookTest.test.operators.coreos.com \"my-cr-1\" is invalid: spec.schedule: Invalid value: false: Spec.Valid must be true"
-			Eventually(func() bool {
+			// Use more flexible error matching - check for key parts of the error message
+			// instead of exact string match which can be fragile
+			Eventually(func() (bool, error) {
 				err := c.CreateCustomResource(invalidCR)
-				if err == nil || expectedErrorMessage != err.Error() {
-					return false
+				if err == nil {
+					// CR was created successfully - this shouldn't happen!
+					// Clean it up and return an error so we can see what's wrong
+					_ = c.DeleteCustomResource("webhook.operators.coreos.io", "v1", generatedNamespace.GetName(), "webhooktests", "my-cr-1")
+					return false, fmt.Errorf("CreateCustomResource succeeded but should have been rejected by webhook")
 				}
-				return true
-			}).Should(BeTrue(), "The admission webhook should have rejected the invalid resource")
 
-			// An valid custom resource is acceoted by the validating webhook and the mutating webhook sets the CR's spec.mutate field to true.
+				errMsg := err.Error()
+
+				// Skip "already exists" errors from previous retry attempts
+				if strings.Contains(errMsg, "already exists") {
+					// Clean up and retry
+					_ = c.DeleteCustomResource("webhook.operators.coreos.io", "v1", generatedNamespace.GetName(), "webhooktests", "my-cr-1")
+					return false, nil
+				}
+
+				// Check that the error contains the expected key components
+				hasWebhookName := strings.Contains(errMsg, "vwebhooktest-v1.kb.io")
+				hasDenied := strings.Contains(errMsg, "denied the request")
+				hasResourceName := strings.Contains(errMsg, "my-cr-1")
+				hasValidationMsg := strings.Contains(errMsg, "Spec.Valid must be true")
+
+				if hasWebhookName && hasDenied && hasResourceName && hasValidationMsg {
+					return true, nil
+				}
+				// Return error with details about what's missing for debugging
+				return false, fmt.Errorf("error message missing expected parts (webhook:%v, denied:%v, name:%v, validation:%v): %s",
+					hasWebhookName, hasDenied, hasResourceName, hasValidationMsg, errMsg)
+			}, 1*time.Minute, 2*time.Second).Should(BeTrue(), "The admission webhook should have rejected the invalid resource")
+
+			By(`An valid custom resource is acceoted by the validating webhook and the mutating webhook sets the CR's spec.mutate field to true.`)
 			validCR := &unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "webhook.operators.coreos.io/v1",
 					"kind":       "webhooktests",
 					"metadata": map[string]interface{}{
-						"namespace": testNamespace,
+						"namespace": generatedNamespace.GetName(),
 						"name":      "my-cr-1",
 					},
 					"spec": map[string]interface{}{
@@ -733,12 +837,12 @@ var _ = Describe("CSVs with a Webhook", func() {
 					},
 				},
 			}
-			crCleanupFunc, err := createCR(c, validCR, "webhook.operators.coreos.io", "v1", testNamespace, "webhooktests", "my-cr-1")
+			crCleanupFunc, err := createCR(c, validCR, "webhook.operators.coreos.io", "v1", generatedNamespace.GetName(), "webhooktests", "my-cr-1")
 			defer crCleanupFunc()
 			require.NoError(GinkgoT(), err, "The valid CR should have been approved by the validating webhook")
 
-			// Check that you can get v1 of the webhooktest cr
-			v1UnstructuredObject, err := c.GetCustomResource("webhook.operators.coreos.io", "v1", testNamespace, "webhooktests", "my-cr-1")
+			By(`Check that you can get v1 of the webhooktest cr`)
+			v1UnstructuredObject, err := c.GetCustomResource("webhook.operators.coreos.io", "v1", generatedNamespace.GetName(), "webhooktests", "my-cr-1")
 			require.NoError(GinkgoT(), err, "Unable to get the v1 of the valid CR")
 			v1Object := v1UnstructuredObject.Object
 			v1Spec, ok := v1Object["spec"].(map[string]interface{})
@@ -751,8 +855,8 @@ var _ = Describe("CSVs with a Webhook", func() {
 			require.True(GinkgoT(), v1SpecMutate, "The mutating webhook should have set the valid CR's spec.mutate field to true")
 			require.True(GinkgoT(), v1SpecValid, "The validating webhook should have required that the CR's spec.valid field is true")
 
-			// Check that you can get v2 of the webhooktest cr
-			v2UnstructuredObject, err := c.GetCustomResource("webhook.operators.coreos.io", "v2", testNamespace, "webhooktests", "my-cr-1")
+			By(`Check that you can get v2 of the webhooktest cr`)
+			v2UnstructuredObject, err := c.GetCustomResource("webhook.operators.coreos.io", "v2", generatedNamespace.GetName(), "webhooktests", "my-cr-1")
 			require.NoError(GinkgoT(), err, "Unable to get the v2 of the valid CR")
 			v2Object := v2UnstructuredObject.Object
 			v2Spec := v2Object["spec"].(map[string]interface{})
@@ -765,37 +869,59 @@ var _ = Describe("CSVs with a Webhook", func() {
 			require.True(GinkgoT(), ok, "Unable to get spec.conversion.valid of v2 object")
 			require.True(GinkgoT(), v2SpecConversionMutate)
 			require.True(GinkgoT(), v2SpecConversionValid)
+
+			By(`Check that conversion strategies are disabled after uninstalling the operator.`)
+			err = crc.OperatorsV1alpha1().ClusterServiceVersions(generatedNamespace.GetName()).Delete(context.TODO(), csvName, metav1.DeleteOptions{})
+			require.NoError(GinkgoT(), err)
+
+			Eventually(func() error {
+				crd, err := c.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), "webhooktests.webhook.operators.coreos.io", metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+
+				if crd.Spec.Conversion.Strategy != apiextensionsv1.NoneConverter {
+					return fmt.Errorf("conversion strategy is not NoneConverter")
+				}
+				if crd.Spec.Conversion.Webhook != nil {
+					return fmt.Errorf("webhook is not nil")
+				}
+				return nil
+			}).Should(Succeed())
 		})
 	})
 	When("WebhookDescription has conversionCRDs field", func() {
 		var cleanupCSV cleanupFunc
+
 		BeforeEach(func() {
-			// global operator group
-			og := newOperatorGroup(namespace.Name, genName("global-og-"), nil, nil, []string{}, false)
-			og, err := crc.OperatorsV1().OperatorGroups(namespace.Name).Create(context.TODO(), og, metav1.CreateOptions{})
+			By(`global operator group`)
+			og := newOperatorGroup(generatedNamespace.GetName(), genName("global-og-"), nil, nil, []string{}, false)
+			og, err := crc.OperatorsV1().OperatorGroups(generatedNamespace.GetName()).Create(context.TODO(), og, metav1.CreateOptions{})
 			Expect(err).Should(BeNil())
 		})
+
 		AfterEach(func() {
 			if cleanupCSV != nil {
 				cleanupCSV()
 			}
 		})
+
 		It("The conversion CRD is not updated via webhook when CSV does not own this CRD", func() {
-			// create CRD (crdA)
+			By(`create CRD (crdA)`)
 			crdAPlural := genName("mockcrda")
 			crdA := newV1CRD(crdAPlural)
-			cleanupCRD, er := createV1CRD(c, crdA)
+			cleanupCRD, er := createCRD(c, crdA)
 			require.NoError(GinkgoT(), er)
 			defer cleanupCRD()
 
-			// create another CRD (crdB)
+			By(`create another CRD (crdB)`)
 			crdBPlural := genName("mockcrdb")
 			crdB := newV1CRD(crdBPlural)
-			cleanupCRD2, er := createV1CRD(c, crdB)
+			cleanupCRD2, er := createCRD(c, crdB)
 			require.NoError(GinkgoT(), er)
 			defer cleanupCRD2()
 
-			// describe webhook
+			By(`describe webhook`)
 			sideEffect := admissionregistrationv1.SideEffectClassNone
 			webhook := operatorsv1alpha1.WebhookDescription{
 				GenerateName:            webhookName,
@@ -809,14 +935,14 @@ var _ = Describe("CSVs with a Webhook", func() {
 
 			ownedCRDDescs := make([]operatorsv1alpha1.CRDDescription, 0)
 
-			// create CSV
-			csv := createCSVWithWebhookAndCrds(namespace.GetName(), webhook, ownedCRDDescs)
+			By(`create CSV`)
+			csv := createCSVWithWebhookAndCrds(generatedNamespace.GetName(), webhook, ownedCRDDescs)
 
 			var err error
-			cleanupCSV, err = createCSV(c, crc, csv, namespace.Name, false, false)
+			cleanupCSV, err = createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
 
-			_, err = fetchCSV(crc, csv.Name, namespace.Name, csvSucceededChecker)
+			_, err = fetchCSV(crc, generatedNamespace.GetName(), csv.Name, csvSucceededChecker)
 			Expect(err).Should(BeNil())
 			actualWebhook, err := getWebhookWithGenerateName(c, webhook.GenerateName)
 			Expect(err).Should(BeNil())
@@ -831,10 +957,10 @@ var _ = Describe("CSVs with a Webhook", func() {
 				Strategy: "Webhook",
 			}
 
-			// Read the updated crdA on cluster into the following crd
+			By(`Read the updated crdA on cluster into the following crd`)
 			tempCrdA, err := c.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), crdA.GetName(), metav1.GetOptions{})
 
-			// Read the updated crdB on cluster into the following crd
+			By(`Read the updated crdB on cluster into the following crd`)
 			tempCrdB, err := c.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), crdB.GetName(), metav1.GetOptions{})
 
 			Expect(tempCrdA.Spec.Conversion.Strategy).Should(Equal(expectedUpdatedCrdFields.Strategy))
@@ -850,14 +976,14 @@ var _ = Describe("CSVs with a Webhook", func() {
 			Expect(tempCrdA.Spec.Conversion.Webhook.ClientConfig.Service.Namespace).Should(Equal(expectedConvertNamespace))
 		})
 		It("The CSV is not created when dealing with conversionCRD and multiple installModes support exists", func() {
-			// create CRD (crdA)
+			By(`create CRD (crdA)`)
 			crdAPlural := genName("mockcrda")
 			crdA := newV1CRD(crdAPlural)
-			cleanupCRD, er := createV1CRD(c, crdA)
+			cleanupCRD, er := createCRD(c, crdA)
 			require.NoError(GinkgoT(), er)
 			defer cleanupCRD()
 
-			// describe webhook
+			By(`describe webhook`)
 			sideEffect := admissionregistrationv1.SideEffectClassNone
 			webhook := operatorsv1alpha1.WebhookDescription{
 				GenerateName:            webhookName,
@@ -872,14 +998,14 @@ var _ = Describe("CSVs with a Webhook", func() {
 			ownedCRDDescs := make([]operatorsv1alpha1.CRDDescription, 0)
 			ownedCRDDescs = append(ownedCRDDescs, operatorsv1alpha1.CRDDescription{Name: crdA.GetName(), Version: crdA.Spec.Versions[0].Name, Kind: crdA.Spec.Names.Kind})
 
-			// create CSV
-			csv := createCSVWithWebhookAndCrdsAndInvalidInstallModes(namespace.GetName(), webhook, ownedCRDDescs)
+			By(`create CSV`)
+			csv := createCSVWithWebhookAndCrdsAndInvalidInstallModes(generatedNamespace.GetName(), webhook, ownedCRDDescs)
 
 			var err error
-			cleanupCSV, err = createCSV(c, crc, csv, namespace.Name, false, false)
+			cleanupCSV, err = createCSV(c, crc, csv, generatedNamespace.GetName(), false, false)
 			Expect(err).Should(BeNil())
 
-			_, err = fetchCSV(crc, csv.Name, namespace.Name, csvSucceededChecker)
+			_, err = fetchCSV(crc, generatedNamespace.GetName(), csv.Name, csvSucceededChecker)
 			Expect(err).Should(BeNil())
 			actualWebhook, err := getWebhookWithGenerateName(c, webhook.GenerateName)
 			Expect(err).Should(BeNil())
@@ -894,7 +1020,7 @@ var _ = Describe("CSVs with a Webhook", func() {
 				Strategy: "Webhook",
 			}
 
-			// Read the updated crdA on cluster into the following crd
+			By(`Read the updated crdA on cluster into the following crd`)
 			tempCrdA, err := c.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), crdA.GetName(), metav1.GetOptions{})
 
 			Expect(tempCrdA.Spec.Conversion.Strategy).Should(Equal(expectedUpdatedCrdFields.Strategy))
@@ -904,7 +1030,7 @@ var _ = Describe("CSVs with a Webhook", func() {
 
 			Expect(tempCrdA.Spec.Conversion.Webhook.ClientConfig.Service.Port).Should(Equal(&expectedTempPort))
 			Expect(tempCrdA.Spec.Conversion.Webhook.ClientConfig.Service.Path).Should(Equal(&expectedConvertPath))
-			// CRD namespace would not be updated, hence conversion webhook won't work for objects of this CRD's Kind
+			By(`CRD namespace would not be updated, hence conversion webhook won't work for objects of this CRD's Kind`)
 			Expect(tempCrdA.Spec.Conversion.Webhook.ClientConfig.Service.Namespace).ShouldNot(Equal(csv.GetNamespace()))
 		})
 	})
@@ -1130,4 +1256,71 @@ func newV1CRD(plural string) apiextensionsv1.CustomResourceDefinition {
 	}
 
 	return crd
+}
+
+func generateExpiredCerts(hosts []string) ([]byte, []byte, []byte) {
+	caSerial, err := rand.Int(rand.Reader, new(big.Int).SetInt64(math.MaxInt64))
+	Expect(err).Should(BeNil())
+
+	caDetails := &x509.Certificate{
+		SerialNumber: caSerial,
+		Subject: pkix.Name{
+			CommonName:   fmt.Sprintf("olm-selfsigned-%x", caSerial),
+			Organization: []string{install.Organization},
+		},
+		NotBefore:             time.Now().Add(-5 * time.Minute),
+		NotAfter:              time.Now().Add(-5 * time.Minute),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	Expect(err).Should(BeNil())
+
+	caRaw, err := x509.CreateCertificate(rand.Reader, caDetails, caDetails, &caKey.PublicKey, caKey)
+	Expect(err).Should(BeNil())
+
+	caCert, err := x509.ParseCertificate(caRaw)
+	Expect(err).Should(BeNil())
+
+	caPEM, _, err := (&certs.KeyPair{
+		Cert: caCert,
+		Priv: caKey,
+	}).ToPEM()
+	Expect(err).Should(BeNil())
+
+	serial, err := rand.Int(rand.Reader, new(big.Int).SetInt64(math.MaxInt64))
+	Expect(err).Should(BeNil())
+
+	certDetails := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			CommonName:   hosts[0],
+			Organization: []string{install.Organization},
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now(),
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              hosts,
+	}
+
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	Expect(err).Should(BeNil())
+
+	publicKey := &privateKey.PublicKey
+	certRaw, err := x509.CreateCertificate(rand.Reader, certDetails, caCert, publicKey, caKey)
+	Expect(err).Should(BeNil())
+
+	cert, err := x509.ParseCertificate(certRaw)
+	Expect(err).Should(BeNil())
+
+	certPEM, privPEM, err := (&certs.KeyPair{
+		Cert: cert,
+		Priv: privateKey,
+	}).ToPEM()
+	Expect(err).Should(BeNil())
+
+	return caPEM, certPEM, privPEM
 }

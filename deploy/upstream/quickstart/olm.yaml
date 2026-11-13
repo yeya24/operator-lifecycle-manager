@@ -72,6 +72,7 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
+              protocol: TCP
             - containerPort: 8081
               name: metrics
               protocol: TCP
@@ -132,6 +133,7 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
+              protocol: TCP
             - containerPort: 8081
               name: metrics
               protocol: TCP
@@ -262,6 +264,14 @@ spec:
           verbs:
           - get
           - list
+        - apiGroups:
+          - "config.openshift.io"
+          resources:
+          - apiservers
+          resourceNames:
+          - cluster
+          verbs:
+          - get
       deployments:
       - name: packageserver
         spec:
@@ -295,6 +305,7 @@ spec:
                 imagePullPolicy: Always
                 ports:
                 - containerPort: 5443
+                  protocol: TCP
                 livenessProbe:
                   httpGet:
                     scheme: HTTPS

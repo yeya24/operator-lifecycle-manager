@@ -12,7 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -25,10 +25,15 @@ func (c *Client) GetDeployment(namespace, name string) (*appsv1.Deployment, erro
 	return c.AppsV1().Deployments(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 }
 
-// CreateDeployment creates the Deployment object.
+// CreateDeployment creates the Deployment object or Updates if it already exists.
 func (c *Client) CreateDeployment(dep *appsv1.Deployment) (*appsv1.Deployment, error) {
 	klog.V(4).Infof("[CREATE Deployment]: %s:%s", dep.Namespace, dep.Name)
-	return c.AppsV1().Deployments(dep.Namespace).Create(context.TODO(), dep, metav1.CreateOptions{})
+	createdDep, err := c.AppsV1().Deployments(dep.Namespace).Create(context.TODO(), dep, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		updatedDep, _, err := c.UpdateDeployment(dep)
+		return updatedDep, err
+	}
+	return createdDep, err
 }
 
 // DeleteDeployment deletes the Deployment object.
@@ -50,15 +55,15 @@ func (c *Client) UpdateDeployment(dep *appsv1.Deployment) (*appsv1.Deployment, b
 //
 // Returns the latest Deployment and true if it was updated, or an error.
 func (c *Client) PatchDeployment(original, modified *appsv1.Deployment) (*appsv1.Deployment, bool, error) {
+	if modified == nil {
+		return nil, false, errors.New("modified cannot be nil")
+	}
 	namespace, name := modified.Namespace, modified.Name
 	klog.V(4).Infof("[PATCH Deployment]: %s:%s", namespace, name)
 
 	current, err := c.AppsV1().Deployments(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 	if err != nil {
 		return nil, false, err
-	}
-	if modified == nil {
-		return nil, false, errors.New("modified cannot be nil")
 	}
 	if original == nil {
 		original = current // Emulate 2-way merge.

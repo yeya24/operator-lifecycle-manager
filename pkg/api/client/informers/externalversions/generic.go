@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -19,7 +17,7 @@ limitations under the License.
 package externalversions
 
 import (
-	"fmt"
+	fmt "fmt"
 
 	v1 "github.com/operator-framework/api/pkg/operators/v1"
 	v1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
@@ -56,6 +54,8 @@ func (f *genericInformer) Lister() cache.GenericLister {
 func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource) (GenericInformer, error) {
 	switch resource {
 	// Group=operators.coreos.com, Version=v1
+	case v1.SchemeGroupVersion.WithResource("olmconfigs"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Operators().V1().OLMConfigs().Informer()}, nil
 	case v1.SchemeGroupVersion.WithResource("operators"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Operators().V1().Operators().Informer()}, nil
 	case v1.SchemeGroupVersion.WithResource("operatorconditions"):

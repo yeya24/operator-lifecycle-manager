@@ -18,9 +18,9 @@ package process
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -84,7 +84,7 @@ type State struct {
 	DirNeedsCleaning bool
 	Path             string
 
-	// ready holds wether the process is currently in ready state (hit the ready condition) or not.
+	// ready holds whether the process is currently in ready state (hit the ready condition) or not.
 	// It will be set to true on a successful `Start()` and set to false on a successful `Stop()`
 	ready bool
 
@@ -109,7 +109,7 @@ func (ps *State) Init(name string) error {
 	}
 
 	if ps.Dir == "" {
-		newDir, err := ioutil.TempDir("", "k8s_test_framework_")
+		newDir, err := os.MkdirTemp("", "k8s_test_framework_")
 		if err != nil {
 			return err
 		}
@@ -128,6 +128,8 @@ func (ps *State) Init(name string) error {
 }
 
 type stopChannel chan struct{}
+
+var signalProcess = signalProcessImpl
 
 // CheckFlag checks the help output of this command for the presence of the given flag, specified
 // without the leading `--` (e.g. `CheckFlag("insecure-port")` checks for `--insecure-port`),
@@ -156,6 +158,7 @@ func (ps *State) Start(stdout, stderr io.Writer) (err error) {
 	ps.Cmd = exec.Command(ps.Path, ps.Args...)
 	ps.Cmd.Stdout = stdout
 	ps.Cmd.Stderr = stderr
+	ps.Cmd.SysProcAttr = GetSysProcAttr()
 
 	ready := make(chan bool)
 	timedOut := time.After(ps.StartTimeout)
@@ -185,19 +188,15 @@ func (ps *State) Start(stdout, stderr io.Writer) (err error) {
 		ps.ready = true
 		return nil
 	case <-ps.waitDone:
-		if pollerStopCh != nil {
-			close(pollerStopCh)
-		}
+		close(pollerStopCh)
 		return fmt.Errorf("timeout waiting for process %s to start successfully "+
 			"(it may have failed to start, or stopped unexpectedly before becoming ready)",
 			path.Base(ps.Path))
 	case <-timedOut:
-		if pollerStopCh != nil {
-			close(pollerStopCh)
-		}
+		close(pollerStopCh)
 		if ps.Cmd != nil {
 			// intentionally ignore this -- we might've crashed, failed to start, etc
-			ps.Cmd.Process.Signal(syscall.SIGTERM) //nolint:errcheck
+			_ = signalProcess(ps.Cmd.Process, syscall.SIGTERM)
 		}
 		return fmt.Errorf("timeout waiting for process %s to start", path.Base(ps.Path))
 	}
@@ -219,7 +218,7 @@ func pollURLUntilOK(url url.URL, interval time.Duration, ready chan bool, stopCh
 				// there's probably certs *somewhere*,
 				// but it's fine to just skip validating
 				// them for health checks during testing
-				InsecureSkipVerify: true, //nolint:gosec
+				InsecureSkipVerify: true,
 			},
 		},
 	}
@@ -260,7 +259,7 @@ func (ps *State) Stop() error {
 	if done, _ := ps.Exited(); done {
 		return nil
 	}
-	if err := ps.Cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := signalProcess(ps.Cmd.Process, syscall.SIGTERM); err != nil {
 		return fmt.Errorf("unable to signal for process %s to stop: %w", ps.Path, err)
 	}
 
@@ -270,7 +269,11 @@ func (ps *State) Stop() error {
 	case <-ps.waitDone:
 		break
 	case <-timedOut:
-		return fmt.Errorf("timeout waiting for process %s to stop", path.Base(ps.Path))
+		timeoutErr := fmt.Errorf("timeout waiting for process %s to stop", path.Base(ps.Path))
+		if err := signalProcess(ps.Cmd.Process, syscall.SIGKILL); err != nil {
+			return errors.Join(timeoutErr, fmt.Errorf("unable to kill process %s: %w", ps.Path, err))
+		}
+		return timeoutErr
 	}
 	ps.ready = false
 	return nil

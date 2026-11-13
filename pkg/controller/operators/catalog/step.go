@@ -4,15 +4,18 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	apiextensionsv1client "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1"
 	apiextensionsv1beta1client "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1beta1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
@@ -43,11 +46,12 @@ type builder struct {
 	dynamicClient    dynamic.Interface
 	manifestResolver ManifestResolver
 	logger           logrus.FieldLogger
+	eventRecorder    record.EventRecorder
 
 	annotator alongside.Annotator
 }
 
-func newBuilder(plan *v1alpha1.InstallPlan, csvLister listersv1alpha1.ClusterServiceVersionLister, opclient operatorclient.ClientInterface, dynamicClient dynamic.Interface, manifestResolver ManifestResolver, logger logrus.FieldLogger) *builder {
+func newBuilder(plan *v1alpha1.InstallPlan, csvLister listersv1alpha1.ClusterServiceVersionLister, opclient operatorclient.ClientInterface, dynamicClient dynamic.Interface, manifestResolver ManifestResolver, logger logrus.FieldLogger, er record.EventRecorder) *builder {
 	return &builder{
 		plan:             plan,
 		csvLister:        csvLister,
@@ -55,6 +59,7 @@ func newBuilder(plan *v1alpha1.InstallPlan, csvLister listersv1alpha1.ClusterSer
 		dynamicClient:    dynamicClient,
 		manifestResolver: manifestResolver,
 		logger:           logger,
+		eventRecorder:    er,
 	}
 }
 
@@ -100,11 +105,10 @@ func (b *builder) NewCRDV1Step(client apiextensionsv1client.ApiextensionsV1Inter
 		case v1alpha1.StepStatusWaitingForAPI:
 			crd, err := client.CustomResourceDefinitions().Get(context.TODO(), step.Resource.Name, metav1.GetOptions{})
 			if err != nil {
-				if k8serrors.IsNotFound(err) {
+				if apierrors.IsNotFound(err) {
 					return v1alpha1.StepStatusNotPresent, nil
-				} else {
-					return v1alpha1.StepStatusNotPresent, errors.Wrapf(err, "error finding the %s CRD", crd.Name)
 				}
+				return v1alpha1.StepStatusNotPresent, errors.Wrapf(err, "error finding the %s CRD", crd.Name)
 			}
 			established, namesAccepted := false, false
 			for _, cdt := range crd.Status.Conditions {
@@ -129,14 +133,37 @@ func (b *builder) NewCRDV1Step(client apiextensionsv1client.ApiextensionsV1Inter
 			}
 
 			setInstalledAlongsideAnnotation(b.annotator, crd, b.plan.GetNamespace(), step.Resolving, b.csvLister, crd)
+			if crd.Labels == nil {
+				crd.Labels = map[string]string{}
+			}
+			crd.Labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
 
 			_, createError := client.CustomResourceDefinitions().Create(context.TODO(), crd, metav1.CreateOptions{})
-			if k8serrors.IsAlreadyExists(createError) {
+			if apierrors.IsAlreadyExists(createError) {
 				err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 					currentCRD, _ := client.CustomResourceDefinitions().Get(context.TODO(), crd.GetName(), metav1.GetOptions{})
 					crd.SetResourceVersion(currentCRD.GetResourceVersion())
 					if err = validateV1CRDCompatibility(b.dynamicClient, currentCRD, crd); err != nil {
-						return fmt.Errorf("error validating existing CRs against new CRD's schema for %q: %w", step.Resource.Name, err)
+						vErr := &validationError{}
+						// if the conversion strategy in the new CRD is not "Webhook" OR the error is not a ValidationError
+						// return an error. This will catch and return any errors that occur unrelated to actual validation.
+						// For example, the API server returning an error when performing a list operation
+						if crd.Spec.Conversion == nil || crd.Spec.Conversion.Strategy != apiextensionsv1.WebhookConverter || !errors.As(err, vErr) {
+							return fmt.Errorf("error validating existing CRs against new CRD's schema for %q: %w", step.Resource.Name, err)
+						}
+						// If the conversion strategy in the new CRD is "Webhook" and the error that occurred
+						// is an error related to validation, warn that validation failed but that we are trusting
+						// that the conversion strategy specified by the author will successfully convert to a format
+						// that passes validation and allow the upgrade to continue
+						warnTempl := `Validation of existing CRs against the new CRD's schema failed, but a webhook conversion strategy was specified in the new CRD.
+The new webhook will only start after the bundle is upgraded, so we must assume that it will successfully convert existing CRs to a format that would have passed validation.
+
+CRD: %q
+Validation Error: %s
+`
+						warnString := fmt.Sprintf(warnTempl, step.Resource.Name, err.Error())
+						b.logger.Warn(warnString)
+						b.eventRecorder.Event(b.plan, corev1.EventTypeWarning, "CRDValidation", warnString)
 					}
 
 					// check to see if stored versions changed and whether the upgrade could cause potential data loss
@@ -167,7 +194,7 @@ func (b *builder) NewCRDV1Step(client apiextensionsv1client.ApiextensionsV1Inter
 				// Unexpected error creating the CRD.
 				return v1alpha1.StepStatusUnknown, createError
 			}
-			// If no error occured, make sure to wait for the API to become available.
+			// If no error occurred, make sure to wait for the API to become available.
 			return v1alpha1.StepStatusWaitingForAPI, nil
 		}
 		return v1alpha1.StepStatusUnknown, nil
@@ -184,11 +211,10 @@ func (b *builder) NewCRDV1Beta1Step(client apiextensionsv1beta1client.Apiextensi
 		case v1alpha1.StepStatusWaitingForAPI:
 			crd, err := client.CustomResourceDefinitions().Get(context.TODO(), step.Resource.Name, metav1.GetOptions{})
 			if err != nil {
-				if k8serrors.IsNotFound(err) {
+				if apierrors.IsNotFound(err) {
 					return v1alpha1.StepStatusNotPresent, nil
-				} else {
-					return v1alpha1.StepStatusNotPresent, fmt.Errorf("error finding the %q CRD: %w", crd.Name, err)
 				}
+				return v1alpha1.StepStatusNotPresent, fmt.Errorf("error finding the %q CRD: %w", crd.Name, err)
 			}
 			established, namesAccepted := false, false
 			for _, cdt := range crd.Status.Conditions {
@@ -213,9 +239,13 @@ func (b *builder) NewCRDV1Beta1Step(client apiextensionsv1beta1client.Apiextensi
 			}
 
 			setInstalledAlongsideAnnotation(b.annotator, crd, b.plan.GetNamespace(), step.Resolving, b.csvLister, crd)
+			if crd.Labels == nil {
+				crd.Labels = map[string]string{}
+			}
+			crd.Labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
 
 			_, createError := client.CustomResourceDefinitions().Create(context.TODO(), crd, metav1.CreateOptions{})
-			if k8serrors.IsAlreadyExists(createError) {
+			if apierrors.IsAlreadyExists(createError) {
 				err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 					currentCRD, _ := client.CustomResourceDefinitions().Get(context.TODO(), crd.GetName(), metav1.GetOptions{})
 					crd.SetResourceVersion(currentCRD.GetResourceVersion())
@@ -252,7 +282,7 @@ func (b *builder) NewCRDV1Beta1Step(client apiextensionsv1beta1client.Apiextensi
 				// Unexpected error creating the CRD.
 				return v1alpha1.StepStatusUnknown, createError
 			}
-			// If no error occured, make sure to wait for the API to become available.
+			// If no error occurred, make sure to wait for the API to become available.
 			return v1alpha1.StepStatusWaitingForAPI, nil
 		}
 		return v1alpha1.StepStatusUnknown, nil
@@ -260,9 +290,7 @@ func (b *builder) NewCRDV1Beta1Step(client apiextensionsv1beta1client.Apiextensi
 }
 
 func setInstalledAlongsideAnnotation(a alongside.Annotator, dst metav1.Object, namespace string, name string, lister listersv1alpha1.ClusterServiceVersionLister, srcs ...metav1.Object) {
-	var (
-		nns []alongside.NamespacedName
-	)
+	var nns []alongside.NamespacedName
 
 	// Only keep references to existing and non-copied CSVs to
 	// avoid unbounded growth.
@@ -272,7 +300,7 @@ func setInstalledAlongsideAnnotation(a alongside.Annotator, dst metav1.Object, n
 				continue
 			}
 
-			if csv, err := lister.ClusterServiceVersions(nn.Namespace).Get(nn.Name); k8serrors.IsNotFound(err) {
+			if csv, err := lister.ClusterServiceVersions(nn.Namespace).Get(nn.Name); apierrors.IsNotFound(err) {
 				continue
 			} else if err == nil && csv.IsCopied() {
 				continue

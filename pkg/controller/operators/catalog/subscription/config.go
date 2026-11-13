@@ -4,12 +4,14 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilclock "k8s.io/apimachinery/pkg/util/clock"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+	utilclock "k8s.io/utils/clock"
 
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/reconciler"
+	resolverCache "github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/resolver/cache"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/kubestate"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorlister"
 )
@@ -22,10 +24,11 @@ type syncerConfig struct {
 	subscriptionInformer      cache.SharedIndexInformer
 	catalogInformer           cache.SharedIndexInformer
 	installPlanInformer       cache.SharedIndexInformer
-	subscriptionQueue         workqueue.RateLimitingInterface
+	subscriptionQueue         workqueue.TypedRateLimitingInterface[types.NamespacedName]
 	reconcilers               kubestate.ReconcilerChain
 	registryReconcilerFactory reconciler.RegistryReconcilerFactory
 	globalCatalogNamespace    string
+	operatorCacheProvider     resolverCache.OperatorCacheProvider
 }
 
 // SyncerOption is a configuration option for a subscription syncer.
@@ -95,7 +98,7 @@ func WithOperatorLister(lister operatorlister.OperatorLister) SyncerOption {
 }
 
 // WithSubscriptionQueue sets a syncer's subscription queue.
-func WithSubscriptionQueue(subscriptionQueue workqueue.RateLimitingInterface) SyncerOption {
+func WithSubscriptionQueue(subscriptionQueue workqueue.TypedRateLimitingInterface[types.NamespacedName]) SyncerOption {
 	return func(config *syncerConfig) {
 		config.subscriptionQueue = subscriptionQueue
 	}
@@ -125,6 +128,12 @@ func WithRegistryReconcilerFactory(r reconciler.RegistryReconcilerFactory) Synce
 func WithGlobalCatalogNamespace(namespace string) SyncerOption {
 	return func(config *syncerConfig) {
 		config.globalCatalogNamespace = namespace
+	}
+}
+
+func WithOperatorCacheProvider(provider resolverCache.OperatorCacheProvider) SyncerOption {
+	return func(config *syncerConfig) {
+		config.operatorCacheProvider = provider
 	}
 }
 

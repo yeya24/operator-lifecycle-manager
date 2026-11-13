@@ -9,9 +9,12 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	rbacv1ac "k8s.io/client-go/applyconfigurations/rbac/v1"
 
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/certs"
@@ -155,12 +158,20 @@ func ServiceName(deploymentName string) string {
 	return deploymentName + "-service"
 }
 
+func HostnamesForService(serviceName, namespace string) []string {
+	return []string{
+		fmt.Sprintf("%s.%s", serviceName, namespace),
+		fmt.Sprintf("%s.%s.svc", serviceName, namespace),
+		fmt.Sprintf("%s.%s.svc.cluster.local", serviceName, namespace),
+	}
+}
+
 func (i *StrategyDeploymentInstaller) getCertResources() []certResource {
 	return append(i.apiServiceDescriptions, i.webhookDescriptions...)
 }
 
 func (i *StrategyDeploymentInstaller) certResourcesForDeployment(deploymentName string) []certResource {
-	result := []certResource{}
+	var result []certResource
 	for _, desc := range i.getCertResources() {
 		if desc.getDeploymentName() == deploymentName {
 			result = append(result, desc)
@@ -185,13 +196,12 @@ func (i *StrategyDeploymentInstaller) installCertRequirements(strategy Strategy)
 	}
 
 	// Create the CA
-	expiration := time.Now().Add(DefaultCertValidFor)
-	ca, err := certs.GenerateCA(expiration, Organization)
+	i.certificateExpirationTime = CalculateCertExpiration(time.Now())
+	ca, err := certs.GenerateCA(i.certificateExpirationTime, Organization)
 	if err != nil {
 		logger.Debug("failed to generate CA")
 		return nil, err
 	}
-	rotateAt := expiration.Add(-1 * DefaultCertMinFresh)
 
 	for n, sddSpec := range strategyDetailsDeployment.DeploymentSpecs {
 		certResources := i.certResourcesForDeployment(sddSpec.Name)
@@ -202,7 +212,7 @@ func (i *StrategyDeploymentInstaller) installCertRequirements(strategy Strategy)
 		}
 
 		// Update the deployment for each certResource
-		newDepSpec, caPEM, err := i.installCertRequirementsForDeployment(sddSpec.Name, ca, rotateAt, sddSpec.Spec, getServicePorts(certResources))
+		newDepSpec, caPEM, err := i.installCertRequirementsForDeployment(sddSpec.Name, ca, i.certificateExpirationTime, sddSpec.Spec, getServicePorts(certResources))
 		if err != nil {
 			return nil, err
 		}
@@ -214,56 +224,119 @@ func (i *StrategyDeploymentInstaller) installCertRequirements(strategy Strategy)
 	return strategyDetailsDeployment, nil
 }
 
-func ShouldRotateCerts(csv *v1alpha1.ClusterServiceVersion) bool {
+func (i *StrategyDeploymentInstaller) CertsRotateAt() time.Time {
+	return CalculateCertRotatesAt(i.certificateExpirationTime)
+}
+
+func (i *StrategyDeploymentInstaller) CertsRotated() bool {
+	return i.certificatesRotated
+}
+
+// shouldRotateCerts indicates whether an apiService cert should be rotated due to being
+// malformed, invalid, expired, inactive or within a specific freshness interval (DefaultCertMinFresh) before expiry.
+func shouldRotateCerts(certSecret *corev1.Secret, hosts []string) bool {
 	now := metav1.Now()
-	if !csv.Status.CertsRotateAt.IsZero() && csv.Status.CertsRotateAt.Before(&now) {
+	caPEM, ok := certSecret.Data[OLMCAPEMKey]
+	if !ok {
+		// missing CA cert in secret
+		return true
+	}
+	certPEM, ok := certSecret.Data["tls.crt"]
+	if !ok {
+		// missing cert in secret
 		return true
 	}
 
+	ca, err := certs.PEMToCert(caPEM)
+	if err != nil {
+		// malformed CA cert
+		return true
+	}
+	cert, err := certs.PEMToCert(certPEM)
+	if err != nil {
+		// malformed cert
+		return true
+	}
+
+	// check for cert freshness
+	if !certs.Active(ca) || now.Time.After(CalculateCertRotatesAt(ca.NotAfter)) ||
+		!certs.Active(cert) || now.Time.After(CalculateCertRotatesAt(cert.NotAfter)) {
+		return true
+	}
+
+	// Check validity of serving cert and if serving cert is trusted by the CA
+	for _, host := range hosts {
+		if err := certs.VerifyCert(ca, cert, host); err != nil {
+			return true
+		}
+	}
 	return false
 }
 
-func (i *StrategyDeploymentInstaller) installCertRequirementsForDeployment(deploymentName string, ca *certs.KeyPair, rotateAt time.Time, depSpec appsv1.DeploymentSpec, ports []corev1.ServicePort) (*appsv1.DeploymentSpec, []byte, error) {
+func (i *StrategyDeploymentInstaller) ShouldRotateCerts(s Strategy) (bool, error) {
+	strategy, ok := s.(*v1alpha1.StrategyDetailsDeployment)
+	if !ok {
+		return false, fmt.Errorf("failed to install %s strategy with deployment installer: unsupported deployment install strategy", strategy.GetStrategyName())
+	}
+
+	hasCerts := sets.New[string]()
+	for _, c := range i.getCertResources() {
+		hasCerts.Insert(c.getDeploymentName())
+	}
+	for _, sddSpec := range strategy.DeploymentSpecs {
+		if hasCerts.Has(sddSpec.Name) {
+			certSecret, err := i.strategyClient.GetOpLister().CoreV1().SecretLister().Secrets(i.owner.GetNamespace()).Get(SecretName(ServiceName(sddSpec.Name)))
+			if err == nil {
+				if shouldRotateCerts(certSecret, HostnamesForService(ServiceName(sddSpec.Name), i.owner.GetNamespace())) {
+					return true, nil
+				}
+			} else if apierrors.IsNotFound(err) {
+				return true, nil
+			} else {
+				return false, err
+			}
+		}
+	}
+	return false, nil
+}
+
+func CalculateCertExpiration(startingFrom time.Time) time.Time {
+	return startingFrom.Add(DefaultCertValidFor)
+}
+
+func CalculateCertRotatesAt(certExpirationTime time.Time) time.Time {
+	return certExpirationTime.Add(-1 * DefaultCertMinFresh)
+}
+
+func (i *StrategyDeploymentInstaller) installCertRequirementsForDeployment(deploymentName string, ca *certs.KeyPair, expiration time.Time, depSpec appsv1.DeploymentSpec, ports []corev1.ServicePort) (*appsv1.DeploymentSpec, []byte, error) {
 	logger := log.WithFields(log.Fields{})
 
-	// Create a service for the deployment
-	service := &corev1.Service{
-		Spec: corev1.ServiceSpec{
-			Ports:    ports,
-			Selector: depSpec.Selector.MatchLabels,
-		},
-	}
-	service.SetName(ServiceName(deploymentName))
-	service.SetNamespace(i.owner.GetNamespace())
-	ownerutil.AddNonBlockingOwner(service, i.owner)
-
-	existingService, err := i.strategyClient.GetOpLister().CoreV1().ServiceLister().Services(i.owner.GetNamespace()).Get(service.GetName())
-	if err == nil {
-		if !ownerutil.Adoptable(i.owner, existingService.GetOwnerReferences()) {
-			return nil, nil, fmt.Errorf("service %s not safe to replace: extraneous ownerreferences found", service.GetName())
-		}
-		service.SetOwnerReferences(existingService.GetOwnerReferences())
-
-		// Delete the Service to replace
-		deleteErr := i.strategyClient.GetOpClient().DeleteService(service.GetNamespace(), service.GetName(), &metav1.DeleteOptions{})
-		if err != nil && !k8serrors.IsNotFound(deleteErr) {
-			return nil, nil, fmt.Errorf("could not delete existing service %s", service.GetName())
-		}
+	// apply Service
+	serviceName := ServiceName(deploymentName)
+	portsApplyConfig := []*corev1ac.ServicePortApplyConfiguration{}
+	for _, p := range ports {
+		ac := corev1ac.ServicePort().
+			WithName(p.Name).
+			WithPort(p.Port).
+			WithTargetPort(p.TargetPort)
+		portsApplyConfig = append(portsApplyConfig, ac)
 	}
 
-	// Attempt to create the Service
-	_, err = i.strategyClient.GetOpClient().CreateService(service)
-	if err != nil {
-		logger.Warnf("could not create service %s", service.GetName())
-		return nil, nil, fmt.Errorf("could not create service %s: %s", service.GetName(), err.Error())
+	svcApplyConfig := corev1ac.Service(serviceName, i.owner.GetNamespace()).
+		WithSpec(corev1ac.ServiceSpec().
+			WithPorts(portsApplyConfig...).
+			WithSelector(depSpec.Selector.MatchLabels)).
+		WithOwnerReferences(ownerutil.NonBlockingOwnerApplyConfiguration(i.owner)).
+		WithLabels(map[string]string{OLMManagedLabelKey: OLMManagedLabelValue})
+
+	if _, err := i.strategyClient.GetOpClient().ApplyService(svcApplyConfig, metav1.ApplyOptions{Force: true, FieldManager: "olm.install"}); err != nil {
+		log.Errorf("could not apply service %s: %s", *svcApplyConfig.Name, err.Error())
+		return nil, nil, err
 	}
 
 	// Create signed serving cert
-	hosts := []string{
-		fmt.Sprintf("%s.%s", service.GetName(), i.owner.GetNamespace()),
-		fmt.Sprintf("%s.%s.svc", service.GetName(), i.owner.GetNamespace()),
-	}
-	servingPair, err := certGenerator.Generate(rotateAt, Organization, ca, hosts)
+	hosts := HostnamesForService(serviceName, i.owner.GetNamespace())
+	servingPair, err := certGenerator.Generate(expiration, Organization, ca, hosts)
 	if err != nil {
 		logger.Warnf("could not generate signed certs for hosts %v", hosts)
 		return nil, nil, err
@@ -272,14 +345,14 @@ func (i *StrategyDeploymentInstaller) installCertRequirementsForDeployment(deplo
 	// Create Secret for serving cert
 	certPEM, privPEM, err := servingPair.ToPEM()
 	if err != nil {
-		logger.Warnf("unable to convert serving certificate and private key to PEM format for Service %s", service.GetName())
+		logger.Warnf("unable to convert serving certificate and private key to PEM format for Service %s", serviceName)
 		return nil, nil, err
 	}
 
 	// Add olmcahash as a label to the caPEM
 	caPEM, _, err := ca.ToPEM()
 	if err != nil {
-		logger.Warnf("unable to convert CA certificate to PEM format for Service %s", service)
+		logger.Warnf("unable to convert CA certificate to PEM format for Service %s", serviceName)
 		return nil, nil, err
 	}
 	caHash := certs.PEMSHA256(caPEM)
@@ -292,7 +365,7 @@ func (i *StrategyDeploymentInstaller) installCertRequirementsForDeployment(deplo
 		},
 		Type: corev1.SecretTypeTLS,
 	}
-	secret.SetName(SecretName(service.GetName()))
+	secret.SetName(SecretName(serviceName))
 	secret.SetNamespace(i.owner.GetNamespace())
 	secret.SetAnnotations(map[string]string{OLMCAHashAnnotationKey: caHash})
 	secret.SetLabels(map[string]string{OLMManagedLabelKey: OLMManagedLabelValue})
@@ -306,21 +379,23 @@ func (i *StrategyDeploymentInstaller) installCertRequirementsForDeployment(deplo
 
 		// Attempt an update
 		// TODO: Check that the secret was not modified
-		if existingCAPEM, ok := existingSecret.Data[OLMCAPEMKey]; ok && !ShouldRotateCerts(i.owner.(*v1alpha1.ClusterServiceVersion)) {
+		if !shouldRotateCerts(existingSecret, HostnamesForService(serviceName, i.owner.GetNamespace())) {
 			logger.Warnf("reusing existing cert %s", secret.GetName())
 			secret = existingSecret
-			caPEM = existingCAPEM
+			caPEM = existingSecret.Data[OLMCAPEMKey]
 			caHash = certs.PEMSHA256(caPEM)
-		} else if _, err := i.strategyClient.GetOpClient().UpdateSecret(secret); err != nil {
-			logger.Warnf("could not update secret %s", secret.GetName())
-			return nil, nil, err
+		} else {
+			if _, err := i.strategyClient.GetOpClient().UpdateSecret(secret); err != nil {
+				logger.Warnf("could not update secret %s", secret.GetName())
+				return nil, nil, err
+			}
+			i.certificatesRotated = true
 		}
-
-	} else if k8serrors.IsNotFound(err) {
+	} else if apierrors.IsNotFound(err) {
 		// Create the secret
 		ownerutil.AddNonBlockingOwner(secret, i.owner)
 		if _, err := i.strategyClient.GetOpClient().CreateSecret(secret); err != nil {
-			if !k8serrors.IsAlreadyExists(err) {
+			if !apierrors.IsAlreadyExists(err) {
 				log.Warnf("could not create secret %s: %v", secret.GetName(), err)
 				return nil, nil, err
 			}
@@ -331,6 +406,7 @@ func (i *StrategyDeploymentInstaller) installCertRequirementsForDeployment(deplo
 				return nil, nil, err
 			}
 		}
+		i.certificatesRotated = true
 	} else {
 		return nil, nil, err
 	}
@@ -348,6 +424,7 @@ func (i *StrategyDeploymentInstaller) installCertRequirementsForDeployment(deplo
 	}
 	secretRole.SetName(secret.GetName())
 	secretRole.SetNamespace(i.owner.GetNamespace())
+	secretRole.SetLabels(map[string]string{OLMManagedLabelKey: OLMManagedLabelValue})
 
 	existingSecretRole, err := i.strategyClient.GetOpLister().RbacV1().RoleLister().Roles(i.owner.GetNamespace()).Get(secretRole.GetName())
 	if err == nil {
@@ -361,7 +438,7 @@ func (i *StrategyDeploymentInstaller) installCertRequirementsForDeployment(deplo
 			logger.Warnf("could not update secret role %s", secretRole.GetName())
 			return nil, nil, err
 		}
-	} else if k8serrors.IsNotFound(err) {
+	} else if apierrors.IsNotFound(err) {
 		// Create the role
 		ownerutil.AddNonBlockingOwner(secretRole, i.owner)
 		_, err = i.strategyClient.GetOpClient().CreateRole(secretRole)
@@ -394,6 +471,7 @@ func (i *StrategyDeploymentInstaller) installCertRequirementsForDeployment(deplo
 	}
 	secretRoleBinding.SetName(secret.GetName())
 	secretRoleBinding.SetNamespace(i.owner.GetNamespace())
+	secretRoleBinding.SetLabels(map[string]string{OLMManagedLabelKey: OLMManagedLabelValue})
 
 	existingSecretRoleBinding, err := i.strategyClient.GetOpLister().RbacV1().RoleBindingLister().RoleBindings(i.owner.GetNamespace()).Get(secretRoleBinding.GetName())
 	if err == nil {
@@ -407,7 +485,7 @@ func (i *StrategyDeploymentInstaller) installCertRequirementsForDeployment(deplo
 			logger.Warnf("could not update secret rolebinding %s", secretRoleBinding.GetName())
 			return nil, nil, err
 		}
-	} else if k8serrors.IsNotFound(err) {
+	} else if apierrors.IsNotFound(err) {
 		// Create the role
 		ownerutil.AddNonBlockingOwner(secretRoleBinding, i.owner)
 		_, err = i.strategyClient.GetOpClient().CreateRoleBinding(secretRoleBinding)
@@ -419,105 +497,60 @@ func (i *StrategyDeploymentInstaller) installCertRequirementsForDeployment(deplo
 		return nil, nil, err
 	}
 
-	// create ClusterRoleBinding to system:auth-delegator Role
-	authDelegatorClusterRoleBinding := &rbacv1.ClusterRoleBinding{
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				APIGroup:  "",
-				Name:      depSpec.Template.Spec.ServiceAccountName,
-				Namespace: i.owner.GetNamespace(),
-			},
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     "system:auth-delegator",
-		},
+	// apply ClusterRoleBinding to system:auth-delegator Role
+	crbLabels := map[string]string{OLMManagedLabelKey: OLMManagedLabelValue}
+	for key, val := range ownerutil.OwnerLabel(i.owner, i.owner.GetObjectKind().GroupVersionKind().Kind) {
+		crbLabels[key] = val
 	}
-	authDelegatorClusterRoleBinding.SetName(service.GetName() + "-system:auth-delegator")
+	crbApplyConfig := rbacv1ac.ClusterRoleBinding(AuthDelegatorClusterRoleBindingName(serviceName)).
+		WithSubjects(rbacv1ac.Subject().
+			WithKind("ServiceAccount").
+			WithAPIGroup("").
+			WithName(depSpec.Template.Spec.ServiceAccountName).
+			WithNamespace(i.owner.GetNamespace())).
+		WithRoleRef(rbacv1ac.RoleRef().
+			WithAPIGroup("rbac.authorization.k8s.io").
+			WithKind("ClusterRole").
+			WithName("system:auth-delegator")).
+		WithLabels(crbLabels)
 
-	existingAuthDelegatorClusterRoleBinding, err := i.strategyClient.GetOpLister().RbacV1().ClusterRoleBindingLister().Get(authDelegatorClusterRoleBinding.GetName())
-	if err == nil {
-		// Check if the only owners are this CSV or in this CSV's replacement chain.
-		if ownerutil.AdoptableLabels(existingAuthDelegatorClusterRoleBinding.GetLabels(), true, i.owner) {
-			logger.WithFields(log.Fields{"obj": "authDelegatorCRB", "labels": existingAuthDelegatorClusterRoleBinding.GetLabels()}).Debug("adopting")
-			if err := ownerutil.AddOwnerLabels(authDelegatorClusterRoleBinding, i.owner); err != nil {
-				return nil, nil, err
-			}
-		}
-
-		// Attempt an update.
-		if _, err := i.strategyClient.GetOpClient().UpdateClusterRoleBinding(authDelegatorClusterRoleBinding); err != nil {
-			logger.Warnf("could not update auth delegator clusterrolebinding %s", authDelegatorClusterRoleBinding.GetName())
-			return nil, nil, err
-		}
-	} else if k8serrors.IsNotFound(err) {
-		// Create the role.
-		if err := ownerutil.AddOwnerLabels(authDelegatorClusterRoleBinding, i.owner); err != nil {
-			return nil, nil, err
-		}
-		_, err = i.strategyClient.GetOpClient().CreateClusterRoleBinding(authDelegatorClusterRoleBinding)
-		if err != nil {
-			log.Warnf("could not create auth delegator clusterrolebinding %s", authDelegatorClusterRoleBinding.GetName())
-			return nil, nil, err
-		}
-	} else {
+	if _, err = i.strategyClient.GetOpClient().ApplyClusterRoleBinding(crbApplyConfig, metav1.ApplyOptions{Force: true, FieldManager: "olm.install"}); err != nil {
+		log.Errorf("could not apply auth delegator clusterrolebinding %s: %s", *crbApplyConfig.Name, err.Error())
 		return nil, nil, err
 	}
 
-	// Create RoleBinding to extension-apiserver-authentication-reader Role in the kube-system namespace.
-	authReaderRoleBinding := &rbacv1.RoleBinding{
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				APIGroup:  "",
-				Name:      depSpec.Template.Spec.ServiceAccountName,
-				Namespace: i.owner.GetNamespace(),
-			},
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "Role",
-			Name:     "extension-apiserver-authentication-reader",
-		},
-	}
-	authReaderRoleBinding.SetName(service.GetName() + "-auth-reader")
-	authReaderRoleBinding.SetNamespace(KubeSystem)
+	// Apply RoleBinding to extension-apiserver-authentication-reader Role in the kube-system namespace.
+	authReaderRoleBindingApplyConfig := rbacv1ac.RoleBinding(AuthReaderRoleBindingName(serviceName), KubeSystem).
+		WithLabels(map[string]string{OLMManagedLabelKey: OLMManagedLabelValue}).
+		WithSubjects(rbacv1ac.Subject().
+			WithKind("ServiceAccount").
+			WithAPIGroup("").
+			WithName(depSpec.Template.Spec.ServiceAccountName).
+			WithNamespace(i.owner.GetNamespace())).
+		WithRoleRef(rbacv1ac.RoleRef().
+			WithAPIGroup("rbac.authorization.k8s.io").
+			WithKind("Role").
+			WithName("extension-apiserver-authentication-reader"))
 
-	existingAuthReaderRoleBinding, err := i.strategyClient.GetOpLister().RbacV1().RoleBindingLister().RoleBindings(KubeSystem).Get(authReaderRoleBinding.GetName())
-	if err == nil {
-		// Check if the only owners are this CSV or in this CSV's replacement chain.
-		if ownerutil.AdoptableLabels(existingAuthReaderRoleBinding.GetLabels(), true, i.owner) {
-			logger.WithFields(log.Fields{"obj": "existingAuthReaderRB", "labels": existingAuthReaderRoleBinding.GetLabels()}).Debug("adopting")
-			if err := ownerutil.AddOwnerLabels(authReaderRoleBinding, i.owner); err != nil {
-				return nil, nil, err
-			}
-		}
-		// Attempt an update.
-		if _, err := i.strategyClient.GetOpClient().UpdateRoleBinding(authReaderRoleBinding); err != nil {
-			logger.Warnf("could not update auth reader role binding %s", authReaderRoleBinding.GetName())
-			return nil, nil, err
-		}
-	} else if k8serrors.IsNotFound(err) {
-		// Create the role.
-		if err := ownerutil.AddOwnerLabels(authReaderRoleBinding, i.owner); err != nil {
-			return nil, nil, err
-		}
-		_, err = i.strategyClient.GetOpClient().CreateRoleBinding(authReaderRoleBinding)
-		if err != nil {
-			log.Warnf("could not create auth reader role binding %s", authReaderRoleBinding.GetName())
-			return nil, nil, err
-		}
-	} else {
+	if _, err = i.strategyClient.GetOpClient().ApplyRoleBinding(authReaderRoleBindingApplyConfig, metav1.ApplyOptions{Force: true, FieldManager: "olm.install"}); err != nil {
+		log.Errorf("could not apply auth reader rolebinding %s: %s", *authReaderRoleBindingApplyConfig.Name, err.Error())
 		return nil, nil, err
 	}
+
 	AddDefaultCertVolumeAndVolumeMounts(&depSpec, secret.GetName())
 
 	// Setting the olm hash label forces a rollout and ensures that the new secret
 	// is used by the apiserver if not hot reloading.
 	SetCAAnnotation(&depSpec, caHash)
 	return &depSpec, caPEM, nil
+}
+
+func AuthDelegatorClusterRoleBindingName(serviceName string) string {
+	return serviceName + "-system:auth-delegator"
+}
+
+func AuthReaderRoleBindingName(serviceName string) string {
+	return serviceName + "-auth-reader"
 }
 
 func SetCAAnnotation(depSpec *appsv1.DeploymentSpec, caHash string) {

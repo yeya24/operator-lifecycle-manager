@@ -4,43 +4,155 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/blang/semver/v4"
+	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+	v1alpha1listers "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/resolver/cache"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/metrics"
 	"github.com/operator-framework/operator-registry/pkg/api"
 	"github.com/operator-framework/operator-registry/pkg/client"
 	opregistry "github.com/operator-framework/operator-registry/pkg/registry"
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/labels"
 )
+
+// todo: move to pkg/controller/operators/catalog
 
 type RegistryClientProvider interface {
 	ClientsForNamespaces(namespaces ...string) map[registry.CatalogKey]client.Interface
 }
 
-type registryClientAdapter struct {
-	rcp    RegistryClientProvider
-	logger logrus.StdLogger
+type sourceInvalidator struct {
+	m          sync.Mutex
+	validChans map[cache.SourceKey]chan struct{}
+	ttl        time.Duration // auto-invalidate after this ttl
 }
 
-func SourceProviderFromRegistryClientProvider(rcp RegistryClientProvider, logger logrus.StdLogger) cache.SourceProvider {
-	return &registryClientAdapter{
-		rcp:    rcp,
-		logger: logger,
+func (i *sourceInvalidator) Invalidate(key cache.SourceKey) {
+	i.m.Lock()
+	defer i.m.Unlock()
+	if c, ok := i.validChans[key]; ok {
+		close(c)
+		delete(i.validChans, key)
 	}
 }
 
+func (i *sourceInvalidator) GetValidChannel(key cache.SourceKey) <-chan struct{} {
+	i.m.Lock()
+	defer i.m.Unlock()
+
+	if c, ok := i.validChans[key]; ok {
+		return c
+	}
+	c := make(chan struct{})
+	i.validChans[key] = c
+
+	go func() {
+		<-time.After(i.ttl)
+
+		// be careful to avoid closing c (and panicking) after
+		// it has already been invalidated via Invalidate
+		i.m.Lock()
+		defer i.m.Unlock()
+
+		if saved := i.validChans[key]; saved == c {
+			close(c)
+			delete(i.validChans, key)
+		}
+	}()
+
+	return c
+}
+
+type RegistrySourceProvider struct {
+	rcp          RegistryClientProvider
+	catsrcLister v1alpha1listers.CatalogSourceLister
+	logger       logrus.StdLogger
+	invalidator  *sourceInvalidator
+}
+
+const defaultCacheLifetime time.Duration = 30 * time.Minute
+
+func SourceProviderFromRegistryClientProvider(rcp RegistryClientProvider, catsrcLister v1alpha1listers.CatalogSourceLister, logger logrus.StdLogger) *RegistrySourceProvider {
+	return &RegistrySourceProvider{
+		rcp:          rcp,
+		logger:       logger,
+		catsrcLister: catsrcLister,
+		invalidator: &sourceInvalidator{
+			validChans: make(map[cache.SourceKey]chan struct{}),
+			ttl:        defaultCacheLifetime,
+		},
+	}
+}
+
+type errorSource struct {
+	error
+}
+
+func (s errorSource) Snapshot(_ context.Context) (*cache.Snapshot, error) {
+	return nil, s.error
+}
+
+func (a *RegistrySourceProvider) Sources(namespaces ...string) map[cache.SourceKey]cache.Source {
+	result := make(map[cache.SourceKey]cache.Source)
+
+	cats := []*operatorsv1alpha1.CatalogSource{}
+	for _, ns := range namespaces {
+		catsInNamespace, err := a.catsrcLister.CatalogSources(ns).List(labels.Everything())
+		if err != nil {
+			result[cache.SourceKey{Name: "", Namespace: ns}] = errorSource{
+				error: fmt.Errorf("failed to list catalogsources for namespace %q: %w", ns, err),
+			}
+			return result
+		}
+		cats = append(cats, catsInNamespace...)
+	}
+
+	clients := a.rcp.ClientsForNamespaces(namespaces...)
+	for _, cat := range cats {
+		key := cache.SourceKey{Name: cat.Name, Namespace: cat.Namespace}
+		if client, ok := clients[registry.CatalogKey{Name: cat.Name, Namespace: cat.Namespace}]; ok {
+			result[key] = &registrySource{
+				key:         key,
+				client:      client,
+				logger:      a.logger,
+				invalidator: a.invalidator,
+			}
+		} else {
+			result[key] = errorSource{
+				error: fmt.Errorf("no registry client established for catalogsource %s/%s", cat.Namespace, cat.Name),
+			}
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func (a *RegistrySourceProvider) Invalidate(key cache.SourceKey) {
+	a.invalidator.Invalidate(key)
+}
+
 type registrySource struct {
-	key    cache.SourceKey
-	client client.Interface
-	logger logrus.StdLogger
+	key         cache.SourceKey
+	client      client.Interface
+	logger      logrus.StdLogger
+	invalidator *sourceInvalidator
 }
 
 func (s *registrySource) Snapshot(ctx context.Context) (*cache.Snapshot, error) {
+	s.logger.Printf("requesting snapshot for catalog source %s/%s", s.key.Namespace, s.key.Name)
+	metrics.IncrementCatalogSourceSnapshotsTotal(s.key.Name, s.key.Namespace)
+
 	// Fetching default channels this way makes many round trips
 	// -- may need to either add a new API to fetch all at once,
 	// or embed the information into Bundle.
-	defaultChannels := make(map[string]string)
+	packages := make(map[string]*api.Package)
 
 	it, err := s.client.ListBundles(ctx)
 	if err != nil {
@@ -49,21 +161,39 @@ func (s *registrySource) Snapshot(ctx context.Context) (*cache.Snapshot, error) 
 
 	var operators []*cache.Entry
 	for b := it.Next(); b != nil; b = it.Next() {
-		defaultChannel, ok := defaultChannels[b.PackageName]
+		p, ok := packages[b.PackageName]
 		if !ok {
-			if p, err := s.client.GetPackage(ctx, b.PackageName); err != nil {
+			if p, err = s.client.GetPackage(ctx, b.PackageName); err != nil {
 				s.logger.Printf("failed to retrieve default channel for bundle, continuing: %v", err)
 				continue
 			} else {
-				defaultChannels[b.PackageName] = p.DefaultChannelName
-				defaultChannel = p.DefaultChannelName
+				packages[b.PackageName] = p
 			}
 		}
-		o, err := newOperatorFromBundle(b, "", s.key, defaultChannel)
+		o, err := newOperatorFromBundle(b, "", s.key, p.DefaultChannelName)
 		if err != nil {
 			s.logger.Printf("failed to construct operator from bundle, continuing: %v", err)
 			continue
 		}
+		var deprecations *cache.Deprecations
+		if p.Deprecation != nil {
+			deprecations = &cache.Deprecations{Package: &api.Deprecation{Message: fmt.Sprintf("olm.package/%s: %s", p.Name, p.Deprecation.GetMessage())}}
+		}
+		for _, c := range p.Channels {
+			if c.Name == b.ChannelName && c.Deprecation != nil {
+				if deprecations == nil {
+					deprecations = &cache.Deprecations{}
+				}
+				deprecations.Channel = &api.Deprecation{Message: fmt.Sprintf("olm.channel/%s: %s", c.Name, c.Deprecation.GetMessage())}
+			}
+		}
+		if b.Deprecation != nil {
+			if deprecations == nil {
+				deprecations = &cache.Deprecations{}
+			}
+			deprecations.Bundle = &api.Deprecation{Message: fmt.Sprintf("olm.bundle/%s: %s", b.CsvName, b.Deprecation.GetMessage())}
+		}
+		o.SourceInfo.Deprecations = deprecations
 		o.ProvidedAPIs = o.ProvidedAPIs.StripPlural()
 		o.RequiredAPIs = o.RequiredAPIs.StripPlural()
 		o.Replaces = b.Replaces
@@ -74,19 +204,10 @@ func (s *registrySource) Snapshot(ctx context.Context) (*cache.Snapshot, error) 
 		return nil, fmt.Errorf("error encountered while listing bundles: %w", err)
 	}
 
-	return &cache.Snapshot{Entries: operators}, nil
-}
-
-func (a *registryClientAdapter) Sources(namespaces ...string) map[cache.SourceKey]cache.Source {
-	result := make(map[cache.SourceKey]cache.Source)
-	for key, client := range a.rcp.ClientsForNamespaces(namespaces...) {
-		result[cache.SourceKey(key)] = &registrySource{
-			key:    cache.SourceKey(key),
-			client: client,
-			logger: a.logger,
-		}
-	}
-	return result
+	return &cache.Snapshot{
+		Entries: operators,
+		Valid:   s.invalidator.GetValidChannel(s.key),
+	}, nil
 }
 
 func EnsurePackageProperty(o *cache.Entry, name, version string) {
@@ -231,6 +352,11 @@ func legacyDependenciesToProperties(dependencies []*api.Dependency) ([]*api.Prop
 		case "olm.label":
 			result = append(result, &api.Property{
 				Type:  "olm.label.required",
+				Value: dependency.Value,
+			})
+		case "olm.constraint":
+			result = append(result, &api.Property{
+				Type:  "olm.constraint",
 				Value: dependency.Value,
 			})
 		}

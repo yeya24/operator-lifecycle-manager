@@ -2,7 +2,8 @@ package filemonitor
 
 import (
 	"crypto/x509"
-	"io/ioutil"
+	"fmt"
+	"os"
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
@@ -16,12 +17,14 @@ type certPoolStore struct {
 }
 
 func NewCertPoolStore(clientCAPath string) (*certPoolStore, error) {
-	pem, err := ioutil.ReadFile(clientCAPath)
+	pem, err := os.ReadFile(clientCAPath)
 	if err != nil {
 		return nil, err
 	}
 	pool := x509.NewCertPool()
-	pool.AppendCertsFromPEM(pem)
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("client CA bundle %q contains no parseable certificates", clientCAPath)
+	}
 
 	return &certPoolStore{
 		mutex:        sync.RWMutex{},
@@ -31,15 +34,20 @@ func NewCertPoolStore(clientCAPath string) (*certPoolStore, error) {
 }
 
 func (c *certPoolStore) storeCABundle(clientCAPath string) error {
-	pem, err := ioutil.ReadFile(clientCAPath)
-	if err == nil {
-		c.mutex.Lock()
-		defer c.mutex.Unlock()
-		pool := x509.NewCertPool()
-		pool.AppendCertsFromPEM(pem)
-		c.certpool = pool
+	pem, err := os.ReadFile(clientCAPath)
+	if err != nil {
+		return err
 	}
-	return err
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		// Preserve the existing (usable) pool rather than replacing it with an
+		// empty one that can verify no client certificates.
+		return fmt.Errorf("client CA bundle %q contains no parseable certificates", clientCAPath)
+	}
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.certpool = pool
+	return nil
 }
 
 func (c *certPoolStore) HandleCABundleUpdate(logger logrus.FieldLogger, event fsnotify.Event) {
@@ -56,5 +64,7 @@ func (c *certPoolStore) HandleCABundleUpdate(logger logrus.FieldLogger, event fs
 }
 
 func (c *certPoolStore) GetCertPool() *x509.CertPool {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
 	return c.certpool
 }

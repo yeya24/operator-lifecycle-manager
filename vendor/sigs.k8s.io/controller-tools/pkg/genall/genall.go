@@ -17,16 +17,16 @@ limitations under the License.
 package genall
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 
 	"golang.org/x/tools/go/packages"
-	"sigs.k8s.io/yaml"
-
 	"sigs.k8s.io/controller-tools/pkg/loader"
 	"sigs.k8s.io/controller-tools/pkg/markers"
+	"sigs.k8s.io/yaml"
 )
 
 // Generators are a list of Generators.
@@ -100,6 +100,8 @@ type Runtime struct {
 	GenerationContext
 	// OutputRules defines how to output artifacts for each Generator.
 	OutputRules OutputRules
+	// ErrorWriter defines where to write error messages.
+	ErrorWriter io.Writer
 }
 
 // GenerationContext defines the common information needed for each Generator
@@ -118,22 +120,49 @@ type GenerationContext struct {
 	InputRule
 }
 
+// WriteYAMLOptions implements the Options Pattern for WriteYAML.
+type WriteYAMLOptions struct {
+	transform func(obj map[string]any) error
+}
+
+// WithTransform applies a transformation to objects just before writing them.
+func WithTransform(transform func(obj map[string]any) error) *WriteYAMLOptions {
+	return &WriteYAMLOptions{
+		transform: transform,
+	}
+}
+
+// TransformRemoveCreationTimestamp ensures we do not write the metadata.creationTimestamp field.
+func TransformRemoveCreationTimestamp(obj map[string]any) error {
+	metadata, ok := obj["metadata"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	delete(metadata, "creationTimestamp")
+	return nil
+}
+
 // WriteYAML writes the given objects out, serialized as YAML, using the
 // context's OutputRule.  Objects are written as separate documents, separated
 // from each other by `---` (as per the YAML spec).
-func (g GenerationContext) WriteYAML(itemPath string, objs ...interface{}) error {
+func (g GenerationContext) WriteYAML(itemPath, headerText string, objs []any, options ...*WriteYAMLOptions) error {
 	out, err := g.Open(nil, itemPath)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
 
+	_, err = out.Write([]byte(headerText))
+	if err != nil {
+		return err
+	}
+
 	for _, obj := range objs {
-		yamlContent, err := yaml.Marshal(obj)
+		yamlContent, err := yamlMarshal(obj, options...)
 		if err != nil {
 			return err
 		}
-		n, err := out.Write(append([]byte("\n---\n"), yamlContent...))
+		n, err := out.Write(append([]byte("---\n"), yamlContent...))
 		if err != nil {
 			return err
 		}
@@ -145,6 +174,41 @@ func (g GenerationContext) WriteYAML(itemPath string, objs ...interface{}) error
 	return nil
 }
 
+// yamlMarshal is based on sigs.k8s.io/yaml.Marshal, but allows for transforming the final data before writing.
+func yamlMarshal(o any, options ...*WriteYAMLOptions) ([]byte, error) {
+	j, err := json.Marshal(o)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling into JSON: %w", err)
+	}
+
+	return yamlJSONToYAMLWithFilter(j, options...)
+}
+
+// yamlJSONToYAMLWithFilter is based on sigs.k8s.io/yaml.JSONToYAML, but allows for transforming the final data before writing.
+//
+// It does not call JSONToYAML directly because transforms need a map[string]any, and the YAML
+// decoder returns map[any]any for nested maps. Marshalling is still done by sigs.k8s.io/yaml.
+func yamlJSONToYAMLWithFilter(j []byte, options ...*WriteYAMLOptions) ([]byte, error) {
+	var jsonObj map[string]any
+	// UseNumber keeps integers exact. Without it every number becomes a float64,
+	// so values above 2^53 lose precision.
+	decoder := json.NewDecoder(bytes.NewReader(j))
+	decoder.UseNumber()
+	if err := decoder.Decode(&jsonObj); err != nil {
+		return nil, err
+	}
+
+	for _, option := range options {
+		if option.transform != nil {
+			if err := option.transform(jsonObj); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return yaml.Marshal(jsonObj)
+}
+
 // ReadFile reads the given boilerplate artifact using the context's InputRule.
 func (g GenerationContext) ReadFile(path string) ([]byte, error) {
 	file, err := g.OpenForRead(path)
@@ -152,13 +216,17 @@ func (g GenerationContext) ReadFile(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer file.Close()
-	return ioutil.ReadAll(file)
+	return io.ReadAll(file)
 }
 
 // ForRoots produces a Runtime to run the given generators against the
 // given packages.  It outputs to /dev/null by default.
 func (g Generators) ForRoots(rootPaths ...string) (*Runtime, error) {
-	roots, err := loader.LoadRoots(rootPaths...)
+	return g.ForRootsWithConfig(&packages.Config{}, rootPaths...)
+}
+
+func (g Generators) ForRootsWithConfig(cfg *packages.Config, rootPaths ...string) (*Runtime, error) {
+	roots, err := loader.LoadRootsWithConfig(cfg, rootPaths...)
 	if err != nil {
 		return nil, err
 	}
@@ -188,8 +256,12 @@ func (g Generators) ForRoots(rootPaths ...string) (*Runtime, error) {
 func (r *Runtime) Run() bool {
 	// TODO(directxman12): we could make this parallel,
 	// but we'd need to ensure all underlying machinery is threadsafe
+
+	if r.ErrorWriter == nil {
+		r.ErrorWriter = os.Stderr
+	}
 	if len(r.Generators) == 0 {
-		fmt.Fprintln(os.Stderr, "no generators to run")
+		fmt.Fprintln(r.ErrorWriter, "no generators to run")
 		return true
 	}
 
@@ -205,7 +277,7 @@ func (r *Runtime) Run() bool {
 		}
 
 		if err := (*gen).Generate(&ctx); err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintln(r.ErrorWriter, err)
 			hadErrs = true
 		}
 	}

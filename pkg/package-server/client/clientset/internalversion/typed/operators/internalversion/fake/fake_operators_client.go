@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -24,17 +22,17 @@ import (
 	testing "k8s.io/client-go/testing"
 )
 
-type FakeOperators struct {
+type FakePackages struct {
 	*testing.Fake
 }
 
-func (c *FakeOperators) PackageManifests(namespace string) internalversion.PackageManifestInterface {
-	return &FakePackageManifests{c, namespace}
+func (c *FakePackages) PackageManifests(namespace string) internalversion.PackageManifestInterface {
+	return newFakePackageManifests(c, namespace)
 }
 
 // RESTClient returns a RESTClient that is used to communicate
 // with API server by this client implementation.
-func (c *FakeOperators) RESTClient() rest.Interface {
+func (c *FakePackages) RESTClient() rest.Interface {
 	var ret *rest.RESTClient
 	return ret
 }

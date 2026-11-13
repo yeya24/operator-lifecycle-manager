@@ -3,36 +3,43 @@ package reconciler
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
+	"strings"
 	"time"
 
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
-	k8serror "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/util/rand"
+	"github.com/google/go-cmp/cmp"
 
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
+
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 	controllerclient "github.com/operator-framework/operator-lifecycle-manager/pkg/lib/controller-runtime/client"
 	hashutil "github.com/operator-framework/operator-lifecycle-manager/pkg/lib/kubernetes/pkg/util/hash"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorclient"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorlister"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/ownerutil"
+	pkgerrors "github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 const (
 	CatalogSourceUpdateKey      = "catalogsource.operators.coreos.com/update"
 	ServiceHashLabelKey         = "olm.service-spec-hash"
 	CatalogPollingRequeuePeriod = 30 * time.Second
+	// containerReasonCrashLoopBackOff is the kubelet Waiting reason when a container is backing off after repeated crashes.
+	containerReasonCrashLoopBackOff = "CrashLoopBackOff"
 )
 
 // grpcCatalogSourceDecorator wraps CatalogSource to add additional methods
 type grpcCatalogSourceDecorator struct {
 	*v1alpha1.CatalogSource
+	createPodAsUser int64
+	opmImage        string
+	utilImage       string
 }
 
 type UpdateNotReadyErr struct {
@@ -58,7 +65,8 @@ func (s *grpcCatalogSourceDecorator) SelectorForUpdate() labels.Selector {
 
 func (s *grpcCatalogSourceDecorator) Labels() map[string]string {
 	return map[string]string{
-		CatalogSourceLabelKey: s.GetName(),
+		CatalogSourceLabelKey:      s.GetName(),
+		install.OLMManagedLabelKey: install.OLMManagedLabelValue,
 	}
 }
 
@@ -67,10 +75,10 @@ func (s *grpcCatalogSourceDecorator) Annotations() map[string]string {
 	return s.GetAnnotations()
 }
 
-func (s *grpcCatalogSourceDecorator) Service() *corev1.Service {
+func (s *grpcCatalogSourceDecorator) Service() (*corev1.Service, error) {
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      s.GetName(),
+			Name:      strings.ReplaceAll(s.GetName(), ".", "-"),
 			Namespace: s.GetNamespace(),
 		},
 		Spec: corev1.ServiceSpec{
@@ -86,11 +94,23 @@ func (s *grpcCatalogSourceDecorator) Service() *corev1.Service {
 	}
 
 	labels := map[string]string{}
-	hash := HashServiceSpec(svc.Spec)
+	hash, err := hashutil.DeepHashObject(&svc.Spec)
+	if err != nil {
+		return nil, err
+	}
 	labels[ServiceHashLabelKey] = hash
+	labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
 	svc.SetLabels(labels)
 	ownerutil.AddOwner(svc, s.CatalogSource, false, false)
-	return svc
+	return svc, nil
+}
+
+func (s *grpcCatalogSourceDecorator) GRPCServerNetworkPolicy() *networkingv1.NetworkPolicy {
+	return DesiredGRPCServerNetworkPolicy(s.CatalogSource, s.Labels())
+}
+
+func (s *grpcCatalogSourceDecorator) UnpackBundlesNetworkPolicy() *networkingv1.NetworkPolicy {
+	return DesiredUnpackBundlesNetworkPolicy(s.CatalogSource)
 }
 
 func (s *grpcCatalogSourceDecorator) ServiceAccount() *corev1.ServiceAccount {
@@ -107,6 +127,7 @@ func (s *grpcCatalogSourceDecorator) ServiceAccount() *corev1.ServiceAccount {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      s.GetName(),
 			Namespace: s.GetNamespace(),
+			Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					Name:               s.GetName(),
@@ -122,147 +143,303 @@ func (s *grpcCatalogSourceDecorator) ServiceAccount() *corev1.ServiceAccount {
 	}
 }
 
-func (s *grpcCatalogSourceDecorator) Pod(saName string) *corev1.Pod {
-	pod := Pod(s.CatalogSource, "registry-server", s.Spec.Image, saName, s.Labels(), s.Annotations(), 5, 10)
-	ownerutil.AddOwner(pod, s.CatalogSource, false, false)
-	return pod
+func (s *grpcCatalogSourceDecorator) Pod(serviceAccount *corev1.ServiceAccount, defaultPodSecurityConfig v1alpha1.SecurityConfig) (*corev1.Pod, error) {
+	pod, err := Pod(s.CatalogSource, "registry-server", s.opmImage, s.utilImage, s.Spec.Image, serviceAccount, s.Labels(), s.Annotations(), 5, 10, s.createPodAsUser, defaultPodSecurityConfig)
+	if err != nil {
+		return nil, err
+	}
+	ownerutil.AddOwner(pod, s.CatalogSource, false, true)
+	return pod, nil
 }
 
 type GrpcRegistryReconciler struct {
-	now       nowFunc
-	Lister    operatorlister.OperatorLister
-	OpClient  operatorclient.ClientInterface
-	SSAClient *controllerclient.ServerSideApplier
+	now             nowFunc
+	Lister          operatorlister.OperatorLister
+	OpClient        operatorclient.ClientInterface
+	SSAClient       *controllerclient.ServerSideApplier
+	createPodAsUser int64
+	opmImage        string
+	utilImage       string
 }
 
 var _ RegistryReconciler = &GrpcRegistryReconciler{}
 
-func (c *GrpcRegistryReconciler) currentService(source grpcCatalogSourceDecorator) *corev1.Service {
-	serviceName := source.Service().GetName()
+func (c *GrpcRegistryReconciler) currentGRPCServerNetworkPolicy(source grpcCatalogSourceDecorator) *networkingv1.NetworkPolicy {
+	npName := source.GRPCServerNetworkPolicy().GetName()
+	np, err := c.Lister.NetworkingV1().NetworkPolicyLister().NetworkPolicies(source.GetNamespace()).Get(npName)
+	if err != nil {
+		logrus.WithField("networkPolicy", npName).WithError(err).Debug("couldn't find grpc server network policy in cache")
+		return nil
+	}
+	return np
+}
+
+func (c *GrpcRegistryReconciler) currentUnpackBundlesNetworkPolicy(source grpcCatalogSourceDecorator) *networkingv1.NetworkPolicy {
+	npName := source.UnpackBundlesNetworkPolicy().GetName()
+	np, err := c.Lister.NetworkingV1().NetworkPolicyLister().NetworkPolicies(source.GetNamespace()).Get(npName)
+	if err != nil {
+		logrus.WithField("networkPolicy", npName).WithError(err).Debug("couldn't find unpack bundles network policy in cache")
+		return nil
+	}
+	return np
+}
+
+func (c *GrpcRegistryReconciler) currentService(source grpcCatalogSourceDecorator) (*corev1.Service, error) {
+	protoService, err := source.Service()
+	if err != nil {
+		return nil, err
+	}
+	serviceName := protoService.GetName()
 	service, err := c.Lister.CoreV1().ServiceLister().Services(source.GetNamespace()).Get(serviceName)
 	if err != nil {
-		logrus.WithField("service", serviceName).Warn("couldn't find service in cache")
-		return nil
+		logrus.WithField("service", serviceName).Debug("couldn't find service in cache")
+		return nil, nil
 	}
-	return service
+	return service, nil
 }
 
-func (c *GrpcRegistryReconciler) currentPods(source grpcCatalogSourceDecorator) []*corev1.Pod {
+func (c *GrpcRegistryReconciler) currentServiceAccount(source grpcCatalogSourceDecorator) *corev1.ServiceAccount {
+	serviceAccountName := source.ServiceAccount().GetName()
+	serviceAccount, err := c.Lister.CoreV1().ServiceAccountLister().ServiceAccounts(source.GetNamespace()).Get(serviceAccountName)
+	if err != nil {
+		logrus.WithField("serviceAccount", serviceAccount).Debug("couldn't find serviceAccount in cache")
+		return nil
+	}
+	return serviceAccount
+}
+
+func (c *GrpcRegistryReconciler) currentPods(logger *logrus.Entry, source grpcCatalogSourceDecorator) []*corev1.Pod {
 	pods, err := c.Lister.CoreV1().PodLister().Pods(source.GetNamespace()).List(source.Selector())
 	if err != nil {
-		logrus.WithError(err).Warn("couldn't find pod in cache")
+		logger.WithError(err).Warn("couldn't find pod in cache")
 		return nil
 	}
 	if len(pods) > 1 {
-		logrus.WithField("selector", source.Selector()).Warn("multiple pods found for selector")
+		logger.WithField("selector", source.Selector()).Info("multiple pods found for selector")
 	}
 	return pods
 }
 
-func (c *GrpcRegistryReconciler) currentUpdatePods(source grpcCatalogSourceDecorator) []*corev1.Pod {
+func (c *GrpcRegistryReconciler) currentUpdatePods(logger *logrus.Entry, source grpcCatalogSourceDecorator) []*corev1.Pod {
 	pods, err := c.Lister.CoreV1().PodLister().Pods(source.GetNamespace()).List(source.SelectorForUpdate())
 	if err != nil {
-		logrus.WithError(err).Warn("couldn't find pod in cache")
+		logger.WithError(err).Warn("couldn't find pod in cache")
 		return nil
 	}
 	if len(pods) > 1 {
-		logrus.WithField("selector", source.Selector()).Warn("multiple pods found for selector")
+		logger.WithField("selector", source.Selector()).Info("multiple update pods found for selector")
 	}
 	return pods
 }
 
-func (c *GrpcRegistryReconciler) currentPodsWithCorrectImageAndSpec(source grpcCatalogSourceDecorator, saName string) []*corev1.Pod {
+func (c *GrpcRegistryReconciler) currentPodsWithCorrectImageAndSpec(logger *logrus.Entry, source grpcCatalogSourceDecorator, serviceAccount *corev1.ServiceAccount, defaultPodSecurityConfig v1alpha1.SecurityConfig) ([]*corev1.Pod, error) {
 	pods, err := c.Lister.CoreV1().PodLister().Pods(source.GetNamespace()).List(labels.SelectorFromValidatedSet(source.Labels()))
 	if err != nil {
-		logrus.WithError(err).Warn("couldn't find pod in cache")
-		return nil
+		logger.WithError(err).Warn("error searching for catalog source pods: couldn't find pod in cache")
+		return nil, nil
 	}
 	found := []*corev1.Pod{}
-	newPod := source.Pod(saName)
+	newPod, err := source.Pod(serviceAccount, defaultPodSecurityConfig)
+	if err != nil {
+		return nil, err
+	}
 	for _, p := range pods {
-		if p.Spec.Containers[0].Image == source.Spec.Image && podHashMatch(p, newPod) {
+		images, hash := correctImages(source, p), podHashMatch(p, newPod)
+		logger = logger.WithFields(logrus.Fields{
+			"current-pod.namespace": p.Namespace, "current-pod.name": p.Name,
+			"correctImages": images, "correctHash": hash,
+		})
+		logger.Info("evaluating current pod")
+		if !hash {
+			logger.Infof("pod spec diff: %s", cmp.Diff(p.Spec, newPod.Spec))
+		}
+		if images && hash {
 			found = append(found, p)
 		}
 	}
-	return found
+	logger.Infof("of %d pods matching label selector, %d have the correct images and matching hash", len(pods), len(found))
+	return found, nil
+}
+
+func correctImages(source grpcCatalogSourceDecorator, pod *corev1.Pod) bool {
+	if source.CatalogSource.Spec.GrpcPodConfig != nil && source.CatalogSource.Spec.GrpcPodConfig.ExtractContent != nil {
+		if len(pod.Spec.InitContainers) != 2 {
+			return false
+		}
+		if len(pod.Spec.Containers) != 1 {
+			return false
+		}
+		return pod.Spec.InitContainers[0].Image == source.utilImage &&
+			pod.Spec.InitContainers[1].Image == source.CatalogSource.Spec.Image &&
+			pod.Spec.Containers[0].Image == source.opmImage
+	}
+	if len(pod.Spec.Containers) == 0 {
+		return false
+	}
+	return pod.Spec.Containers[0].Image == source.CatalogSource.Spec.Image
 }
 
 // EnsureRegistryServer ensures that all components of registry server are up to date.
-func (c *GrpcRegistryReconciler) EnsureRegistryServer(catalogSource *v1alpha1.CatalogSource) error {
-	source := grpcCatalogSourceDecorator{catalogSource}
+func (c *GrpcRegistryReconciler) EnsureRegistryServer(logger *logrus.Entry, catalogSource *v1alpha1.CatalogSource) error {
+	source := grpcCatalogSourceDecorator{CatalogSource: catalogSource, createPodAsUser: c.createPodAsUser, opmImage: c.opmImage, utilImage: c.utilImage}
 
 	// if service status is nil, we force create every object to ensure they're created the first time
-	overwrite := source.Status.RegistryServiceStatus == nil
+	valid, err := isRegistryServiceStatusValid(&source)
+	if err != nil {
+		logger.WithError(err).Error("error ensuring registry server: could not validate registry service status")
+		return err
+	}
+	overwrite := !valid
+	if overwrite {
+		logger.Info("registry service status invalid, need to overwrite")
+	}
 
 	//TODO: if any of these error out, we should write a status back (possibly set RegistryServiceStatus to nil so they get recreated)
-	sa, err := c.ensureSA(source)
-	// recreate the pod if no existing pod is serving the latest image or correct spec
-	overwritePod := overwrite || len(c.currentPodsWithCorrectImageAndSpec(source, sa.GetName())) == 0
+	if err := c.ensureGRPCServerNetworkPolicy(source); err != nil {
+		logger.WithError(err).Error("error ensuring registry server: could not ensure grpc server network policy")
+		return pkgerrors.Wrapf(err, "error ensuring grpc server network policy for catalog source %s", source.GetName())
+	}
+	if err := c.ensureUnpackBundlesNetworkPolicy(source); err != nil {
+		logger.WithError(err).Error("error ensuring registry server: could not ensure bundle unpack network policy")
+		return pkgerrors.Wrapf(err, "error ensuring bundle unpack network policy for catalog source %s", source.GetName())
+	}
 
-	if err != nil && !k8serror.IsAlreadyExists(err) {
-		return errors.Wrapf(err, "error ensuring service account: %s", source.GetName())
+	sa, err := c.ensureSA(source)
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		logger.WithError(err).Error("error ensuring registry server: could not ensure registry service account")
+		return pkgerrors.Wrapf(err, "error ensuring service account: %s", source.GetName())
 	}
-	if err := c.ensurePod(source, sa.GetName(), overwritePod); err != nil {
-		return errors.Wrapf(err, "error ensuring pod: %s", source.Pod(sa.Name).GetName())
+
+	sa, err = c.OpClient.GetServiceAccount(sa.GetNamespace(), sa.GetName())
+	if err != nil {
+		logger.WithError(err).Error("error ensuring registry server: could not get registry service account")
+		return err
 	}
-	if err := c.ensureUpdatePod(source, sa.Name); err != nil {
+
+	defaultPodSecurityConfig, err := getDefaultPodContextConfig(c.OpClient, catalogSource.GetNamespace())
+	if err != nil {
+		logger.WithError(err).Error("error ensuring registry server: could not get default pod security config")
+		return err
+	}
+
+	// recreate the pod if no existing pod is serving the latest image or correct spec
+	current, err := c.currentPodsWithCorrectImageAndSpec(logger, source, sa, defaultPodSecurityConfig)
+	if err != nil {
+		logger.WithError(err).Error("error ensuring registry server: could not get current pods with correct image and spec")
+		return err
+	}
+	overwritePod := overwrite || len(current) == 0
+	if overwritePod {
+		logger.Info("registry pods invalid, need to overwrite")
+	}
+
+	pod, err := source.Pod(sa, defaultPodSecurityConfig)
+	if err != nil {
+		logger.WithError(err).Error("error ensuring registry server: could not create registry pod")
+		return err
+	}
+	if err := c.ensurePod(logger, source, sa, defaultPodSecurityConfig, overwritePod); err != nil {
+		logger.WithError(err).Error("error ensuring registry server: could not ensure registry pod")
+		return pkgerrors.Wrapf(err, "error ensuring pod: %s", pod.GetGenerateName())
+	}
+	if err := c.ensureUpdatePod(logger, sa, defaultPodSecurityConfig, source); err != nil {
 		if _, ok := err.(UpdateNotReadyErr); ok {
+			logger.WithError(err).Debug("registry server update pod not yet ready")
 			return err
 		}
-		return errors.Wrapf(err, "error ensuring updated catalog source pod: %s", source.Pod(sa.Name).GetName())
+		logger.WithError(err).Error("error ensuring registry server: could not ensure update pod")
+		return pkgerrors.Wrapf(err, "error ensuring update pod for catalog source %s", source.GetName())
+	}
+
+	service, err := source.Service()
+	if err != nil {
+		logger.WithError(err).Error("couldn't get service")
+		return err
 	}
 	if err := c.ensureService(source, overwrite); err != nil {
-		return errors.Wrapf(err, "error ensuring service: %s", source.Service().GetName())
+		logger.WithError(err).Error("error ensuring registry server: could not ensure service")
+		return pkgerrors.Wrapf(err, "error ensuring service: %s", service.GetName())
 	}
 
 	if overwritePod {
 		now := c.now()
+		service, err := source.Service()
+		if err != nil {
+			logger.WithError(err).Error("error ensuring registry server: could not get service")
+			return err
+		}
 		catalogSource.Status.RegistryServiceStatus = &v1alpha1.RegistryServiceStatus{
 			CreatedAt:        now,
 			Protocol:         "grpc",
-			ServiceName:      source.Service().GetName(),
+			ServiceName:      service.GetName(),
 			ServiceNamespace: source.GetNamespace(),
-			Port:             fmt.Sprintf("%d", source.Service().Spec.Ports[0].Port),
+			Port:             getPort(service),
 		}
 	}
 	return nil
 }
 
-func (c *GrpcRegistryReconciler) ensurePod(source grpcCatalogSourceDecorator, saName string, overwrite bool) error {
-	// currentLivePods refers to the currently live instances of the catalog source
-	currentLivePods := c.currentPods(source)
-	if len(currentLivePods) > 0 {
+func getPort(service *corev1.Service) string {
+	return fmt.Sprintf("%d", service.Spec.Ports[0].Port)
+}
+
+func isRegistryServiceStatusValid(source *grpcCatalogSourceDecorator) (bool, error) {
+	service, err := source.Service()
+	if err != nil {
+		return false, err
+	}
+	if source.Status.RegistryServiceStatus == nil ||
+		source.Status.RegistryServiceStatus.ServiceName != service.GetName() ||
+		source.Status.RegistryServiceStatus.ServiceNamespace != service.GetNamespace() ||
+		source.Status.RegistryServiceStatus.Port != getPort(service) ||
+		source.Status.RegistryServiceStatus.Protocol != "grpc" {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (c *GrpcRegistryReconciler) ensurePod(logger *logrus.Entry, source grpcCatalogSourceDecorator, serviceAccount *corev1.ServiceAccount, defaultPodSecurityConfig v1alpha1.SecurityConfig, overwrite bool) error {
+	// currentPods refers to the current pod instances of the catalog source
+	currentPods := c.currentPods(logger, source)
+	if len(currentPods) > 0 {
 		if !overwrite {
 			return nil
 		}
-		for _, p := range currentLivePods {
-			if err := c.OpClient.KubernetesInterface().CoreV1().Pods(source.GetNamespace()).Delete(context.TODO(), p.GetName(), *metav1.NewDeleteOptions(1)); err != nil && !k8serror.IsNotFound(err) {
-				return errors.Wrapf(err, "error deleting old pod: %s", p.GetName())
+		for _, p := range currentPods {
+			logger.WithFields(logrus.Fields{"pod.namespace": source.GetNamespace(), "pod.name": p.GetName()}).Info("deleting current pod")
+			if err := c.OpClient.KubernetesInterface().CoreV1().Pods(source.GetNamespace()).Delete(context.TODO(), p.GetName(), *metav1.NewDeleteOptions(1)); err != nil && !apierrors.IsNotFound(err) {
+				return pkgerrors.Wrapf(err, "error deleting old pod: %s", p.GetName())
 			}
 		}
 	}
-	_, err := c.OpClient.KubernetesInterface().CoreV1().Pods(source.GetNamespace()).Create(context.TODO(), source.Pod(saName), metav1.CreateOptions{})
+	desiredPod, err := source.Pod(serviceAccount, defaultPodSecurityConfig)
 	if err != nil {
-		return errors.Wrapf(err, "error creating new pod: %s", source.Pod(saName).GetGenerateName())
+		return err
+	}
+	logger.WithFields(logrus.Fields{"pod.namespace": desiredPod.GetNamespace(), "pod.name": desiredPod.GetName()}).Info("creating desired pod")
+	_, err = c.OpClient.KubernetesInterface().CoreV1().Pods(source.GetNamespace()).Create(context.TODO(), desiredPod, metav1.CreateOptions{})
+	if err != nil {
+		return pkgerrors.Wrapf(err, "error creating new pod: %s", desiredPod.GetGenerateName())
 	}
 
 	return nil
 }
 
 // ensureUpdatePod checks that for the same catalog source version the same container imageID is running
-func (c *GrpcRegistryReconciler) ensureUpdatePod(source grpcCatalogSourceDecorator, saName string) error {
+func (c *GrpcRegistryReconciler) ensureUpdatePod(logger *logrus.Entry, serviceAccount *corev1.ServiceAccount, podSecurityConfig v1alpha1.SecurityConfig, source grpcCatalogSourceDecorator) error {
 	if !source.Poll() {
+		logger.Info("polling not enabled, no update pod will be created")
 		return nil
 	}
 
-	currentLivePods := c.currentPods(source)
-	currentUpdatePods := c.currentUpdatePods(source)
+	currentLivePods := c.currentPods(logger, source)
+	currentUpdatePods := c.currentUpdatePods(logger, source)
 
 	if source.Update() && len(currentUpdatePods) == 0 {
-		logrus.WithField("CatalogSource", source.GetName()).Infof("catalog update required at %s", time.Now().String())
-		pod, err := c.createUpdatePod(source, saName)
+		logger.Infof("catalog update required at %s", time.Now().String())
+		pod, err := c.createUpdatePod(source, serviceAccount, podSecurityConfig)
 		if err != nil {
-			return errors.Wrapf(err, "creating update catalog source pod")
+			return pkgerrors.Wrapf(err, "creating update catalog source pod")
 		}
 		source.SetLastUpdateTime()
 		return UpdateNotReadyErr{catalogName: source.GetName(), podName: pod.GetName()}
@@ -285,25 +462,26 @@ func (c *GrpcRegistryReconciler) ensureUpdatePod(source grpcCatalogSourceDecorat
 
 	for _, updatePod := range currentUpdatePods {
 		// if container imageID IDs are different, switch the serving pods
-		if imageChanged(updatePod, currentLivePods) {
+		if imageChanged(logger, updatePod, currentLivePods) {
 			err := c.promoteCatalog(updatePod, source.GetName())
 			if err != nil {
 				return fmt.Errorf("detected imageID change: error during update: %s", err)
 			}
 			// remove old catalog source pod
-			err = c.removePods(currentLivePods, source.GetNamespace())
-			if err != nil {
-				return errors.Wrapf(err, "detected imageID change: error deleting old catalog source pod")
+			for _, p := range currentLivePods {
+				logger.WithFields(logrus.Fields{"live-pod.namespace": source.GetNamespace(), "live-pod.name": p.Name}).Info("deleting current live pods")
+				if err := c.OpClient.KubernetesInterface().CoreV1().Pods(source.GetNamespace()).Delete(context.TODO(), p.GetName(), *metav1.NewDeleteOptions(1)); err != nil && !apierrors.IsNotFound(err) {
+					return pkgerrors.Wrapf(pkgerrors.Wrapf(err, "error deleting pod: %s", p.GetName()), "detected imageID change: error deleting old catalog source pod")
+				}
 			}
 			// done syncing
-			logrus.WithField("CatalogSource", source.GetName()).Infof("detected imageID change: catalogsource pod updated at %s", time.Now().String())
+			logger.Infof("detected imageID change: catalogsource pod updated at %s", time.Now().String())
 			return nil
 		}
 		// delete update pod right away, since the digest match, to prevent long-lived duplicate catalog pods
-		logrus.WithField("CatalogSource", source.GetName()).Info("catalog polling result: no update")
-		err := c.removePods([]*corev1.Pod{updatePod}, source.GetNamespace())
-		if err != nil {
-			return errors.Wrapf(err, "error deleting duplicate catalog polling pod: %s", updatePod.GetName())
+		logger.WithFields(logrus.Fields{"update-pod.namespace": updatePod.Namespace, "update-pod.name": updatePod.Name}).Debug("catalog polling result: no update; removing duplicate update pod")
+		if err := c.OpClient.KubernetesInterface().CoreV1().Pods(source.GetNamespace()).Delete(context.TODO(), updatePod.GetName(), *metav1.NewDeleteOptions(1)); err != nil && !apierrors.IsNotFound(err) {
+			return pkgerrors.Wrapf(pkgerrors.Wrapf(err, "error deleting pod: %s", updatePod.GetName()), "duplicate catalog polling pod")
 		}
 	}
 
@@ -311,22 +489,53 @@ func (c *GrpcRegistryReconciler) ensureUpdatePod(source grpcCatalogSourceDecorat
 }
 
 func (c *GrpcRegistryReconciler) ensureService(source grpcCatalogSourceDecorator, overwrite bool) error {
-	service := source.Service()
-	svc := c.currentService(source)
+	service, err := source.Service()
+	if err != nil {
+		return err
+	}
+	svc, err := c.currentService(source)
+	if err != nil {
+		return err
+	}
 	if svc != nil {
 		if !overwrite && ServiceHashMatch(svc, service) {
 			return nil
 		}
 		// TODO(tflannag): Do we care about force deleting services?
-		if err := c.OpClient.DeleteService(service.GetNamespace(), service.GetName(), metav1.NewDeleteOptions(0)); err != nil && !k8serror.IsNotFound(err) {
+		if err := c.OpClient.DeleteService(service.GetNamespace(), service.GetName(), metav1.NewDeleteOptions(0)); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
 	}
-	_, err := c.OpClient.CreateService(service)
+	_, err = c.OpClient.CreateService(service)
 	return err
 }
 
-func (c *GrpcRegistryReconciler) ensureSA(source grpcCatalogSourceDecorator) (*v1.ServiceAccount, error) {
+func (c *GrpcRegistryReconciler) ensureGRPCServerNetworkPolicy(source grpcCatalogSourceDecorator) error {
+	desired := source.GRPCServerNetworkPolicy()
+	current := c.currentGRPCServerNetworkPolicy(source)
+	return c.ensureNetworkPolicy(desired, current)
+}
+
+func (c *GrpcRegistryReconciler) ensureUnpackBundlesNetworkPolicy(source grpcCatalogSourceDecorator) error {
+	desired := source.UnpackBundlesNetworkPolicy()
+	current := c.currentUnpackBundlesNetworkPolicy(source)
+	return c.ensureNetworkPolicy(desired, current)
+}
+
+func (c *GrpcRegistryReconciler) ensureNetworkPolicy(desired, current *networkingv1.NetworkPolicy) error {
+	if current != nil {
+		if isExpectedNetworkPolicy(desired, current) {
+			return nil
+		}
+		if err := c.OpClient.DeleteNetworkPolicy(current.GetNamespace(), current.GetName(), metav1.NewDeleteOptions(0)); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	_, err := c.OpClient.CreateNetworkPolicy(desired)
+	return err
+}
+
+func (c *GrpcRegistryReconciler) ensureSA(source grpcCatalogSourceDecorator) (*corev1.ServiceAccount, error) {
 	sa := source.ServiceAccount()
 	if _, err := c.OpClient.CreateServiceAccount(sa); err != nil {
 		return sa, err
@@ -360,22 +569,18 @@ func ServiceHashMatch(existing, new *corev1.Service) bool {
 	return true
 }
 
-// HashServiceSpec calculates a hash given a copy of the service spec
-func HashServiceSpec(spec corev1.ServiceSpec) string {
-	hasher := fnv.New32a()
-	hashutil.DeepHashObject(hasher, &spec)
-	return rand.SafeEncodeString(fmt.Sprint(hasher.Sum32()))
-}
-
 // createUpdatePod is an internal method that creates a pod using the latest catalog source.
-func (c *GrpcRegistryReconciler) createUpdatePod(source grpcCatalogSourceDecorator, saName string) (*corev1.Pod, error) {
+func (c *GrpcRegistryReconciler) createUpdatePod(source grpcCatalogSourceDecorator, serviceAccount *corev1.ServiceAccount, defaultPodSecurityConfig v1alpha1.SecurityConfig) (*corev1.Pod, error) {
 	// remove label from pod to ensure service does not accidentally route traffic to the pod
-	p := source.Pod(saName)
+	p, err := source.Pod(serviceAccount, defaultPodSecurityConfig)
+	if err != nil {
+		return nil, err
+	}
 	p = swapLabels(p, "", source.Name)
 
 	pod, err := c.OpClient.KubernetesInterface().CoreV1().Pods(source.GetNamespace()).Create(context.TODO(), p, metav1.CreateOptions{})
 	if err != nil {
-		logrus.WithField("pod", source.Pod(saName).GetName()).Warn("couldn't create new catalogsource pod")
+		logrus.WithField("pod", p.GetName()).Warn("couldn't create new catalogsource pod")
 		return nil, err
 	}
 
@@ -383,16 +588,20 @@ func (c *GrpcRegistryReconciler) createUpdatePod(source grpcCatalogSourceDecorat
 }
 
 // checkUpdatePodDigest checks update pod to get Image ID and see if it matches the serving (live) pod ImageID
-func imageChanged(updatePod *corev1.Pod, servingPods []*corev1.Pod) bool {
+func imageChanged(logger *logrus.Entry, updatePod *corev1.Pod, servingPods []*corev1.Pod) bool {
 	updatedCatalogSourcePodImageID := imageID(updatePod)
 	if updatedCatalogSourcePodImageID == "" {
-		logrus.WithField("CatalogSource", updatePod.GetName()).Warn("pod status unknown, cannot get the pod's imageID")
+		logger.WithField("update-pod.name", updatePod.GetName()).Warn("pod status unknown, cannot get the updated pod's imageID")
 		return false
 	}
 	for _, servingPod := range servingPods {
 		servingCatalogSourcePodImageID := imageID(servingPod)
+		if servingCatalogSourcePodImageID == "" {
+			logger.WithField("serving-pod.name", servingPod.GetName()).Warn("pod status unknown, cannot get the current pod's imageID")
+			return false
+		}
 		if updatedCatalogSourcePodImageID != servingCatalogSourcePodImageID {
-			logrus.WithField("CatalogSource", servingPod.GetName()).Infof("catalog image changed: serving pod %s update pod %s", servingCatalogSourcePodImageID, updatedCatalogSourcePodImageID)
+			logger.WithField("serving-pod.name", servingPod.GetName()).Infof("catalog image changed: serving pod %s update pod %s", servingCatalogSourcePodImageID, updatedCatalogSourcePodImageID)
 			return true
 		}
 	}
@@ -400,39 +609,122 @@ func imageChanged(updatePod *corev1.Pod, servingPods []*corev1.Pod) bool {
 	return false
 }
 
+// isPodDead checks if the pod has the DisruptionTarget condition set to true,
+// which indicates that the Pod is about to be deleted due to a disruption.
+// ref: https://kubernetes.io/docs/concepts/workloads/pods/disruptions/#pod-disruption-conditions
+func isPodDead(pod *corev1.Pod) bool {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.DisruptionTarget && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
 // imageID returns the ImageID of the primary catalog source container or an empty string if the image ID isn't available yet.
 // Note: the pod must be running and the container in a ready status to return a valid ImageID.
 func imageID(pod *corev1.Pod) string {
-	if len(pod.Status.ContainerStatuses) < 1 {
-		logrus.WithField("CatalogSource", pod.GetName()).Warn("pod status unknown")
-		return ""
+	if len(pod.Status.InitContainerStatuses) == 2 && len(pod.Status.ContainerStatuses) == 1 {
+		// spec.grpcPodConfig.extractContent mode was used for this pod
+		return pod.Status.InitContainerStatuses[1].ImageID
 	}
-
-	return pod.Status.ContainerStatuses[0].ImageID
+	if len(pod.Status.InitContainerStatuses) == 0 && len(pod.Status.ContainerStatuses) == 1 {
+		// spec.grpcPodConfig.extractContent mode was NOT used for this pod (i.e. we're just running the catalog image directly)
+		return pod.Status.ContainerStatuses[0].ImageID
+	}
+	if len(pod.Status.InitContainerStatuses) == 0 && len(pod.Status.ContainerStatuses) == 0 {
+		logrus.WithField("CatalogSource", pod.GetName()).Warn("pod status unknown; pod has not yet populated initContainer and container status")
+	} else {
+		logrus.WithField("CatalogSource", pod.GetName()).Warn("pod status unknown; pod contains unexpected initContainer and container configuration")
+	}
+	return ""
 }
 
 func (c *GrpcRegistryReconciler) removePods(pods []*corev1.Pod, namespace string) error {
 	for _, p := range pods {
-		if err := c.OpClient.KubernetesInterface().CoreV1().Pods(namespace).Delete(context.TODO(), p.GetName(), *metav1.NewDeleteOptions(1)); err != nil && !k8serror.IsNotFound(err) {
-			return errors.Wrapf(err, "error deleting pod: %s", p.GetName())
+		if err := c.OpClient.KubernetesInterface().CoreV1().Pods(namespace).Delete(context.TODO(), p.GetName(), *metav1.NewDeleteOptions(1)); err != nil && !apierrors.IsNotFound(err) {
+			return pkgerrors.Wrapf(err, "error deleting pod: %s", p.GetName())
 		}
 	}
 	return nil
 }
 
 // CheckRegistryServer returns true if the given CatalogSource is considered healthy; false otherwise.
-func (c *GrpcRegistryReconciler) CheckRegistryServer(catalogSource *v1alpha1.CatalogSource) (healthy bool, err error) {
-	source := grpcCatalogSourceDecorator{catalogSource}
-	// Check on registry resources
-	// TODO: add gRPC health check
-	if len(c.currentPodsWithCorrectImageAndSpec(source, source.ServiceAccount().GetName())) < 1 ||
-		c.currentService(source) == nil {
-		healthy = false
-		return
+func (c *GrpcRegistryReconciler) CheckRegistryServer(logger *logrus.Entry, catalogSource *v1alpha1.CatalogSource) (bool, error) {
+	source := grpcCatalogSourceDecorator{CatalogSource: catalogSource, createPodAsUser: c.createPodAsUser, opmImage: c.opmImage, utilImage: c.utilImage}
+
+	// The CheckRegistryServer function is called by the CatalogSoruce controller before the registry resources are created,
+	// returning a IsNotFound error will cause the controller to exit and never create the resources, so we should
+	// only return an error if it is something other than a NotFound error.
+	serviceAccount := source.ServiceAccount()
+	serviceAccount, err := c.OpClient.GetServiceAccount(serviceAccount.GetNamespace(), serviceAccount.GetName())
+	if err != nil {
+		logger.WithError(err).Error("registry service not healthy: could not get service account")
+		if !apierrors.IsNotFound(err) {
+			return false, err
+		}
+		return false, nil
 	}
 
-	healthy = true
-	return
+	registryPodSecurityConfig, err := getDefaultPodContextConfig(c.OpClient, catalogSource.GetNamespace())
+	if err != nil {
+		logger.WithError(err).Error("registry service not healthy: could not get registry pod security config")
+		return false, err
+	}
+
+	// Check on registry resources
+	// TODO: add gRPC health check
+	currentNetworkPolicy := c.currentGRPCServerNetworkPolicy(source)
+	if currentNetworkPolicy == nil {
+		logger.Error("registry service not healthy: could not get grpc server network policy")
+		return false, nil
+	}
+	expectedNetworkPolicy := source.GRPCServerNetworkPolicy()
+	if !isExpectedNetworkPolicy(expectedNetworkPolicy, currentNetworkPolicy) {
+		logger.Error("registry service not healthy: unexpected grpc server network policy")
+		return false, nil
+	}
+
+	currentNetworkPolicy = c.currentUnpackBundlesNetworkPolicy(source)
+	if currentNetworkPolicy == nil {
+		logger.Error("registry service not healthy: could not get unpack bundles network policy")
+		return false, nil
+	}
+	expectedNetworkPolicy = source.UnpackBundlesNetworkPolicy()
+	if !isExpectedNetworkPolicy(expectedNetworkPolicy, currentNetworkPolicy) {
+		logger.Error("registry service not healthy: unexpected unpack bundles network policy")
+		return false, nil
+	}
+
+	service, err := c.currentService(source)
+	if err != nil {
+		logger.WithError(err).Error("registry service not healthy: could not get current service")
+		return false, err
+	}
+
+	currentPods, err := c.currentPodsWithCorrectImageAndSpec(logger, source, serviceAccount, registryPodSecurityConfig)
+	if err != nil {
+		logger.WithError(err).Error("registry service not healthy: could not get current pods")
+		return false, err
+	}
+
+	currentServiceAccount := c.currentServiceAccount(source)
+	if len(currentPods) < 1 ||
+		service == nil || currentServiceAccount == nil {
+		logger.WithFields(logrus.Fields{
+			"numCurrentPods":             len(currentPods),
+			"isServiceNil":               service == nil,
+			"isCurrentServiceAccountNil": currentServiceAccount == nil,
+		}).Error("registry service not healthy: one or more required resources are missing")
+		return false, nil
+	}
+
+	podsAreLive, e := detectAndDeleteDeadPods(logger, c.OpClient, currentPods, source.GetNamespace())
+	if e != nil {
+		logger.WithError(e).Error("registry service not healthy: could not detect and delete dead pods")
+		return false, fmt.Errorf("error deleting dead pods: %v", e)
+	}
+	return podsAreLive, nil
 }
 
 // promoteCatalog swaps the labels on the update pod so that the update pod is now reachable by the catalog service.
@@ -467,13 +759,29 @@ func swapLabels(pod *corev1.Pod, labelKey, updateKey string) *corev1.Pod {
 	return pod
 }
 
+// podContainersArePathological returns true if any container in the pod has restarts exceeding pathologicalRestartCountThreshold or is in CrashLoopBackOff.
+func podContainersArePathological(pod *corev1.Pod) bool {
+	for _, s := range pod.Status.ContainerStatuses {
+		if s.State.Waiting != nil && s.State.Waiting.Reason == containerReasonCrashLoopBackOff {
+			return true
+		}
+	}
+	for _, s := range pod.Status.InitContainerStatuses {
+		if s.State.Waiting != nil && s.State.Waiting.Reason == containerReasonCrashLoopBackOff {
+			return true
+		}
+	}
+	// TODO: currently no ephemeral containers in a catalogsource, should we add checks anyway?
+	return false
+}
+
 // podFailed checks whether the pod status is in a failed or unknown state, and deletes the pod if so.
 func (c *GrpcRegistryReconciler) podFailed(pod *corev1.Pod) (bool, error) {
-	if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodUnknown {
+	if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodUnknown || podContainersArePathological(pod) {
 		logrus.WithField("UpdatePod", pod.GetName()).Infof("catalog polling result: update pod %s failed to start", pod.GetName())
 		err := c.removePods([]*corev1.Pod{pod}, pod.GetNamespace())
 		if err != nil {
-			return true, errors.Wrapf(err, "error deleting failed catalog polling pod: %s", pod.GetName())
+			return true, pkgerrors.Wrapf(err, "error deleting failed catalog polling pod: %s", pod.GetName())
 		}
 		return true, nil
 	}

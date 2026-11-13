@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -25,7 +23,7 @@ import (
 // Interface provides access to all the informers in this group version.
 type Interface interface {
 	// OperatorConditions returns a OperatorConditionInformer.
-	OperatorConditions() OperatorConditionInformer
+	OperatorConditions() TypedOperatorConditionInformer
 }
 
 type version struct {
@@ -39,7 +37,7 @@ func New(f internalinterfaces.SharedInformerFactory, namespace string, tweakList
 	return &version{factory: f, namespace: namespace, tweakListOptions: tweakListOptions}
 }
 
-// OperatorConditions returns a OperatorConditionInformer.
-func (v *version) OperatorConditions() OperatorConditionInformer {
+// OperatorConditions returns a TypedOperatorConditionInformer.
+func (v *version) OperatorConditions() TypedOperatorConditionInformer {
 	return &operatorConditionInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }

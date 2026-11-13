@@ -4,11 +4,12 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 	errorwrap "github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
@@ -43,7 +44,7 @@ func (o *StepEnsurer) EnsureClusterServiceVersion(csv *v1alpha1.ClusterServiceVe
 		return
 	}
 
-	if !k8serrors.IsAlreadyExists(createErr) {
+	if !apierrors.IsAlreadyExists(createErr) {
 		err = errorwrap.Wrapf(createErr, "error creating csv %s", csv.GetName())
 		return
 	}
@@ -60,7 +61,7 @@ func (o *StepEnsurer) EnsureSubscription(subscription *v1alpha1.Subscription) (s
 		return
 	}
 
-	if !k8serrors.IsAlreadyExists(createErr) {
+	if !apierrors.IsAlreadyExists(createErr) {
 		err = errorwrap.Wrapf(createErr, "error creating subscription %s", subscription.GetName())
 		return
 	}
@@ -74,7 +75,7 @@ func (o *StepEnsurer) EnsureSubscription(subscription *v1alpha1.Subscription) (s
 func (o *StepEnsurer) EnsureSecret(operatorNamespace, planNamespace, name string) (status v1alpha1.StepStatus, err error) {
 	secret, getError := o.kubeClient.KubernetesInterface().CoreV1().Secrets(operatorNamespace).Get(context.TODO(), name, metav1.GetOptions{})
 	if getError != nil {
-		if k8serrors.IsNotFound(getError) {
+		if apierrors.IsNotFound(getError) {
 			err = fmt.Errorf("secret %s does not exist - %v", name, getError)
 			return
 		}
@@ -91,13 +92,16 @@ func (o *StepEnsurer) EnsureSecret(operatorNamespace, planNamespace, name string
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      secret.Name,
 			Namespace: planNamespace,
+			Labels: map[string]string{
+				install.OLMManagedLabelKey: install.OLMManagedLabelValue,
+			},
 		},
 		Data: secret.Data,
 		Type: secret.Type,
 	}
 
 	if _, createError := o.kubeClient.KubernetesInterface().CoreV1().Secrets(planNamespace).Create(context.TODO(), newSecret, metav1.CreateOptions{}); createError != nil {
-		if k8serrors.IsAlreadyExists(createError) {
+		if apierrors.IsAlreadyExists(createError) {
 			status = v1alpha1.StepStatusPresent
 			return
 		}
@@ -118,7 +122,7 @@ func (o *StepEnsurer) EnsureBundleSecret(namespace string, secret *corev1.Secret
 		return
 	}
 
-	if !k8serrors.IsAlreadyExists(createErr) {
+	if !apierrors.IsAlreadyExists(createErr) {
 		err = errorwrap.Wrapf(createErr, "error updating secret: %s", secret.GetName())
 		return
 	}
@@ -142,12 +146,12 @@ func (o *StepEnsurer) EnsureServiceAccount(namespace string, sa *corev1.ServiceA
 		return
 	}
 
-	if !k8serrors.IsAlreadyExists(createErr) {
+	if !apierrors.IsAlreadyExists(createErr) {
 		err = errorwrap.Wrapf(createErr, "error creating service account: %s", sa.GetName())
 		return
 	}
 
-	// Carrying secrets through the service account update.
+	// Carrying secrets and annotations through the service account update.
 	preSa, getErr := o.kubeClient.KubernetesInterface().CoreV1().ServiceAccounts(namespace).Get(context.TODO(),
 		sa.Name,
 		metav1.GetOptions{})
@@ -157,6 +161,16 @@ func (o *StepEnsurer) EnsureServiceAccount(namespace string, sa *corev1.ServiceA
 	}
 	sa.Secrets = preSa.Secrets
 	sa.OwnerReferences = mergedOwnerReferences(preSa.OwnerReferences, sa.OwnerReferences)
+
+	// Merge annotations, giving precedence to the new ones.
+	if sa.Annotations == nil {
+		sa.Annotations = make(map[string]string)
+	}
+	for k, v := range preSa.Annotations {
+		if _, ok := sa.Annotations[k]; !ok {
+			sa.Annotations[k] = v
+		}
+	}
 
 	sa.SetNamespace(namespace)
 
@@ -180,7 +194,7 @@ func (o *StepEnsurer) EnsureService(namespace string, service *corev1.Service) (
 		return
 	}
 
-	if !k8serrors.IsAlreadyExists(createErr) {
+	if !apierrors.IsAlreadyExists(createErr) {
 		err = errorwrap.Wrapf(createErr, "error updating service: %s", service.GetName())
 		return
 	}
@@ -203,7 +217,7 @@ func (o *StepEnsurer) EnsureClusterRole(cr *rbacv1.ClusterRole, step *v1alpha1.S
 		return
 	}
 
-	if !k8serrors.IsAlreadyExists(createErr) {
+	if !apierrors.IsAlreadyExists(createErr) {
 		err = errorwrap.Wrapf(createErr, "error creating clusterrole %s", cr.GetName())
 		return
 	}
@@ -230,7 +244,7 @@ func (o *StepEnsurer) EnsureClusterRoleBinding(crb *rbacv1.ClusterRoleBinding, s
 		return
 	}
 
-	if !k8serrors.IsAlreadyExists(createErr) {
+	if !apierrors.IsAlreadyExists(createErr) {
 		err = errorwrap.Wrapf(createErr, "error creating clusterrolebinding %s", crb.GetName())
 		return
 	}
@@ -257,7 +271,7 @@ func (o *StepEnsurer) EnsureRole(namespace string, role *rbacv1.Role) (status v1
 		return
 	}
 
-	if !k8serrors.IsAlreadyExists(createErr) {
+	if !apierrors.IsAlreadyExists(createErr) {
 		err = errorwrap.Wrapf(createErr, "error creating role %s", role.GetName())
 		return
 	}
@@ -281,7 +295,7 @@ func (o *StepEnsurer) EnsureRoleBinding(namespace string, rb *rbacv1.RoleBinding
 		return
 	}
 
-	if !k8serrors.IsAlreadyExists(createErr) {
+	if !apierrors.IsAlreadyExists(createErr) {
 		err = errorwrap.Wrapf(createErr, "error creating rolebinding %s", rb.GetName())
 		return
 	}
@@ -304,7 +318,7 @@ func (o *StepEnsurer) EnsureUnstructuredObject(client dynamic.ResourceInterface,
 		return
 	}
 
-	if !k8serrors.IsAlreadyExists(createErr) {
+	if !apierrors.IsAlreadyExists(createErr) {
 		err = errorwrap.Wrapf(createErr, "error creating unstructured object %s", obj.GetName())
 		return
 	}
@@ -336,7 +350,7 @@ func (o *StepEnsurer) EnsureConfigMap(namespace string, configmap *corev1.Config
 		return
 	}
 
-	if !k8serrors.IsAlreadyExists(createErr) {
+	if !apierrors.IsAlreadyExists(createErr) {
 		err = errorwrap.Wrapf(createErr, "error updating configmap: %s", configmap.GetName())
 		return
 	}

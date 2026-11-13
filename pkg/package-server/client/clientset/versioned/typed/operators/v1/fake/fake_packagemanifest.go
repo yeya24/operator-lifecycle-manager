@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -19,124 +17,32 @@ limitations under the License.
 package fake
 
 import (
-	"context"
-
-	operatorsv1 "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/apis/operators/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	labels "k8s.io/apimachinery/pkg/labels"
-	schema "k8s.io/apimachinery/pkg/runtime/schema"
-	types "k8s.io/apimachinery/pkg/types"
-	watch "k8s.io/apimachinery/pkg/watch"
-	testing "k8s.io/client-go/testing"
+	v1 "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/apis/operators/v1"
+	operatorsv1 "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/client/clientset/versioned/typed/operators/v1"
+	gentype "k8s.io/client-go/gentype"
 )
 
-// FakePackageManifests implements PackageManifestInterface
-type FakePackageManifests struct {
-	Fake *FakeOperatorsV1
-	ns   string
+// fakePackageManifests implements PackageManifestInterface
+type fakePackageManifests struct {
+	*gentype.FakeClientWithList[*v1.PackageManifest, *v1.PackageManifestList]
+	Fake *FakePackagesV1
 }
 
-var packagemanifestsResource = schema.GroupVersionResource{Group: "operators.coreos.com", Version: "v1", Resource: "packagemanifests"}
-
-var packagemanifestsKind = schema.GroupVersionKind{Group: "operators.coreos.com", Version: "v1", Kind: "PackageManifest"}
-
-// Get takes name of the packageManifest, and returns the corresponding packageManifest object, and an error if there is any.
-func (c *FakePackageManifests) Get(ctx context.Context, name string, options v1.GetOptions) (result *operatorsv1.PackageManifest, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewGetAction(packagemanifestsResource, c.ns, name), &operatorsv1.PackageManifest{})
-
-	if obj == nil {
-		return nil, err
+func newFakePackageManifests(fake *FakePackagesV1, namespace string) operatorsv1.PackageManifestInterface {
+	return &fakePackageManifests{
+		gentype.NewFakeClientWithList[*v1.PackageManifest, *v1.PackageManifestList](
+			fake.Fake,
+			namespace,
+			v1.SchemeGroupVersion.WithResource("packagemanifests"),
+			v1.SchemeGroupVersion.WithKind("PackageManifest"),
+			func() *v1.PackageManifest { return &v1.PackageManifest{} },
+			func() *v1.PackageManifestList { return &v1.PackageManifestList{} },
+			func(dst, src *v1.PackageManifestList) { dst.ListMeta = src.ListMeta },
+			func(list *v1.PackageManifestList) []*v1.PackageManifest { return gentype.ToPointerSlice(list.Items) },
+			func(list *v1.PackageManifestList, items []*v1.PackageManifest) {
+				list.Items = gentype.FromPointerSlice(items)
+			},
+		),
+		fake,
 	}
-	return obj.(*operatorsv1.PackageManifest), err
-}
-
-// List takes label and field selectors, and returns the list of PackageManifests that match those selectors.
-func (c *FakePackageManifests) List(ctx context.Context, opts v1.ListOptions) (result *operatorsv1.PackageManifestList, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewListAction(packagemanifestsResource, packagemanifestsKind, c.ns, opts), &operatorsv1.PackageManifestList{})
-
-	if obj == nil {
-		return nil, err
-	}
-
-	label, _, _ := testing.ExtractFromListOptions(opts)
-	if label == nil {
-		label = labels.Everything()
-	}
-	list := &operatorsv1.PackageManifestList{ListMeta: obj.(*operatorsv1.PackageManifestList).ListMeta}
-	for _, item := range obj.(*operatorsv1.PackageManifestList).Items {
-		if label.Matches(labels.Set(item.Labels)) {
-			list.Items = append(list.Items, item)
-		}
-	}
-	return list, err
-}
-
-// Watch returns a watch.Interface that watches the requested packageManifests.
-func (c *FakePackageManifests) Watch(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
-	return c.Fake.
-		InvokesWatch(testing.NewWatchAction(packagemanifestsResource, c.ns, opts))
-
-}
-
-// Create takes the representation of a packageManifest and creates it.  Returns the server's representation of the packageManifest, and an error, if there is any.
-func (c *FakePackageManifests) Create(ctx context.Context, packageManifest *operatorsv1.PackageManifest, opts v1.CreateOptions) (result *operatorsv1.PackageManifest, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewCreateAction(packagemanifestsResource, c.ns, packageManifest), &operatorsv1.PackageManifest{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*operatorsv1.PackageManifest), err
-}
-
-// Update takes the representation of a packageManifest and updates it. Returns the server's representation of the packageManifest, and an error, if there is any.
-func (c *FakePackageManifests) Update(ctx context.Context, packageManifest *operatorsv1.PackageManifest, opts v1.UpdateOptions) (result *operatorsv1.PackageManifest, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewUpdateAction(packagemanifestsResource, c.ns, packageManifest), &operatorsv1.PackageManifest{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*operatorsv1.PackageManifest), err
-}
-
-// UpdateStatus was generated because the type contains a Status member.
-// Add a +genclient:noStatus comment above the type to avoid generating UpdateStatus().
-func (c *FakePackageManifests) UpdateStatus(ctx context.Context, packageManifest *operatorsv1.PackageManifest, opts v1.UpdateOptions) (*operatorsv1.PackageManifest, error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewUpdateSubresourceAction(packagemanifestsResource, "status", c.ns, packageManifest), &operatorsv1.PackageManifest{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*operatorsv1.PackageManifest), err
-}
-
-// Delete takes name of the packageManifest and deletes it. Returns an error if one occurs.
-func (c *FakePackageManifests) Delete(ctx context.Context, name string, opts v1.DeleteOptions) error {
-	_, err := c.Fake.
-		Invokes(testing.NewDeleteAction(packagemanifestsResource, c.ns, name), &operatorsv1.PackageManifest{})
-
-	return err
-}
-
-// DeleteCollection deletes a collection of objects.
-func (c *FakePackageManifests) DeleteCollection(ctx context.Context, opts v1.DeleteOptions, listOpts v1.ListOptions) error {
-	action := testing.NewDeleteCollectionAction(packagemanifestsResource, c.ns, listOpts)
-
-	_, err := c.Fake.Invokes(action, &operatorsv1.PackageManifestList{})
-	return err
-}
-
-// Patch applies the patch and returns the patched packageManifest.
-func (c *FakePackageManifests) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts v1.PatchOptions, subresources ...string) (result *operatorsv1.PackageManifest, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewPatchSubresourceAction(packagemanifestsResource, c.ns, name, pt, data, subresources...), &operatorsv1.PackageManifest{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*operatorsv1.PackageManifest), err
 }

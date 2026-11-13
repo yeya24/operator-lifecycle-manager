@@ -1,15 +1,17 @@
 package olm
 
 import (
+	"strings"
 	"time"
 
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/queueinformer"
+	"k8s.io/client-go/metadata"
 
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilclock "k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/client-go/rest"
+	utilclock "k8s.io/utils/clock"
 
 	configv1client "github.com/openshift/client-go/config/clientset/versioned"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
@@ -21,18 +23,41 @@ import (
 type OperatorOption func(*operatorConfig)
 
 type operatorConfig struct {
-	resyncPeriod      func() time.Duration
-	operatorNamespace string
-	watchedNamespaces []string
-	clock             utilclock.Clock
-	logger            *logrus.Logger
-	operatorClient    operatorclient.ClientInterface
-	externalClient    versioned.Interface
-	strategyResolver  install.StrategyResolverInterface
-	apiReconciler     APIIntersectionReconciler
-	apiLabeler        labeler.Labeler
-	restConfig        *rest.Config
-	configClient      configv1client.Interface
+	protectedCopiedCSVNamespaces map[string]struct{}
+	resyncPeriod                 func() time.Duration
+	operatorNamespace            string
+	watchedNamespaces            []string
+	clock                        utilclock.Clock
+	logger                       *logrus.Logger
+	operatorClient               operatorclient.ClientInterface
+	metadataClient               metadata.Interface
+	externalClient               versioned.Interface
+	strategyResolver             install.StrategyResolverInterface
+	apiReconciler                APIIntersectionReconciler
+	apiLabeler                   labeler.Labeler
+	restConfig                   *rest.Config
+	configClient                 configv1client.Interface
+	openshiftConfigAPIExists     bool
+}
+
+func (o *operatorConfig) OperatorClient() operatorclient.ClientInterface {
+	return o.operatorClient
+}
+
+func (o *operatorConfig) ExternalClient() versioned.Interface {
+	return o.externalClient
+}
+
+func (o *operatorConfig) ResyncPeriod() func() time.Duration {
+	return o.resyncPeriod
+}
+
+func (o *operatorConfig) WatchedNamespaces() []string {
+	return o.watchedNamespaces
+}
+
+func (o *operatorConfig) Logger() *logrus.Logger {
+	return o.logger
 }
 
 func (o *operatorConfig) apply(options []OperatorOption) {
@@ -77,14 +102,15 @@ func (o *operatorConfig) validate() (err error) {
 
 func defaultOperatorConfig() *operatorConfig {
 	return &operatorConfig{
-		resyncPeriod:      queueinformer.ResyncWithJitter(30*time.Second, 0.2),
-		operatorNamespace: "default",
-		watchedNamespaces: []string{metav1.NamespaceAll},
-		clock:             utilclock.RealClock{},
-		logger:            logrus.New(),
-		strategyResolver:  &install.StrategyResolver{},
-		apiReconciler:     APIIntersectionReconcileFunc(ReconcileAPIIntersection),
-		apiLabeler:        labeler.Func(LabelSetsFor),
+		resyncPeriod:                 queueinformer.ResyncWithJitter(30*time.Second, 0.2),
+		operatorNamespace:            "default",
+		watchedNamespaces:            []string{metav1.NamespaceAll},
+		clock:                        utilclock.RealClock{},
+		logger:                       logrus.New(),
+		strategyResolver:             &install.StrategyResolver{},
+		apiReconciler:                APIIntersectionReconcileFunc(ReconcileAPIIntersection),
+		apiLabeler:                   labeler.Func(LabelSetsFor),
+		protectedCopiedCSVNamespaces: map[string]struct{}{},
 	}
 }
 
@@ -112,6 +138,18 @@ func WithLogger(logger *logrus.Logger) OperatorOption {
 	}
 }
 
+func WithProtectedCopiedCSVNamespaces(namespaces string) OperatorOption {
+	return func(config *operatorConfig) {
+		if namespaces == "" {
+			return
+		}
+
+		for _, ns := range strings.Split(namespaces, ",") {
+			config.protectedCopiedCSVNamespaces[ns] = struct{}{}
+		}
+	}
+}
+
 func WithClock(clock utilclock.Clock) OperatorOption {
 	return func(config *operatorConfig) {
 		config.clock = clock
@@ -121,6 +159,12 @@ func WithClock(clock utilclock.Clock) OperatorOption {
 func WithOperatorClient(operatorClient operatorclient.ClientInterface) OperatorOption {
 	return func(config *operatorConfig) {
 		config.operatorClient = operatorClient
+	}
+}
+
+func WithMetadataClient(metadataClient metadata.Interface) OperatorOption {
+	return func(config *operatorConfig) {
+		config.metadataClient = metadataClient
 	}
 }
 
@@ -157,5 +201,11 @@ func WithRestConfig(restConfig *rest.Config) OperatorOption {
 func WithConfigClient(configClient configv1client.Interface) OperatorOption {
 	return func(config *operatorConfig) {
 		config.configClient = configClient
+	}
+}
+
+func WithOpenshiftConfigAPIExists(exists bool) OperatorOption {
+	return func(config *operatorConfig) {
+		config.openshiftConfigAPIExists = exists
 	}
 }

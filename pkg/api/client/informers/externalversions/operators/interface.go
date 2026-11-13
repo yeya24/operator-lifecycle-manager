@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -28,12 +26,12 @@ import (
 
 // Interface provides access to each of this group's versions.
 type Interface interface {
+	// V1 provides access to shared informers for resources in V1.
+	V1() v1.Interface
 	// V1alpha1 provides access to shared informers for resources in V1alpha1.
 	V1alpha1() v1alpha1.Interface
 	// V1alpha2 provides access to shared informers for resources in V1alpha2.
 	V1alpha2() v1alpha2.Interface
-	// V1 provides access to shared informers for resources in V1.
-	V1() v1.Interface
 	// V2 provides access to shared informers for resources in V2.
 	V2() v2.Interface
 }
@@ -49,6 +47,11 @@ func New(f internalinterfaces.SharedInformerFactory, namespace string, tweakList
 	return &group{factory: f, namespace: namespace, tweakListOptions: tweakListOptions}
 }
 
+// V1 returns a new v1.Interface.
+func (g *group) V1() v1.Interface {
+	return v1.New(g.factory, g.namespace, g.tweakListOptions)
+}
+
 // V1alpha1 returns a new v1alpha1.Interface.
 func (g *group) V1alpha1() v1alpha1.Interface {
 	return v1alpha1.New(g.factory, g.namespace, g.tweakListOptions)
@@ -57,11 +60,6 @@ func (g *group) V1alpha1() v1alpha1.Interface {
 // V1alpha2 returns a new v1alpha2.Interface.
 func (g *group) V1alpha2() v1alpha2.Interface {
 	return v1alpha2.New(g.factory, g.namespace, g.tweakListOptions)
-}
-
-// V1 returns a new v1.Interface.
-func (g *group) V1() v1.Interface {
-	return v1.New(g.factory, g.namespace, g.tweakListOptions)
 }
 
 // V2 returns a new v2.Interface.

@@ -48,6 +48,21 @@ func (p Params) WithPrefix(prefix string) string {
 	return strings.Join(params, ", ")
 }
 
+// AsFieldsWithPrefix builds a string listing the parameters as the exported
+// fields of the recorded arguments struct (Arg1, Arg2, ...), with a prefix
+// added to each.
+func (p Params) AsFieldsWithPrefix(prefix string) string {
+	if len(p) == 0 {
+		return ""
+	}
+
+	fields := []string{}
+	for i := range p {
+		fields = append(fields, prefix+titleCase(unexport(p[i].Name)))
+	}
+	return strings.Join(fields, ", ")
+}
+
 // AsArgs builds a string that represents the parameters to a function as
 // arguments to a function invocation.
 func (p Params) AsArgs() string {
@@ -63,7 +78,7 @@ func (p Params) AsArgs() string {
 }
 
 // AsNamedArgsWithTypes builds a string that represents parameters as named
-// arugments to a function, with associated types.
+// arguments to a function, with associated types.
 func (p Params) AsNamedArgsWithTypes() string {
 	if len(p) == 0 {
 		return ""

@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -19,10 +17,10 @@ limitations under the License.
 package v1alpha1
 
 import (
-	v1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/tools/cache"
+	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+	labels "k8s.io/apimachinery/pkg/labels"
+	listers "k8s.io/client-go/listers"
+	cache "k8s.io/client-go/tools/cache"
 )
 
 // CatalogSourceLister helps list CatalogSources.
@@ -30,7 +28,7 @@ import (
 type CatalogSourceLister interface {
 	// List lists all CatalogSources in the indexer.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1alpha1.CatalogSource, err error)
+	List(selector labels.Selector) (ret []*operatorsv1alpha1.CatalogSource, err error)
 	// CatalogSources returns an object that can list and get CatalogSources.
 	CatalogSources(namespace string) CatalogSourceNamespaceLister
 	CatalogSourceListerExpansion
@@ -38,25 +36,17 @@ type CatalogSourceLister interface {
 
 // catalogSourceLister implements the CatalogSourceLister interface.
 type catalogSourceLister struct {
-	indexer cache.Indexer
+	listers.ResourceIndexer[*operatorsv1alpha1.CatalogSource]
 }
 
 // NewCatalogSourceLister returns a new CatalogSourceLister.
 func NewCatalogSourceLister(indexer cache.Indexer) CatalogSourceLister {
-	return &catalogSourceLister{indexer: indexer}
-}
-
-// List lists all CatalogSources in the indexer.
-func (s *catalogSourceLister) List(selector labels.Selector) (ret []*v1alpha1.CatalogSource, err error) {
-	err = cache.ListAll(s.indexer, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1alpha1.CatalogSource))
-	})
-	return ret, err
+	return &catalogSourceLister{listers.New[*operatorsv1alpha1.CatalogSource](indexer, operatorsv1alpha1.Resource("catalogsource"))}
 }
 
 // CatalogSources returns an object that can list and get CatalogSources.
 func (s *catalogSourceLister) CatalogSources(namespace string) CatalogSourceNamespaceLister {
-	return catalogSourceNamespaceLister{indexer: s.indexer, namespace: namespace}
+	return catalogSourceNamespaceLister{listers.NewNamespaced[*operatorsv1alpha1.CatalogSource](s.ResourceIndexer, namespace)}
 }
 
 // CatalogSourceNamespaceLister helps list and get CatalogSources.
@@ -64,36 +54,15 @@ func (s *catalogSourceLister) CatalogSources(namespace string) CatalogSourceName
 type CatalogSourceNamespaceLister interface {
 	// List lists all CatalogSources in the indexer for a given namespace.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1alpha1.CatalogSource, err error)
+	List(selector labels.Selector) (ret []*operatorsv1alpha1.CatalogSource, err error)
 	// Get retrieves the CatalogSource from the indexer for a given namespace and name.
 	// Objects returned here must be treated as read-only.
-	Get(name string) (*v1alpha1.CatalogSource, error)
+	Get(name string) (*operatorsv1alpha1.CatalogSource, error)
 	CatalogSourceNamespaceListerExpansion
 }
 
 // catalogSourceNamespaceLister implements the CatalogSourceNamespaceLister
 // interface.
 type catalogSourceNamespaceLister struct {
-	indexer   cache.Indexer
-	namespace string
-}
-
-// List lists all CatalogSources in the indexer for a given namespace.
-func (s catalogSourceNamespaceLister) List(selector labels.Selector) (ret []*v1alpha1.CatalogSource, err error) {
-	err = cache.ListAllByNamespace(s.indexer, s.namespace, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1alpha1.CatalogSource))
-	})
-	return ret, err
-}
-
-// Get retrieves the CatalogSource from the indexer for a given namespace and name.
-func (s catalogSourceNamespaceLister) Get(name string) (*v1alpha1.CatalogSource, error) {
-	obj, exists, err := s.indexer.GetByKey(s.namespace + "/" + name)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, errors.NewNotFound(v1alpha1.Resource("catalogsource"), name)
-	}
-	return obj.(*v1alpha1.CatalogSource), nil
+	listers.ResourceIndexer[*operatorsv1alpha1.CatalogSource]
 }

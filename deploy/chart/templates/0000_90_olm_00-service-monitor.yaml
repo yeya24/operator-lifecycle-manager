@@ -27,6 +27,7 @@ spec:
   selector:
     matchLabels:
       app: olm-operator
+  serviceDiscoveryRole: EndpointSlice
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
@@ -36,7 +37,6 @@ metadata:
   labels:
     app: catalog-operator
 spec:
-  jobLabel: k8s-app
   endpoints:
   - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
     interval: 30s
@@ -57,6 +57,7 @@ spec:
   selector:
     matchLabels:
       app: catalog-operator
+  serviceDiscoveryRole: EndpointSlice
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -88,4 +89,35 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: operator-lifecycle-manager-metrics-reader
+rules:
+- nonResourceURLs:
+  - "/metrics"
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: operator-lifecycle-manager-metrics-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: operator-lifecycle-manager-metrics-reader
+subjects:
+- kind: ServiceAccount
+  name: prometheus-k8s
+  namespace: {{ .Values.monitoring.namespace }}
 {{ end }}

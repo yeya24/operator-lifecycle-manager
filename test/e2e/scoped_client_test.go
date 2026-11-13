@@ -3,12 +3,11 @@ package e2e
 import (
 	"context"
 
-	. "github.com/onsi/ginkgo"
-	"github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -19,7 +18,7 @@ import (
 	"github.com/operator-framework/operator-lifecycle-manager/test/e2e/ctx"
 )
 
-var _ = Describe("Scoped Client bound to a service account can be used to make API calls", func() {
+var _ = Describe("Scoped Client bound to a service account can be used to make API calls", Label("ScopedClient"), func() {
 	// TestScopedClient ensures that we can create a scoped client bound to a
 	// service account and then we can use the scoped client to make API calls.
 	var (
@@ -33,7 +32,7 @@ var _ = Describe("Scoped Client bound to a service account can be used to make A
 	BeforeEach(func() {
 		config = ctx.Ctx().RESTConfig()
 
-		kubeclient = newKubeClient()
+		kubeclient = ctx.Ctx().KubeClient()
 
 		logger = logrus.New()
 		logger.SetOutput(GinkgoWriter)
@@ -45,20 +44,20 @@ var _ = Describe("Scoped Client bound to a service account can be used to make A
 		assertFunc func(errGot error)
 	}
 
-	tableEntries := []table.TableEntry{
+	tableEntries := []TableEntry{
 		// The parent test invokes 'Get' API on non existent objects. If the
 		// scoped client has enough permission, we expect a NotFound error code.
 		// Otherwise, we expect a 'Forbidden' error code due to lack of permission.
 
-		table.Entry("returns error on API calls as ServiceAccount does not have any permission", testParameter{
+		Entry("returns error on API calls as ServiceAccount does not have any permission", testParameter{
 			// The service account does not have any permission granted to it.
 			// We expect the get api call to return 'Forbidden' error due to
 			// lack of permission.
 			assertFunc: func(errGot error) {
-				Expect(k8serrors.IsForbidden(errGot)).To(BeTrue())
+				Expect(apierrors.IsForbidden(errGot)).To(BeTrue())
 			},
 		}),
-		table.Entry("successfully allows API calls to be made when ServiceAccount has permission", testParameter{
+		Entry("successfully allows API calls to be made when ServiceAccount has permission", testParameter{
 			// The service account does have permission granted to it.
 			// We expect the get api call to return 'NotFound' error.
 			grant: func(namespace, name string) (cleanup cleanupFunc) {
@@ -66,35 +65,34 @@ var _ = Describe("Scoped Client bound to a service account can be used to make A
 				return
 			},
 			assertFunc: func(errGot error) {
-				Expect(k8serrors.IsNotFound(errGot)).To(BeTrue())
+				Expect(apierrors.IsNotFound(errGot)).To(BeTrue())
 			},
 		}),
 	}
 
-	table.DescribeTable("API call using scoped client", func(tc testParameter) {
-		// Steps:
-		// 1. Create a new namespace
-		// 2. Create a service account.
-		// 3. Grant permission(s) to the service account if specified.
-		// 4. Get scoped client instance(s)
-		// 5. Invoke Get API call on non existent object(s) to check if
-		//    the call can be made successfully.
+	DescribeTable("API call using scoped client", func(tc testParameter) {
+		By(`Create a new namespace`)
 		namespace := genName("a")
 		_, cleanupNS := newNamespace(kubeclient, namespace)
 		defer cleanupNS()
 
+		By(`Create a service account.`)
 		saName := genName("user-defined-")
 		sa, cleanupSA := newServiceAccount(kubeclient, namespace, saName)
 		defer cleanupSA()
+		By(`Create token secret for the serviceaccount`)
+		secret, cleanupSE := newTokenSecret(kubeclient, namespace, saName)
+		defer cleanupSE()
 
-		By("Wait for ServiceAccount secret to be available")
-		Eventually(func() (*corev1.ServiceAccount, error) {
-			sa, err := kubeclient.KubernetesInterface().CoreV1().ServiceAccounts(sa.GetNamespace()).Get(context.TODO(), sa.GetName(), metav1.GetOptions{})
-			return sa, err
-		}).ShouldNot(WithTransform(func(v *corev1.ServiceAccount) []corev1.ObjectReference {
-			return v.Secrets
+		By("Wait for token secret data to be available")
+		Eventually(func() (*corev1.Secret, error) {
+			se, err := kubeclient.KubernetesInterface().CoreV1().Secrets(secret.GetNamespace()).Get(context.TODO(), secret.GetName(), metav1.GetOptions{})
+			return se, err
+		}).ShouldNot(WithTransform(func(v *corev1.Secret) string {
+			return string(v.Data[corev1.ServiceAccountTokenKey])
 		}, BeEmpty()))
 
+		By(`Grant permission(s) to the service account if specified.`)
 		strategy := scoped.NewClientAttenuator(logger, config, kubeclient)
 		getter := func() (reference *corev1.ObjectReference, err error) {
 			reference = &corev1.ObjectReference{
@@ -124,6 +122,7 @@ var _ = Describe("Scoped Client bound to a service account can be used to make A
 		Expect(err).ToNot(HaveOccurred())
 		Expect(dynamicClientGot).ToNot(BeNil())
 
+		By(`Invoke Get API call on non existent object(s) to check if the call can be made successfully.`)
 		_, err = kubeclientGot.KubernetesInterface().CoreV1().ConfigMaps(namespace).Get(context.TODO(), genName("does-not-exist-"), metav1.GetOptions{})
 		Expect(err).To(HaveOccurred())
 		tc.assertFunc(err)
@@ -136,5 +135,5 @@ var _ = Describe("Scoped Client bound to a service account can be used to make A
 		_, err = dynamicClientGot.Resource(gvr).Namespace(namespace).Get(context.TODO(), genName("does-not-exist-"), metav1.GetOptions{})
 		Expect(err).To(HaveOccurred())
 		tc.assertFunc(err)
-	}, tableEntries...)
+	}, tableEntries)
 })

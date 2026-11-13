@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -19,40 +17,54 @@ limitations under the License.
 package internalversion
 
 import (
-	"github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/client/clientset/internalversion/scheme"
+	http "net/http"
+
+	scheme "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/client/clientset/internalversion/scheme"
 	rest "k8s.io/client-go/rest"
 )
 
-type OperatorsInterface interface {
+type PackagesInterface interface {
 	RESTClient() rest.Interface
 	PackageManifestsGetter
 }
 
-// OperatorsClient is used to interact with features provided by the operators.coreos.com group.
-type OperatorsClient struct {
+// PackagesClient is used to interact with features provided by the packages.operators.coreos.com group.
+type PackagesClient struct {
 	restClient rest.Interface
 }
 
-func (c *OperatorsClient) PackageManifests(namespace string) PackageManifestInterface {
+func (c *PackagesClient) PackageManifests(namespace string) PackageManifestInterface {
 	return newPackageManifests(c, namespace)
 }
 
-// NewForConfig creates a new OperatorsClient for the given config.
-func NewForConfig(c *rest.Config) (*OperatorsClient, error) {
+// NewForConfig creates a new PackagesClient for the given config.
+// NewForConfig is equivalent to NewForConfigAndClient(c, httpClient),
+// where httpClient was generated with rest.HTTPClientFor(c).
+func NewForConfig(c *rest.Config) (*PackagesClient, error) {
 	config := *c
-	if err := setConfigDefaults(&config); err != nil {
-		return nil, err
-	}
-	client, err := rest.RESTClientFor(&config)
+	setConfigDefaults(&config)
+	httpClient, err := rest.HTTPClientFor(&config)
 	if err != nil {
 		return nil, err
 	}
-	return &OperatorsClient{client}, nil
+	return NewForConfigAndClient(&config, httpClient)
 }
 
-// NewForConfigOrDie creates a new OperatorsClient for the given config and
+// NewForConfigAndClient creates a new PackagesClient for the given config and http client.
+// Note the http client provided takes precedence over the configured transport values.
+func NewForConfigAndClient(c *rest.Config, h *http.Client) (*PackagesClient, error) {
+	config := *c
+	setConfigDefaults(&config)
+	client, err := rest.RESTClientForConfigAndClient(&config, h)
+	if err != nil {
+		return nil, err
+	}
+	return &PackagesClient{client}, nil
+}
+
+// NewForConfigOrDie creates a new PackagesClient for the given config and
 // panics if there is an error in the config.
-func NewForConfigOrDie(c *rest.Config) *OperatorsClient {
+func NewForConfigOrDie(c *rest.Config) *PackagesClient {
 	client, err := NewForConfig(c)
 	if err != nil {
 		panic(err)
@@ -60,21 +72,21 @@ func NewForConfigOrDie(c *rest.Config) *OperatorsClient {
 	return client
 }
 
-// New creates a new OperatorsClient for the given RESTClient.
-func New(c rest.Interface) *OperatorsClient {
-	return &OperatorsClient{c}
+// New creates a new PackagesClient for the given RESTClient.
+func New(c rest.Interface) *PackagesClient {
+	return &PackagesClient{c}
 }
 
-func setConfigDefaults(config *rest.Config) error {
+func setConfigDefaults(config *rest.Config) {
 	config.APIPath = "/apis"
 	if config.UserAgent == "" {
 		config.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
-	if config.GroupVersion == nil || config.GroupVersion.Group != scheme.Scheme.PrioritizedVersionsForGroup("operators.coreos.com")[0].Group {
-		gv := scheme.Scheme.PrioritizedVersionsForGroup("operators.coreos.com")[0]
+	if config.GroupVersion == nil || config.GroupVersion.Group != scheme.Scheme.PrioritizedVersionsForGroup("packages.operators.coreos.com")[0].Group {
+		gv := scheme.Scheme.PrioritizedVersionsForGroup("packages.operators.coreos.com")[0]
 		config.GroupVersion = &gv
 	}
-	config.NegotiatedSerializer = scheme.Codecs
+	config.NegotiatedSerializer = rest.CodecFactoryForGeneratedClient(scheme.Scheme, scheme.Codecs)
 
 	if config.QPS == 0 {
 		config.QPS = 5
@@ -82,13 +94,11 @@ func setConfigDefaults(config *rest.Config) error {
 	if config.Burst == 0 {
 		config.Burst = 10
 	}
-
-	return nil
 }
 
 // RESTClient returns a RESTClient that is used to communicate
 // with API server by this client implementation.
-func (c *OperatorsClient) RESTClient() rest.Interface {
+func (c *PackagesClient) RESTClient() rest.Interface {
 	if c == nil {
 		return nil
 	}

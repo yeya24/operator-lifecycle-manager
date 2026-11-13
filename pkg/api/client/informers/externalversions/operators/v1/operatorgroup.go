@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -19,25 +17,54 @@ limitations under the License.
 package v1
 
 import (
-	"context"
+	context "context"
 	time "time"
 
-	operatorsv1 "github.com/operator-framework/api/pkg/operators/v1"
+	pkgoperatorsv1 "github.com/operator-framework/api/pkg/operators/v1"
 	versioned "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
 	internalinterfaces "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/informers/externalversions/internalinterfaces"
-	v1 "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1"
+	operatorsv1 "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
 )
 
 // OperatorGroupInformer provides access to a shared informer and lister for
-// OperatorGroups.
+// OperatorGroups. Prefer using the type-safe variant (see [TypedOperatorGroupInformer]).
 type OperatorGroupInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1.OperatorGroupLister
+	Lister() operatorsv1.OperatorGroupLister
 }
+
+// TypedOperatorGroupInformer provides access to a shared informer and lister for
+// OperatorGroups, including the type-safe TypedInformer variant.
+// It is a superset of OperatorGroupInformer.
+type TypedOperatorGroupInformer interface {
+	Informer() cache.SharedIndexInformer
+	TypedInformer() OperatorGroupIndexInformer
+	Lister() operatorsv1.OperatorGroupLister
+}
+
+// OperatorGroupIndexInformer is a wrapper around the underlying [cache.SharedIndexInformer]
+// with type-safe variants of several methods.
+type OperatorGroupIndexInformer cache.TypedSharedIndexInformer[*pkgoperatorsv1.OperatorGroup]
+
+// OperatorGroupHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerFuncs] for OperatorGroup.
+type OperatorGroupHandlerFuncs = cache.TypedResourceEventHandlerFuncs[*pkgoperatorsv1.OperatorGroup]
+
+// OperatorGroupDetailedHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerDetailedFuncs] for OperatorGroup.
+type OperatorGroupDetailedHandlerFuncs = cache.TypedResourceEventHandlerDetailedFuncs[*pkgoperatorsv1.OperatorGroup]
+
+// OperatorGroupFilteringHandler is a specialization of [cache.TypedFilteringResourceEventHandler] for OperatorGroup.
+type OperatorGroupFilteringHandler = cache.TypedFilteringResourceEventHandler[*pkgoperatorsv1.OperatorGroup]
+
+// OperatorGroupIndexers is a specialization of [cache.TypedIndexers] for OperatorGroup.
+type OperatorGroupIndexers = cache.TypedIndexers[*pkgoperatorsv1.OperatorGroup]
+
+// DeletedOperatorGroup is a specialization of [cache.DeletedObject] for OperatorGroup.
+type DeletedOperatorGroup = cache.DeletedObject[*pkgoperatorsv1.OperatorGroup]
 
 type operatorGroupInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
@@ -48,43 +75,132 @@ type operatorGroupInformer struct {
 // NewOperatorGroupInformer constructs a new informer for OperatorGroup type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedOperatorGroupInformer]).
 func NewOperatorGroupInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredOperatorGroupInformer(client, namespace, resyncPeriod, indexers, nil)
+	return NewOperatorGroupInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers})
+}
+
+// NewTypedOperatorGroupInformer constructs a new informer for OperatorGroup type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedOperatorGroupInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers OperatorGroupIndexers) OperatorGroupIndexInformer {
+	return NewTypedOperatorGroupInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers)})
 }
 
 // NewFilteredOperatorGroupInformer constructs a new informer for OperatorGroup type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedFilteredOperatorGroupInformer]).
 func NewFilteredOperatorGroupInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
-	return cache.NewSharedIndexInformer(
-		&cache.ListWatch{
-			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+	return NewTypedOperatorGroupInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers, TweakListOptions: tweakListOptions})
+}
+
+// NewTypedFilteredOperatorGroupInformer constructs a new informer for OperatorGroup type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedFilteredOperatorGroupInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers OperatorGroupIndexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) OperatorGroupIndexInformer {
+	return NewTypedOperatorGroupInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers), TweakListOptions: tweakListOptions})
+}
+
+// NewOperatorGroupInformerWithOptions constructs a new informer for OperatorGroup type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedOperatorGroupInformerWithOptions]).
+func NewOperatorGroupInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) cache.SharedIndexInformer {
+	return NewTypedOperatorGroupInformerWithOptions(client, namespace, options)
+}
+
+// NewTypedOperatorGroupInformerWithOptions constructs a new informer for OperatorGroup type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedOperatorGroupInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) OperatorGroupIndexInformer {
+	gvr := schema.GroupVersionResource{Group: "operators.coreos.com", Version: "v1", Resource: "operatorgroups"}
+	identifier := options.InformerName.WithResource(gvr)
+	tweakListOptions := options.TweakListOptions
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1.OperatorGroup](cache.NewSharedIndexInformerWithOptions(
+		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
+			ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.OperatorsV1().OperatorGroups(namespace).List(context.TODO(), options)
+				return client.OperatorsV1().OperatorGroups(namespace).List(context.Background(), opts)
 			},
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.OperatorsV1().OperatorGroups(namespace).Watch(context.TODO(), options)
+				return client.OperatorsV1().OperatorGroups(namespace).Watch(context.Background(), opts)
 			},
+			ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.OperatorsV1().OperatorGroups(namespace).List(ctx, opts)
+			},
+			WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.OperatorsV1().OperatorGroups(namespace).Watch(ctx, opts)
+			},
+		}, client),
+		&pkgoperatorsv1.OperatorGroup{},
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: options.ResyncPeriod,
+			Indexers:     options.Indexers,
+			Identifier:   identifier,
 		},
-		&operatorsv1.OperatorGroup{},
-		resyncPeriod,
-		indexers,
-	)
+	))
 }
 
 func (f *operatorGroupInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredOperatorGroupInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+	return NewTypedOperatorGroupInformerWithOptions(client, f.namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, InformerName: f.factory.InformerName(), TweakListOptions: f.tweakListOptions})
 }
 
 func (f *operatorGroupInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&operatorsv1.OperatorGroup{}, f.defaultInformer)
+	return f.TypedInformer()
 }
 
-func (f *operatorGroupInformer) Lister() v1.OperatorGroupLister {
-	return v1.NewOperatorGroupLister(f.Informer().GetIndexer())
+func (f *operatorGroupInformer) TypedInformer() OperatorGroupIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1.OperatorGroup](f.factory.InformerFor(&pkgoperatorsv1.OperatorGroup{}, f.defaultInformer))
+}
+
+func (f *operatorGroupInformer) Lister() operatorsv1.OperatorGroupLister {
+	return operatorsv1.NewOperatorGroupLister(f.Informer().GetIndexer())
+}
+
+// ToTypedOperatorGroupInformer converts an untyped informer into a TypedOperatorGroupInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *OperatorGroup. If that is not the case, calling type-safe methods of the returned
+// TypedOperatorGroupInformer leads to runtime panics. A safer alternative is to pass
+// around a TypedOperatorGroupInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToTypedOperatorGroupInformer(informer OperatorGroupInformer) TypedOperatorGroupInformer {
+	if informer, ok := informer.(TypedOperatorGroupInformer); ok {
+		return informer
+	}
+	return &operatorGroupTypedInformerAdapter{informer}
+}
+
+type operatorGroupTypedInformerAdapter struct {
+	OperatorGroupInformer
+}
+
+func (a *operatorGroupTypedInformerAdapter) TypedInformer() OperatorGroupIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1.OperatorGroup](a.Informer())
+}
+
+// ToOperatorGroupIndexInformer converts an untyped informer into a OperatorGroupIndexInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *OperatorGroup. If that is not the case, calling type-safe methods of the returned
+// OperatorGroupIndexInformer leads to runtime panics. A safer alternative is to pass
+// around a OperatorGroupIndexInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToOperatorGroupIndexInformer(informer cache.SharedIndexInformer) OperatorGroupIndexInformer {
+	if informer, ok := informer.(OperatorGroupIndexInformer); ok {
+		return informer
+	}
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1.OperatorGroup](informer)
 }

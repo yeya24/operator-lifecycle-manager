@@ -3,11 +3,13 @@ package olm
 import (
 	"context"
 	"fmt"
+	"time"
 
+	hashutil "github.com/operator-framework/operator-lifecycle-manager/pkg/lib/kubernetes/pkg/util/hash"
 	log "github.com/sirupsen/logrus"
 	appsv1 "k8s.io/api/apps/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
@@ -22,6 +24,11 @@ import (
 const (
 	// Name of packageserver API service
 	PackageserverName = "v1.packages.operators.coreos.com"
+
+	// maxDisruptionDuration is the maximum duration we consider pod disruption as "expected"
+	// (e.g., during cluster upgrade). Beyond this time, we treat the unavailability as a real failure.
+	// This prevents indefinitely waiting for pods that will never recover.
+	maxDisruptionDuration = 5 * time.Minute
 )
 
 // apiServiceResourceErrorActionable returns true if OLM can do something about any one
@@ -47,7 +54,6 @@ func (a *Operator) checkAPIServiceResources(csv *v1alpha1.ClusterServiceVersion,
 	})
 
 	errs := []error{}
-	ruleChecker := install.NewCSVRuleChecker(a.lister.RbacV1().RoleLister(), a.lister.RbacV1().RoleBindingLister(), a.lister.RbacV1().ClusterRoleLister(), a.lister.RbacV1().ClusterRoleBindingLister(), csv)
 	for _, desc := range csv.GetOwnedAPIServiceDescriptions() {
 		apiServiceName := desc.GetName()
 		logger := logger.WithFields(log.Fields{
@@ -88,21 +94,16 @@ func (a *Operator) checkAPIServiceResources(csv *v1alpha1.ClusterServiceVersion,
 		// Check if the APIService points to the correct service
 		if apiService.Spec.Service.Name != serviceName || apiService.Spec.Service.Namespace != csv.GetNamespace() {
 			logger.WithFields(log.Fields{"service": apiService.Spec.Service.Name, "serviceNamespace": apiService.Spec.Service.Namespace}).Warnf("APIService service reference mismatch")
-			errs = append(errs, fmt.Errorf("APIService service reference mismatch"))
+			errs = append(errs, fmt.Errorf("found APIService and service reference mismatch"))
 			continue
 		}
 
 		// Check if CA is Active
 		caBundle := apiService.Spec.CABundle
-		ca, err := certs.PEMToCert(caBundle)
+		_, err = certs.PEMToCert(caBundle)
 		if err != nil {
 			logger.Warnf("could not convert APIService CA bundle to x509 cert")
 			errs = append(errs, err)
-			continue
-		}
-		if !certs.Active(ca) {
-			logger.Warnf("CA cert not active")
-			errs = append(errs, fmt.Errorf("CA cert not active"))
 			continue
 		}
 
@@ -114,15 +115,10 @@ func (a *Operator) checkAPIServiceResources(csv *v1alpha1.ClusterServiceVersion,
 			errs = append(errs, err)
 			continue
 		}
-		cert, err := certs.PEMToCert(secret.Data["tls.crt"])
+		_, err = certs.PEMToCert(secret.Data["tls.crt"])
 		if err != nil {
 			logger.Warnf("could not convert serving cert to x509 cert")
 			errs = append(errs, err)
-			continue
-		}
-		if !certs.Active(cert) {
-			logger.Warnf("serving cert not active")
-			errs = append(errs, fmt.Errorf("serving cert not active"))
 			continue
 		}
 
@@ -134,28 +130,16 @@ func (a *Operator) checkAPIServiceResources(csv *v1alpha1.ClusterServiceVersion,
 			continue
 		}
 
-		// Check if serving cert is trusted by the CA
-		hosts := []string{
-			fmt.Sprintf("%s.%s", service.GetName(), csv.GetNamespace()),
-			fmt.Sprintf("%s.%s.svc", service.GetName(), csv.GetNamespace()),
-		}
-		for _, host := range hosts {
-			if err := certs.VerifyCert(ca, cert, host); err != nil {
-				errs = append(errs, fmt.Errorf("could not verify cert: %s", err.Error()))
-				continue
-			}
-		}
-
 		// Ensure the existing Deployment has a matching CA hash annotation
 		deployment, err := a.lister.AppsV1().DeploymentLister().Deployments(csv.GetNamespace()).Get(desc.DeploymentName)
-		if k8serrors.IsNotFound(err) || err != nil {
+		if apierrors.IsNotFound(err) || err != nil {
 			logger.WithField("deployment", desc.DeploymentName).Warnf("expected Deployment could not be retrieved")
 			errs = append(errs, err)
 			continue
 		}
 		if hash, ok := deployment.Spec.Template.GetAnnotations()[install.OLMCAHashAnnotationKey]; !ok || hash != caHash {
 			logger.WithField("deployment", desc.DeploymentName).Warnf("Deployment CA cert hash does not match expected")
-			errs = append(errs, fmt.Errorf("Deployment %s CA cert hash does not match expected", desc.DeploymentName))
+			errs = append(errs, fmt.Errorf("deployment %s CA cert hash does not match expected", desc.DeploymentName))
 			continue
 		}
 
@@ -164,70 +148,200 @@ func (a *Operator) checkAPIServiceResources(csv *v1alpha1.ClusterServiceVersion,
 		if serviceAccountName == "" {
 			serviceAccountName = "default"
 		}
-		serviceAccount, err := a.lister.CoreV1().ServiceAccountLister().ServiceAccounts(deployment.GetNamespace()).Get(serviceAccountName)
+		_, err = a.opClient.KubernetesInterface().CoreV1().ServiceAccounts(deployment.GetNamespace()).Get(context.TODO(), serviceAccountName, metav1.GetOptions{})
 		if err != nil {
-			logger.WithField("serviceaccount", serviceAccountName).Warnf("could not retrieve ServiceAccount")
+			logger.WithError(err).WithField("serviceaccount", serviceAccountName).Warnf("could not retrieve ServiceAccount")
 			errs = append(errs, err)
-			continue
 		}
 
-		// Ensure RBAC permissions for the APIService are correct
-		rulesMap := map[string][]rbacv1.PolicyRule{
-			// Serving cert Secret Rule
-			csv.GetNamespace(): {
-				{
-					Verbs:         []string{"get"},
-					APIGroups:     []string{""},
-					Resources:     []string{"secrets"},
-					ResourceNames: []string{secret.GetName()},
-				},
-			},
-			install.KubeSystem:  {},
-			metav1.NamespaceAll: {},
-		}
-
-		// extension-apiserver-authentication-reader
-		authReaderRole, err := a.lister.RbacV1().RoleLister().Roles(install.KubeSystem).Get("extension-apiserver-authentication-reader")
-		if err != nil {
-			logger.Warnf("could not retrieve Role extension-apiserver-authentication-reader")
+		if _, err := a.lister.RbacV1().RoleLister().Roles(secret.GetNamespace()).Get(secret.GetName()); err != nil {
+			logger.WithError(err).Warnf("could not retrieve role %s/%s", secret.GetNamespace(), secret.GetName())
 			errs = append(errs, err)
-			continue
 		}
-		rulesMap[install.KubeSystem] = append(rulesMap[install.KubeSystem], authReaderRole.Rules...)
-
-		// system:auth-delegator
-		authDelegatorClusterRole, err := a.lister.RbacV1().ClusterRoleLister().Get("system:auth-delegator")
-		if err != nil {
-			logger.Warnf("could not retrieve ClusterRole system:auth-delegator")
+		if _, err := a.lister.RbacV1().RoleBindingLister().RoleBindings(secret.GetNamespace()).Get(secret.GetName()); err != nil {
+			logger.WithError(err).Warnf("could not retrieve role binding %s/%s", secret.GetNamespace(), secret.GetName())
 			errs = append(errs, err)
-			continue
 		}
-		rulesMap[metav1.NamespaceAll] = append(rulesMap[metav1.NamespaceAll], authDelegatorClusterRole.Rules...)
-
-		for namespace, rules := range rulesMap {
-			for _, rule := range rules {
-				satisfied, err := ruleChecker.RuleSatisfied(serviceAccount, namespace, rule)
-				if err != nil {
-					logger.WithField("rule", fmt.Sprintf("%+v", rule)).Warnf("error checking Rule")
-					errs = append(errs, err)
-					continue
-				}
-				if !satisfied {
-					logger.WithField("rule", fmt.Sprintf("%+v", rule)).Warnf("Rule not satisfied")
-					errs = append(errs, fmt.Errorf("Rule %+v not satisfied", rule))
-					continue
-				}
-			}
+		if _, err := a.lister.RbacV1().ClusterRoleBindingLister().Get(install.AuthDelegatorClusterRoleBindingName(service.GetName())); err != nil {
+			logger.WithError(err).Warnf("could not retrieve auth delegator cluster role binding %s", install.AuthDelegatorClusterRoleBindingName(service.GetName()))
+			errs = append(errs, err)
+		}
+		if _, err := a.lister.RbacV1().RoleBindingLister().RoleBindings(install.KubeSystem).Get(install.AuthReaderRoleBindingName(service.GetName())); err != nil {
+			logger.WithError(err).Warnf("could not retrieve role binding %s/%s", install.KubeSystem, install.AuthReaderRoleBindingName(service.GetName()))
+			errs = append(errs, err)
 		}
 	}
 
 	return utilerrors.NewAggregate(errs)
 }
 
+// isAPIServiceBackendDisrupted checks if the APIService is unavailable due to expected pod disruption
+// (e.g., during node reboot or cluster upgrade) rather than an actual failure.
+// According to the Progressing condition contract, operators should not report Progressing=True
+// only because pods are adjusting to new nodes or rebooting during cluster upgrade.
+func (a *Operator) isAPIServiceBackendDisrupted(csv *v1alpha1.ClusterServiceVersion, apiServiceName string) bool {
+	// Get the deployment that backs this APIService
+	// For most APIServices, the deployment name matches the CSV name or is specified in the CSV
+
+	// Try to find the deployment from the CSV's install strategy
+	strategy, err := a.resolver.UnmarshalStrategy(csv.Spec.InstallStrategy)
+	if err != nil {
+		a.logger.Debugf("Unable to unmarshal strategy for CSV %s: %v", csv.Name, err)
+		return false
+	}
+
+	strategyDetailsDeployment, ok := strategy.(*v1alpha1.StrategyDetailsDeployment)
+	if !ok {
+		a.logger.Debugf("CSV %s does not use deployment strategy", csv.Name)
+		return false
+	}
+
+	// Check each deployment's pods
+	// Note: We check all deployments in the CSV rather than trying to identify
+	// the specific deployment backing this APIService. This is because:
+	// 1. Mapping APIService -> Service -> Deployment requires complex logic
+	// 2. During cluster upgrades, all deployments in the CSV are likely affected
+	// 3. The time limit and failure detection logic prevents false positives
+	for _, deploymentSpec := range strategyDetailsDeployment.DeploymentSpecs {
+		deployment, err := a.lister.AppsV1().DeploymentLister().Deployments(csv.Namespace).Get(deploymentSpec.Name)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			a.logger.Debugf("Error getting deployment %s: %v", deploymentSpec.Name, err)
+			continue
+		}
+
+		// Check if deployment is being updated or rolling out
+		if deployment.Status.UnavailableReplicas > 0 ||
+			deployment.Status.UpdatedReplicas < deployment.Status.Replicas {
+			a.logger.Debugf("Deployment %s has unavailable replicas, likely due to pod disruption", deploymentSpec.Name)
+
+			// Check pod status to confirm disruption
+			selector, err := metav1.LabelSelectorAsSelector(deployment.Spec.Selector)
+			if err != nil {
+				a.logger.Debugf("Error parsing deployment selector: %v", err)
+				continue
+			}
+
+			pods, err := a.lister.CoreV1().PodLister().Pods(csv.Namespace).List(selector)
+			if err != nil {
+				a.logger.Debugf("Error listing pods: %v", err)
+				continue
+			}
+
+			// Check if any pod is in expected disruption state
+			for _, pod := range pods {
+				// Check how long the pod has been in disrupted state
+				// If it's been too long, it's likely a real failure, not temporary disruption
+				podAge := time.Since(pod.CreationTimestamp.Time)
+				if podAge > maxDisruptionDuration {
+					a.logger.Debugf("Pod %s has been in disrupted state for %v (exceeds %v) - treating as real failure",
+						pod.Name, podAge, maxDisruptionDuration)
+					continue
+				}
+
+				// Pod is terminating (DeletionTimestamp is set)
+				if pod.DeletionTimestamp != nil {
+					a.logger.Debugf("Pod %s is terminating - expected disruption", pod.Name)
+					return true
+				}
+
+				// For pending pods, we need to distinguish between expected disruption
+				// (being scheduled/created during node drain) and real failures (ImagePullBackOff, etc.)
+				if pod.Status.Phase == corev1.PodPending {
+					// Check if this is a real failure vs expected disruption
+					isExpectedDisruption := false
+					isRealFailure := false
+
+					// Check pod conditions for scheduling issues
+					for _, condition := range pod.Status.Conditions {
+						if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
+							// If pod has been unschedulable for a while, it's likely a real issue
+							// not a temporary disruption from cluster upgrade
+							if condition.Reason == "Unschedulable" {
+								isRealFailure = true
+								a.logger.Debugf("Pod %s is unschedulable - not a temporary disruption", pod.Name)
+								break
+							}
+						}
+					}
+
+					// Check container statuses for real failures
+					for _, containerStatus := range pod.Status.ContainerStatuses {
+						if containerStatus.State.Waiting != nil {
+							reason := containerStatus.State.Waiting.Reason
+							switch reason {
+							case "ContainerCreating", "PodInitializing":
+								// These are expected during normal pod startup
+								isExpectedDisruption = true
+							case "ImagePullBackOff", "ErrImagePull", "CrashLoopBackOff", "CreateContainerConfigError", "InvalidImageName":
+								// These are real failures, not temporary disruptions
+								isRealFailure = true
+								a.logger.Debugf("Pod %s has container error %s - real failure, not disruption", pod.Name, reason)
+							}
+						}
+					}
+
+					// Also check init container statuses
+					for _, containerStatus := range pod.Status.InitContainerStatuses {
+						if containerStatus.State.Waiting != nil {
+							reason := containerStatus.State.Waiting.Reason
+							switch reason {
+							case "ContainerCreating", "PodInitializing":
+								isExpectedDisruption = true
+							case "ImagePullBackOff", "ErrImagePull", "CrashLoopBackOff", "CreateContainerConfigError", "InvalidImageName":
+								isRealFailure = true
+								a.logger.Debugf("Pod %s has init container error %s - real failure, not disruption", pod.Name, reason)
+							}
+						}
+					}
+
+					// If it's a real failure, don't treat it as expected disruption
+					if isRealFailure {
+						continue
+					}
+
+					// If it's in expected disruption state, return true
+					if isExpectedDisruption {
+						a.logger.Debugf("Pod %s is in expected disruption state", pod.Name)
+						return true
+					}
+
+					// If pending without clear container status, check if it's just being scheduled
+					// This could be normal pod creation during node drain
+					if len(pod.Status.ContainerStatuses) == 0 && len(pod.Status.InitContainerStatuses) == 0 {
+						a.logger.Debugf("Pod %s is pending without container statuses - likely being scheduled", pod.Name)
+						return true
+					}
+				}
+
+				// Check container statuses for running pods that are restarting
+				for _, containerStatus := range pod.Status.ContainerStatuses {
+					if containerStatus.State.Waiting != nil {
+						reason := containerStatus.State.Waiting.Reason
+						switch reason {
+						case "ContainerCreating", "PodInitializing":
+							a.logger.Debugf("Pod %s container is starting - expected disruption", pod.Name)
+							return true
+						case "ImagePullBackOff", "ErrImagePull", "CrashLoopBackOff":
+							// Real failures - don't treat as disruption
+							a.logger.Debugf("Pod %s has container error %s - not treating as disruption", pod.Name, reason)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return false
+}
+
 func (a *Operator) areAPIServicesAvailable(csv *v1alpha1.ClusterServiceVersion) (bool, error) {
 	for _, desc := range csv.Spec.APIServiceDefinitions.Owned {
 		apiService, err := a.lister.APIRegistrationV1().APIServiceLister().Get(desc.GetName())
-		if k8serrors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
+			a.logger.Debugf("APIRegistration APIService %s not found", desc.GetName())
 			return false, nil
 		}
 
@@ -236,10 +350,21 @@ func (a *Operator) areAPIServicesAvailable(csv *v1alpha1.ClusterServiceVersion) 
 		}
 
 		if !install.IsAPIServiceAvailable(apiService) {
+			a.logger.Debugf("APIService not available for %s", desc.GetName())
+
+			// Check if this unavailability is due to expected pod disruption
+			// If so, we should not immediately mark as failed or trigger Progressing=True
+			if a.isAPIServiceBackendDisrupted(csv, desc.GetName()) {
+				a.logger.Infof("APIService %s unavailable due to pod disruption (e.g., node reboot), will retry", desc.GetName())
+				// Return an error to trigger retry, but don't mark as definitively unavailable
+				return false, olmerrors.NewRetryableError(fmt.Errorf("APIService %s temporarily unavailable due to pod disruption", desc.GetName()))
+			}
+
 			return false, nil
 		}
 
 		if ok, err := a.isGVKRegistered(desc.Group, desc.Version, desc.Kind); !ok || err != nil {
+			a.logger.Debugf("%s.%s/%s not registered for %s", desc.Group, desc.Version, desc.Kind, desc.GetName())
 			return false, err
 		}
 	}
@@ -260,7 +385,7 @@ func (a *Operator) getAPIServiceCABundle(csv *v1alpha1.ClusterServiceVersion, de
 		return apiService.Spec.CABundle, nil
 	}
 
-	return nil, fmt.Errorf("Unable to find ca")
+	return nil, fmt.Errorf("unable to find CA")
 }
 
 // getWebhookCABundle returns the CA associated with a webhook
@@ -295,7 +420,7 @@ func (a *Operator) getWebhookCABundle(csv *v1alpha1.ClusterServiceVersion, desc 
 			if err != nil {
 				continue
 			}
-			if crd.Spec.Conversion == nil || crd.Spec.Conversion.Webhook == nil || crd.Spec.Conversion.Webhook.ClientConfig == nil && crd.Spec.Conversion.Webhook.ClientConfig.CABundle == nil {
+			if crd.Spec.Conversion == nil || crd.Spec.Conversion.Webhook == nil || crd.Spec.Conversion.Webhook.ClientConfig == nil || crd.Spec.Conversion.Webhook.ClientConfig.CABundle == nil {
 				continue
 			}
 
@@ -303,13 +428,13 @@ func (a *Operator) getWebhookCABundle(csv *v1alpha1.ClusterServiceVersion, desc 
 		}
 	}
 
-	return nil, fmt.Errorf("Unable to find ca")
+	return nil, fmt.Errorf("unable to find CA")
 }
 
-// updateDeploymentSpecsWithApiServiceData transforms an install strategy to include information about apiservices
+// updateDeploymentSpecsWithAPIServiceData transforms an install strategy to include information about apiservices
 // it is used in generating hashes for deployment specs to know when something in the spec has changed,
 // but duplicates a lot of installAPIServiceRequirements and should be refactored.
-func (a *Operator) updateDeploymentSpecsWithApiServiceData(csv *v1alpha1.ClusterServiceVersion, strategy install.Strategy) (install.Strategy, error) {
+func (a *Operator) updateDeploymentSpecsWithAPIServiceData(csv *v1alpha1.ClusterServiceVersion, strategy install.Strategy) (install.Strategy, error) {
 	// Assume the strategy is for a deployment
 	strategyDetailsDeployment, ok := strategy.(*v1alpha1.StrategyDetailsDeployment)
 	if !ok {
@@ -335,7 +460,7 @@ func (a *Operator) updateDeploymentSpecsWithApiServiceData(csv *v1alpha1.Cluster
 
 		depSpec, ok := depSpecs[desc.DeploymentName]
 		if !ok {
-			return nil, fmt.Errorf("StrategyDetailsDeployment missing deployment %s for owned APIServices %s", desc.DeploymentName, fmt.Sprintf("%s.%s", desc.Version, desc.Group))
+			return nil, fmt.Errorf("strategyDetailsDeployment is missing deployment %s for owned APIServices %s", desc.DeploymentName, fmt.Sprintf("%s.%s", desc.Version, desc.Group))
 		}
 
 		if depSpec.Template.Spec.ServiceAccountName == "" {
@@ -345,7 +470,7 @@ func (a *Operator) updateDeploymentSpecsWithApiServiceData(csv *v1alpha1.Cluster
 		// Update deployment with secret volume mount.
 		secret, err := a.lister.CoreV1().SecretLister().Secrets(csv.GetNamespace()).Get(install.SecretName(install.ServiceName(desc.DeploymentName)))
 		if err != nil {
-			return nil, fmt.Errorf("Unable to get secret %s", install.SecretName(install.ServiceName(desc.DeploymentName)))
+			return nil, fmt.Errorf("unable to get secret %s", install.SecretName(install.ServiceName(desc.DeploymentName)))
 		}
 
 		install.AddDefaultCertVolumeAndVolumeMounts(&depSpec, secret.GetName())
@@ -362,7 +487,7 @@ func (a *Operator) updateDeploymentSpecsWithApiServiceData(csv *v1alpha1.Cluster
 
 		depSpec, ok := depSpecs[desc.DeploymentName]
 		if !ok {
-			return nil, fmt.Errorf("StrategyDetailsDeployment missing deployment %s for WebhookDescription %s", desc.DeploymentName, desc.GenerateName)
+			return nil, fmt.Errorf("strategyDetailsDeployment is missing deployment %s for WebhookDescription %s", desc.DeploymentName, desc.GenerateName)
 		}
 
 		if depSpec.Template.Spec.ServiceAccountName == "" {
@@ -372,7 +497,7 @@ func (a *Operator) updateDeploymentSpecsWithApiServiceData(csv *v1alpha1.Cluster
 		// Update deployment with secret volume mount.
 		secret, err := a.lister.CoreV1().SecretLister().Secrets(csv.GetNamespace()).Get(install.SecretName(install.ServiceName(desc.DeploymentName)))
 		if err != nil {
-			return nil, fmt.Errorf("Unable to get secret %s", install.SecretName(install.ServiceName(desc.DeploymentName)))
+			return nil, fmt.Errorf("unable to get secret %s", install.SecretName(install.ServiceName(desc.DeploymentName)))
 		}
 		install.AddDefaultCertVolumeAndVolumeMounts(&depSpec, secret.GetName())
 
@@ -406,11 +531,11 @@ func (a *Operator) cleanUpRemovedWebhooks(csv *v1alpha1.ClusterServiceVersion) e
 	for _, webhook := range validatingWebhookConfigurationList.Items {
 		webhookGenerateNameLabel, ok := webhook.GetLabels()[install.WebhookDescKey]
 		if !ok {
-			return fmt.Errorf("ValidatingWebhookConfiguration %s does not have WebhookDesc key", webhook.Name)
+			return fmt.Errorf("validatingWebhookConfiguration %s does not have WebhookDesc key", webhook.Name)
 		}
 		if _, ok := csvWebhookGenerateNames[webhookGenerateNameLabel]; !ok {
 			err = a.opClient.KubernetesInterface().AdmissionregistrationV1().ValidatingWebhookConfigurations().Delete(context.TODO(), webhook.Name, metav1.DeleteOptions{})
-			if err != nil && k8serrors.IsNotFound(err) {
+			if err != nil && apierrors.IsNotFound(err) {
 				return err
 			}
 		}
@@ -424,11 +549,11 @@ func (a *Operator) cleanUpRemovedWebhooks(csv *v1alpha1.ClusterServiceVersion) e
 	for _, webhook := range mutatingWebhookConfigurationList.Items {
 		webhookGenerateNameLabel, ok := webhook.GetLabels()[install.WebhookDescKey]
 		if !ok {
-			return fmt.Errorf("MutatingWebhookConfiguration %s does not have WebhookDesc key", webhook.Name)
+			return fmt.Errorf("mutatingWebhookConfiguration %s does not have WebhookDesc key", webhook.Name)
 		}
 		if _, ok := csvWebhookGenerateNames[webhookGenerateNameLabel]; !ok {
 			err = a.opClient.KubernetesInterface().AdmissionregistrationV1().MutatingWebhookConfigurations().Delete(context.TODO(), webhook.Name, metav1.DeleteOptions{})
-			if err != nil && k8serrors.IsNotFound(err) {
+			if err != nil && apierrors.IsNotFound(err) {
 				return err
 			}
 		}
@@ -446,7 +571,11 @@ func (a *Operator) areWebhooksAvailable(csv *v1alpha1.ClusterServiceVersion) (bo
 		// Create Webhook Label Selector
 		webhookLabels := ownerutil.OwnerLabel(csv, v1alpha1.ClusterServiceVersionKind)
 		webhookLabels[install.WebhookDescKey] = desc.GenerateName
-		webhookLabels[install.WebhookHashKey] = install.HashWebhookDesc(desc)
+		hash, err := hashutil.DeepHashObject(&desc)
+		if err != nil {
+			return false, err
+		}
+		webhookLabels[install.WebhookHashKey] = hash
 		webhookSelector := labels.SelectorFromSet(webhookLabels).String()
 
 		webhookCount := 0
@@ -472,8 +601,8 @@ func (a *Operator) areWebhooksAvailable(csv *v1alpha1.ClusterServiceVersion) (bo
 					return false, err
 				}
 
-				if crd.Spec.Conversion == nil || crd.Spec.Conversion.Strategy != "Webhook" || crd.Spec.Conversion.Webhook == nil || crd.Spec.Conversion.Webhook.ClientConfig == nil && crd.Spec.Conversion.Webhook.ClientConfig.CABundle == nil {
-					return false, fmt.Errorf("ConversionWebhook not ready")
+				if crd.Spec.Conversion == nil || crd.Spec.Conversion.Strategy != "Webhook" || crd.Spec.Conversion.Webhook == nil || crd.Spec.Conversion.Webhook.ClientConfig == nil || crd.Spec.Conversion.Webhook.ClientConfig.CABundle == nil {
+					return false, fmt.Errorf("conversionWebhook not ready")
 				}
 				webhookCount++
 			}

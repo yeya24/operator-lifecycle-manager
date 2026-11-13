@@ -5,6 +5,7 @@ package install
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/wrappers"
@@ -20,6 +21,9 @@ type Strategy interface {
 type StrategyInstaller interface {
 	Install(strategy Strategy) error
 	CheckInstalled(strategy Strategy) (bool, error)
+	ShouldRotateCerts(strategy Strategy) (bool, error)
+	CertsRotateAt() time.Time
+	CertsRotated() bool
 }
 
 type StrategyResolverInterface interface {
@@ -67,4 +71,16 @@ func (i *NullStrategyInstaller) Install(s Strategy) error {
 
 func (i *NullStrategyInstaller) CheckInstalled(s Strategy) (bool, error) {
 	return true, nil
+}
+
+func (i *NullStrategyInstaller) CertsRotateAt() time.Time {
+	return time.Time{}
+}
+
+func (i *NullStrategyInstaller) CertsRotated() bool {
+	return false
+}
+
+func (i *NullStrategyInstaller) ShouldRotateCerts(s Strategy) (bool, error) {
+	return false, nil
 }

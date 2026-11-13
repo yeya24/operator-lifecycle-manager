@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -19,25 +17,54 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"context"
+	context "context"
 	time "time"
 
-	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+	pkgoperatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	versioned "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
 	internalinterfaces "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/informers/externalversions/internalinterfaces"
-	v1alpha1 "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1alpha1"
+	operatorsv1alpha1 "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1alpha1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
 )
 
 // InstallPlanInformer provides access to a shared informer and lister for
-// InstallPlans.
+// InstallPlans. Prefer using the type-safe variant (see [TypedInstallPlanInformer]).
 type InstallPlanInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1alpha1.InstallPlanLister
+	Lister() operatorsv1alpha1.InstallPlanLister
 }
+
+// TypedInstallPlanInformer provides access to a shared informer and lister for
+// InstallPlans, including the type-safe TypedInformer variant.
+// It is a superset of InstallPlanInformer.
+type TypedInstallPlanInformer interface {
+	Informer() cache.SharedIndexInformer
+	TypedInformer() InstallPlanIndexInformer
+	Lister() operatorsv1alpha1.InstallPlanLister
+}
+
+// InstallPlanIndexInformer is a wrapper around the underlying [cache.SharedIndexInformer]
+// with type-safe variants of several methods.
+type InstallPlanIndexInformer cache.TypedSharedIndexInformer[*pkgoperatorsv1alpha1.InstallPlan]
+
+// InstallPlanHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerFuncs] for InstallPlan.
+type InstallPlanHandlerFuncs = cache.TypedResourceEventHandlerFuncs[*pkgoperatorsv1alpha1.InstallPlan]
+
+// InstallPlanDetailedHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerDetailedFuncs] for InstallPlan.
+type InstallPlanDetailedHandlerFuncs = cache.TypedResourceEventHandlerDetailedFuncs[*pkgoperatorsv1alpha1.InstallPlan]
+
+// InstallPlanFilteringHandler is a specialization of [cache.TypedFilteringResourceEventHandler] for InstallPlan.
+type InstallPlanFilteringHandler = cache.TypedFilteringResourceEventHandler[*pkgoperatorsv1alpha1.InstallPlan]
+
+// InstallPlanIndexers is a specialization of [cache.TypedIndexers] for InstallPlan.
+type InstallPlanIndexers = cache.TypedIndexers[*pkgoperatorsv1alpha1.InstallPlan]
+
+// DeletedInstallPlan is a specialization of [cache.DeletedObject] for InstallPlan.
+type DeletedInstallPlan = cache.DeletedObject[*pkgoperatorsv1alpha1.InstallPlan]
 
 type installPlanInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
@@ -48,43 +75,132 @@ type installPlanInformer struct {
 // NewInstallPlanInformer constructs a new informer for InstallPlan type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedInstallPlanInformer]).
 func NewInstallPlanInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredInstallPlanInformer(client, namespace, resyncPeriod, indexers, nil)
+	return NewInstallPlanInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers})
+}
+
+// NewTypedInstallPlanInformer constructs a new informer for InstallPlan type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedInstallPlanInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers InstallPlanIndexers) InstallPlanIndexInformer {
+	return NewTypedInstallPlanInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers)})
 }
 
 // NewFilteredInstallPlanInformer constructs a new informer for InstallPlan type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedFilteredInstallPlanInformer]).
 func NewFilteredInstallPlanInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
-	return cache.NewSharedIndexInformer(
-		&cache.ListWatch{
-			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
+	return NewTypedInstallPlanInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers, TweakListOptions: tweakListOptions})
+}
+
+// NewTypedFilteredInstallPlanInformer constructs a new informer for InstallPlan type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedFilteredInstallPlanInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers InstallPlanIndexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) InstallPlanIndexInformer {
+	return NewTypedInstallPlanInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers), TweakListOptions: tweakListOptions})
+}
+
+// NewInstallPlanInformerWithOptions constructs a new informer for InstallPlan type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedInstallPlanInformerWithOptions]).
+func NewInstallPlanInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) cache.SharedIndexInformer {
+	return NewTypedInstallPlanInformerWithOptions(client, namespace, options)
+}
+
+// NewTypedInstallPlanInformerWithOptions constructs a new informer for InstallPlan type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedInstallPlanInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) InstallPlanIndexInformer {
+	gvr := schema.GroupVersionResource{Group: "operators.coreos.com", Version: "v1alpha1", Resource: "installplans"}
+	identifier := options.InformerName.WithResource(gvr)
+	tweakListOptions := options.TweakListOptions
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1alpha1.InstallPlan](cache.NewSharedIndexInformerWithOptions(
+		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
+			ListFunc: func(opts v1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.OperatorsV1alpha1().InstallPlans(namespace).List(context.TODO(), options)
+				return client.OperatorsV1alpha1().InstallPlans(namespace).List(context.Background(), opts)
 			},
-			WatchFunc: func(options v1.ListOptions) (watch.Interface, error) {
+			WatchFunc: func(opts v1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.OperatorsV1alpha1().InstallPlans(namespace).Watch(context.TODO(), options)
+				return client.OperatorsV1alpha1().InstallPlans(namespace).Watch(context.Background(), opts)
 			},
+			ListWithContextFunc: func(ctx context.Context, opts v1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.OperatorsV1alpha1().InstallPlans(namespace).List(ctx, opts)
+			},
+			WatchFuncWithContext: func(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.OperatorsV1alpha1().InstallPlans(namespace).Watch(ctx, opts)
+			},
+		}, client),
+		&pkgoperatorsv1alpha1.InstallPlan{},
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: options.ResyncPeriod,
+			Indexers:     options.Indexers,
+			Identifier:   identifier,
 		},
-		&operatorsv1alpha1.InstallPlan{},
-		resyncPeriod,
-		indexers,
-	)
+	))
 }
 
 func (f *installPlanInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredInstallPlanInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+	return NewTypedInstallPlanInformerWithOptions(client, f.namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, InformerName: f.factory.InformerName(), TweakListOptions: f.tweakListOptions})
 }
 
 func (f *installPlanInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&operatorsv1alpha1.InstallPlan{}, f.defaultInformer)
+	return f.TypedInformer()
 }
 
-func (f *installPlanInformer) Lister() v1alpha1.InstallPlanLister {
-	return v1alpha1.NewInstallPlanLister(f.Informer().GetIndexer())
+func (f *installPlanInformer) TypedInformer() InstallPlanIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1alpha1.InstallPlan](f.factory.InformerFor(&pkgoperatorsv1alpha1.InstallPlan{}, f.defaultInformer))
+}
+
+func (f *installPlanInformer) Lister() operatorsv1alpha1.InstallPlanLister {
+	return operatorsv1alpha1.NewInstallPlanLister(f.Informer().GetIndexer())
+}
+
+// ToTypedInstallPlanInformer converts an untyped informer into a TypedInstallPlanInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *InstallPlan. If that is not the case, calling type-safe methods of the returned
+// TypedInstallPlanInformer leads to runtime panics. A safer alternative is to pass
+// around a TypedInstallPlanInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToTypedInstallPlanInformer(informer InstallPlanInformer) TypedInstallPlanInformer {
+	if informer, ok := informer.(TypedInstallPlanInformer); ok {
+		return informer
+	}
+	return &installPlanTypedInformerAdapter{informer}
+}
+
+type installPlanTypedInformerAdapter struct {
+	InstallPlanInformer
+}
+
+func (a *installPlanTypedInformerAdapter) TypedInformer() InstallPlanIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1alpha1.InstallPlan](a.Informer())
+}
+
+// ToInstallPlanIndexInformer converts an untyped informer into a InstallPlanIndexInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *InstallPlan. If that is not the case, calling type-safe methods of the returned
+// InstallPlanIndexInformer leads to runtime panics. A safer alternative is to pass
+// around a InstallPlanIndexInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToInstallPlanIndexInformer(informer cache.SharedIndexInformer) InstallPlanIndexInformer {
+	if informer, ok := informer.(InstallPlanIndexInformer); ok {
+		return informer
+	}
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1alpha1.InstallPlan](informer)
 }

@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -25,7 +23,7 @@ import (
 // Interface provides access to all the informers in this group version.
 type Interface interface {
 	// PackageManifests returns a PackageManifestInformer.
-	PackageManifests() PackageManifestInformer
+	PackageManifests() TypedPackageManifestInformer
 }
 
 type version struct {
@@ -39,7 +37,7 @@ func New(f internalinterfaces.SharedInformerFactory, namespace string, tweakList
 	return &version{factory: f, namespace: namespace, tweakListOptions: tweakListOptions}
 }
 
-// PackageManifests returns a PackageManifestInformer.
-func (v *version) PackageManifests() PackageManifestInformer {
+// PackageManifests returns a TypedPackageManifestInformer.
+func (v *version) PackageManifests() TypedPackageManifestInformer {
 	return &packageManifestInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }

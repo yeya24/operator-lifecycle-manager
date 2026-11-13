@@ -9,15 +9,15 @@ import (
 	"time"
 
 	"github.com/operator-framework/operator-registry/pkg/client"
-
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/net/proxy"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials/insecure"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type SourceMeta struct {
@@ -147,12 +147,13 @@ func getEnvAny(names ...string) string {
 }
 
 func grpcConnection(address string) (*grpc.ClientConn, error) {
-	dialOptions := []grpc.DialOption{grpc.WithInsecure()}
+	dialOptions := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 	proxyURL, err := grpcProxyURL(address)
 	if err != nil {
 		return nil, err
 	}
 
+	target := address
 	if proxyURL != nil {
 		dialOptions = append(dialOptions, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
 			dialer, err := proxy.FromURL(proxyURL, &net.Dialer{})
@@ -161,9 +162,20 @@ func grpcConnection(address string) (*grpc.ClientConn, error) {
 			}
 			return dialer.Dial("tcp", addr)
 		}))
+
+		// When using a custom dialer (proxy), use the "passthrough" resolver scheme
+		// to bypass client-side name resolution and delegate it to the dialer.
+		// This is required for scenarios like Hypershift where the catalog operator
+		// runs in a management cluster and connects via proxy to catalog pods in a
+		// guest cluster. The service addresses (e.g., "service.namespace.svc:50051")
+		// only exist in the guest cluster and must be resolved by the proxy, not by
+		// the client.
+		//
+		// See: https://github.com/grpc/grpc-go/blob/master/dialoptions.go#L469
+		target = "passthrough:///" + address
 	}
 
-	return grpc.Dial(address, dialOptions...)
+	return grpc.NewClient(target, dialOptions...)
 }
 
 func (s *SourceStore) Add(key registry.CatalogKey, address string) (*SourceConn, error) {
@@ -203,6 +215,11 @@ func (s *SourceStore) stateTimeout(state connectivity.State) time.Duration {
 
 func (s *SourceStore) watch(ctx context.Context, key registry.CatalogKey, source SourceConn) {
 	state := source.ConnectionState
+
+	// Make initial connection
+	source.Conn.Connect()
+
+	// Periodically observe connection state change
 	for {
 		select {
 		case <-ctx.Done():
@@ -227,6 +244,12 @@ func (s *SourceStore) watch(ctx context.Context, key registry.CatalogKey, source
 					s.sourcesLock.Lock()
 					s.sources[key] = *src
 					s.sourcesLock.Unlock()
+
+					// Always try to reconnect. If the connection is already connected, this is a no-op.
+					//
+					// This function is non-blocking. Therefore, when it returns we'll still return IDLE
+					// as the state (we'll see further state changes in subsequent iterations of the loop).
+					source.Conn.Connect()
 
 					// notify subscriber
 					s.notify <- SourceState{Key: key, State: newState}

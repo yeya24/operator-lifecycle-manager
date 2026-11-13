@@ -5,14 +5,16 @@ import (
 	"fmt"
 	"reflect"
 
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	meta "k8s.io/apimachinery/pkg/api/meta"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/clock"
+	corev1applyconfigurations "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/tools/reference"
+	"k8s.io/utils/clock"
 
 	v1 "github.com/operator-framework/api/pkg/operators/v1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
@@ -79,7 +81,7 @@ func (s *UserDefinedServiceAccountSyncer) SyncOperatorGroup(in *v1.OperatorGroup
 	// A service account has been specified, we need to update the status.
 	sa, err := s.client.KubernetesInterface().CoreV1().ServiceAccounts(namespace).Get(context.TODO(), serviceAccountName, metav1.GetOptions{})
 	if err != nil {
-		if k8serrors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			// Set OG's status condition to indicate SA is not found
 			cond := metav1.Condition{
 				Type:    v1.OperatorGroupServiceAccountCondition,
@@ -96,6 +98,14 @@ func (s *UserDefinedServiceAccountSyncer) SyncOperatorGroup(in *v1.OperatorGroup
 		}
 		err = fmt.Errorf("failed to get service account, sa=%s %v", serviceAccountName, err)
 		return
+	}
+
+	// A service account has been specified, but likely does not have the labels we require it to have to ensure it
+	// shows up in our listers, so let's add that and queue again later
+	config := corev1applyconfigurations.ServiceAccount(serviceAccountName, namespace)
+	config.Labels = map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue}
+	if _, err := s.client.KubernetesInterface().CoreV1().ServiceAccounts(namespace).Apply(context.TODO(), config, metav1.ApplyOptions{FieldManager: "operator-lifecycle-manager"}); err != nil {
+		return out, fmt.Errorf("failed to apply labels[%s]=%s to serviceaccount %s/%s: %w", install.OLMManagedLabelKey, install.OLMManagedLabelValue, namespace, serviceAccountName, err)
 	}
 
 	ref, err := reference.GetReference(s.scheme, sa)

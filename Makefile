@@ -1,6 +1,11 @@
-##########################
-#  OLM - Build and Test  #
-##########################
+#####################################################
+#  Operator-Framework - Operator Lifecycle Manager  #
+#####################################################
+
+# Setting SHELL to bash allows bash commands to be executed by recipes.
+# Options are set to exit when a recipe line exits non-zero or a piped command fails.
+SHELL := /usr/bin/env bash -o pipefail
+.SHELLFLAGS := -ec
 
 # Undefine GOFLAGS environment variable.
 ifdef GOFLAGS
@@ -8,284 +13,378 @@ $(warning Undefining GOFLAGS set in CI)
 undefine GOFLAGS
 endif
 
-SHELL := /bin/bash
-ORG := github.com/operator-framework
-PKG   := $(ORG)/operator-lifecycle-manager
-MOD_FLAGS := $(shell (go version | grep -q -E "1\.1[1-9]") && echo -mod=vendor)
-CMDS  := $(shell go list $(MOD_FLAGS) ./cmd/...)
-TCMDS := $(shell go list $(MOD_FLAGS) ./test/e2e/...)
-MOCKGEN := ./scripts/update_mockgen.sh
-CODEGEN := ./scripts/update_codegen.sh
-IMAGE_REPO := quay.io/operator-framework/olm
+# Tools #
+
+# The tools required to build and test the project come from three sources:
+# 1. .bingo/Variables.mk: tools that are orthogonal to OLM, e.g.
+#   - golangci-lint
+#   - helm
+#   - kind
+#   - setup-envtest
+#   - yq
+# 2. go.mod/tools.go: imports testing libraries, modules that need to be vendored and/or have a low tolerance for skew with the main module
+#                     or because they are already imported by the main module but we want to pull down the whole dependency
+#                     to run some cmd or script, or get some resource (e.g. CRD yaml files).
+#   - OLM API CRDs
+#   - Code generation tools, e.g. k8s.io/code-generator
+
+# bingo manages the type 1 tools. If
+#  a) we don't want their dependencies affecting ours, and
+#  b) the tool's version doesn't need to track closely with OLM
+# the tool goes here
+include .bingo/Variables.mk
+
+# go.mod/tools.go manages type 2 tools. If
+# a) we use the library for development, e.g testing, assertion, etc.
+# b) we need some resource (e.g. yaml file)
+# c) need to run a script that is in the library
+# c) need to track tools closely with OLM (e.g. have the same k8s library version)
+# the tools belongs in go.mod. If your normal imports don't pull down everything you need into vendor
+# then add the import to tools.go
+# Note: The code generation tools are either being used in go:generate directives or
+# they are setup in a different script, e.g. ./scripts/update_codegen.sh
+TOOL_EXEC := go run -mod=vendor
+GINKGO := $(TOOL_EXEC) github.com/onsi/ginkgo/v2/ginkgo
+
+# Target environment and Dependencies #
+
+# Cert-manager version - update this for new releases
+CERT_MANAGER_VERSION ?= v1.18.2
+
+# Cert-manager deployment timeout
+CERT_MANAGER_TIMEOUT ?= 120s
+
+# Minor Kubernetes version to build against derived from the client-go dependency version
+KUBE_MINOR ?= $(shell go list -m k8s.io/client-go | cut -d" " -f2 | sed 's/^v0\.\([[:digit:]]\{1,\}\)\.[[:digit:]]\{1,\}$$/1.\1/')
+
+# operator registry version to build against
+OPERATOR_REGISTRY_VERSION ?= $(shell go list -m github.com/operator-framework/operator-registry | cut -d" " -f2 | sed 's/^v//')
+
+# Pin operator registry images to the same version as the operator registry
+export OPERATOR_REGISTRY_TAG ?= v$(OPERATOR_REGISTRY_VERSION)
+export OPERATOR_REGISTRY_IMAGE ?= quay.io/operator-framework/opm:$(OPERATOR_REGISTRY_TAG)
+export CONFIGMAP_SERVER_IMAGE ?= quay.io/operator-framework/configmap-operator-registry:$(OPERATOR_REGISTRY_TAG)
+
+# Artifact settings #
+
+PKG := github.com/operator-framework/operator-lifecycle-manager
+IMAGE_REPO ?= quay.io/operator-framework/olm
 IMAGE_TAG ?= "dev"
-SPECIFIC_UNIT_TEST := $(if $(TEST),-run $(TEST),)
-LOCAL_NAMESPACE := "olm"
-export GO111MODULE=on
-CONTROLLER_GEN := go run $(MOD_FLAGS) ./vendor/sigs.k8s.io/controller-tools/cmd/controller-gen
-YQ_INTERNAL := go run $(MOD_FLAGS) ./vendor/github.com/mikefarah/yq/v3/
-KUBEBUILDER_ASSETS := $(or $(or $(KUBEBUILDER_ASSETS),$(dir $(shell command -v kubebuilder))),/usr/local/kubebuilder/bin)
-export KUBEBUILDER_ASSETS
-GO := GO111MODULE=on GOFLAGS="$(MOD_FLAGS)" go
-GINKGO := $(GO) run github.com/onsi/ginkgo/ginkgo
-BINDATA := $(GO) run github.com/go-bindata/go-bindata/v3/go-bindata
-GIT_COMMIT := $(shell git rev-parse HEAD)
 
-.PHONY: build test run clean vendor schema-check \
-	vendor-update coverage coverage-html e2e \
-	kubebuilder .FORCE
+# Go build settings #
 
-all: test build
+export CGO_ENABLED ?= 0
+export GO111MODULE ?= on
+export GIT_REPO := $(shell go list -m)
+export GIT_COMMIT := $(shell git rev-parse HEAD)
+export VERSION_PATH := ${GIT_REPO}/pkg/version
 
-test: clean cover.out
-
-unit: kubebuilder
-	KUBEBUILDER_ASSETS=$(KUBEBUILDER_ASSETS) go test $(MOD_FLAGS) $(SPECIFIC_UNIT_TEST) -tags "json1" -race -count=1 ./pkg/...
-
-# Ensure kubebuilder is installed before continuing
-KUBEBUILDER_ASSETS_ERR := not detected in $(KUBEBUILDER_ASSETS), to override the assets path set the KUBEBUILDER_ASSETS environment variable, for install instructions see https://book.kubebuilder.io/quick-start.html
-kubebuilder:
-ifeq (, $(wildcard $(KUBEBUILDER_ASSETS)/kubebuilder))
-	$(error kubebuilder $(KUBEBUILDER_ASSETS_ERR))
+ifeq ($(origin VERSION), undefined)
+VERSION := $(shell git describe --tags --always --dirty)
 endif
-ifeq (, $(wildcard $(KUBEBUILDER_ASSETS)/etcd))
-	$(error etcd $(KUBEBUILDER_ASSETS_ERR))
+export VERSION
+
+# GO_BUILD flags are set with = to allow for re-evaluation of the variables
+export GO_BUILD_ASMFLAGS = all=-trimpath=$(PWD)
+export GO_BUILD_GCFLAGS = all=-trimpath=$(PWD)
+export GO_BUILD_FLAGS = -mod=vendor -buildvcs=false
+export GO_BUILD_LDFLAGS = -s -w -X '$(VERSION_PATH).OLMVersion=$(VERSION)' -X '$(VERSION_PATH).GitCommit=$(GIT_COMMIT)' -extldflags "-static"
+export GO_BUILD_TAGS = json1
+
+# GO_TEST flags are set with = to allow for re-evaluation of the variables
+# CGO_ENABLED=1 is required by the go test -race flag
+GO_TEST_FLAGS = -race -count=1 $(if $(TEST),-run '$(TEST)',)
+GO_TEST_ENV = CGO_ENABLED=1
+
+# Test environment configuration #
+
+# By default setup-envtest will write to $XDG_DATA_HOME, or $HOME/.local/share if that is not defined.
+# If $HOME is not set, we need to specify a binary directory to prevent an error in setup-envtest.
+# Useful for some CI/CD environments that set neither $XDG_DATA_HOME nor $HOME.
+SETUP_ENVTEST_BIN_DIR_OVERRIDE=
+ifeq ($(shell [[ $$HOME == "" || $$HOME == "/" ]] && [[ $$XDG_DATA_HOME == "" ]] && echo true ), true)
+	SETUP_ENVTEST_BIN_DIR_OVERRIDE += --bin-dir /tmp/envtest-binaries
 endif
-ifeq (, $(wildcard $(KUBEBUILDER_ASSETS)/kube-apiserver))
-	$(error kube-apiserver $(KUBEBUILDER_ASSETS_ERR))
-endif
 
-schema-check:
+# Unit test against the latest available version for the minor version of kubernetes we are building against e.g. 1.30.x
+ENVTEST_KUBE_VERSION ?= $(KUBE_MINOR).x
+KUBEBUILDER_ASSETS ?= $(shell $(SETUP_ENVTEST) use -p path $(KUBE_MINOR).x)
 
-cover.out: schema-check
-	go test $(MOD_FLAGS) -tags "json1" -v -race -coverprofile=cover.out -covermode=atomic \
-		-coverpkg ./pkg/controller/... ./pkg/...
+KIND_CLUSTER_NAME ?= kind-olmv0
 
-coverage: cover.out
-	go tool cover -func=cover.out
+# Targets #
+# Disable -j flag for make
+.NOTPARALLEL:
 
-coverage-html: cover.out
-	go tool cover -html=cover.out
+.DEFAULT_GOAL := build
 
-build: build_cmd=build
-build: clean $(CMDS)
+#SECTION General
 
-test-bare: BUILD_TAGS=-tags=bare
-test-bare: clean $(TCMDS)
+.PHONY: all
+all: test image #HELP Unit test, and build operator image
 
-test-bin: clean $(TCMDS)
+.PHONY: help
+help: #HELP Display this help message
+	@awk 'BEGIN {FS = ":.*#(EX)?HELP"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*#(EX)?HELP / { printf "  \033[36m%-25s\033[0m %s\n", $$1, $$2 } /^#SECTION / { printf "\n\033[1m%s\033[0m\n", substr($$0, 10) } ' $(MAKEFILE_LIST)
 
-# build versions of the binaries with coverage enabled
-build-coverage: build_cmd=test -c -covermode=count -coverpkg ./pkg/controller/...
-build-coverage: clean $(CMDS)
+#SECTION Build
 
-build-linux: build_cmd=build
-build-linux: arch_flags=GOOS=linux GOARCH=386
-build-linux: clean $(CMDS)
+# Note: We want to use BUILDCMD = because we need it to be re-evaluated every time it is used
+# since different targets might have different go build flags
+BUILD_CMD = go build $(GO_BUILD_FLAGS) -ldflags '$(GO_BUILD_LDFLAGS)' -tags '$(GO_BUILD_TAGS)' -gcflags '$(GO_BUILD_GCFLAGS)' -asmflags '$(GO_BUILD_ASMFLAGS)'
 
-build-wait: clean bin/wait
+CMDS := $(shell go list $(GO_BUILD_FLAGS) ./cmd/...)
+$(CMDS): FORCE
+	@echo "Building $(@)"
+	$(BUILD_CMD) -o ./bin/$(shell basename $@) ./cmd/$(notdir $@)
 
-bin/wait: FORCE
-	GOOS=linux GOARCH=386 go build $(MOD_FLAGS) -o $@ $(PKG)/test/e2e/wait
+.PHONY: build-utils
+build-utils: #HELP Build utility binaries for local OS/ARCH
+	$(BUILD_CMD) -o ./bin/cpb ./util/cpb
 
-build-util-linux: arch_flags=GOOS=linux GOARCH=386
-build-util-linux: build-util
+.PHONY: build #HELP Build binaries for local OS/ARCH
+build: build-utils $(CMDS)
 
-build-util: bin/cpb
+.PHONY: image
+# Set GOOS to linux to build a linux binary for the image
+# Don't set GOARCH because we want the default host architecture - this is important for developers on MacOS
+image: export GOOS = linux
+image: clean build #HELP Build image image for linux on host architecture
+	docker build -t $(IMAGE_REPO):$(IMAGE_TAG) -f Dockerfile bin
 
-bin/cpb: FORCE
-	CGO_ENABLED=0 $(arch_flags) go build $(MOD_FLAGS) -ldflags '-extldflags "-static"' -o $@ ./util/cpb
+.PHONY: e2e-build
+# the e2e and experimental_metrics tags are required to get e2e tests to pass
+# search the code for go:build e2e or go:build experimental_metrics to see where these tags are used
+e2e-build: export GO_BUILD_TAGS += e2e experimental_metrics #HELP Build image for e2e testing
+e2e-build: local-build
 
-$(CMDS): version_flags=-ldflags "-X $(PKG)/pkg/version.GitCommit=$(GIT_COMMIT) -X $(PKG)/pkg/version.OLMVersion=`cat OLM_VERSION`"
-$(CMDS):
-	$(arch_flags) go $(build_cmd) $(MOD_FLAGS) $(version_flags) -tags "json1" -o bin/$(shell basename $@) $@
+.PHONY: local-build
+local-build: IMAGE_TAG = local
+local-build: image
 
-build: clean $(CMDS)
+.PHONY: run-local
+run-local: local-build kind-create deploy
 
-$(TCMDS):
-	go test -c $(BUILD_TAGS) $(MOD_FLAGS) -o bin/$(shell basename $@) $@
+.PHONY: cert-manager-install
+cert-manager-install: #HELP Install cert-manager $(CERT_MANAGER_VERSION)
+	@echo "Installing cert-manager $(CERT_MANAGER_VERSION)"
+	kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/$(CERT_MANAGER_VERSION)/cert-manager.yaml
+	@echo "Waiting for cert-manager to be ready..."
+	kubectl wait --for=condition=Available --namespace=cert-manager deployment/cert-manager --timeout=$(CERT_MANAGER_TIMEOUT)
+	kubectl wait --for=condition=Available --namespace=cert-manager deployment/cert-manager-cainjector --timeout=$(CERT_MANAGER_TIMEOUT)
+	kubectl wait --for=condition=Available --namespace=cert-manager deployment/cert-manager-webhook --timeout=$(CERT_MANAGER_TIMEOUT)
+	@echo "Waiting for cert-manager webhook to be ready..."
+	kubectl wait --for=condition=Ready --namespace=cert-manager pod -l app=webhook --timeout=$(CERT_MANAGER_TIMEOUT)
+	@echo "Waiting for cert-manager CRDs to be available..."
+	kubectl wait --for condition=established --timeout=$(CERT_MANAGER_TIMEOUT) crd/certificates.cert-manager.io
+	kubectl wait --for condition=established --timeout=$(CERT_MANAGER_TIMEOUT) crd/issuers.cert-manager.io
+	@echo "cert-manager $(CERT_MANAGER_VERSION) installed successfully"
 
-deploy-local:
-	mkdir -p build/resources
-	. ./scripts/package_release.sh 1.0.0 build/resources doc/install/local-values.yaml
-	. ./scripts/install_local.sh $(LOCAL_NAMESPACE) build/resources
-	rm -rf build
+.PHONY: cert-manager-uninstall
+cert-manager-uninstall: #HELP Uninstall cert-manager
+	@echo "Uninstalling cert-manager..."
+	kubectl delete -f https://github.com/cert-manager/cert-manager/releases/download/$(CERT_MANAGER_VERSION)/cert-manager.yaml --ignore-not-found=true
+	@echo "cert-manager uninstalled"
 
-e2e.namespace:
-	@printf "e2e-tests-$(shell date +%s)-$$RANDOM" > e2e.namespace
 
-# useful if running e2e directly with `go test -tags=bare`
-setup-bare: clean e2e.namespace
-	. ./scripts/build_bare.sh
-	. ./scripts/package_release.sh 1.0.0 test/e2e/resources test/e2e/e2e-bare-values.yaml
-	. ./scripts/install_bare.sh $(shell cat ./e2e.namespace) test/e2e/resources
+.PHONY: clean
+clean: #HELP Clean up build artifacts
+	@rm -rf cover.out
+	@rm -rf bin
 
-GINKGO_OPTS := -flakeAttempts 3 -randomizeAllSpecs -v --timeout 120m
+#SECTION Development
 
-# TODO(tflannag): Remove this target entirely and move downstream
-e2e:
-	$(GINKGO) \
-        ./test/e2e \
-        $(GINKGO_OPTS) \
-        $< -- \
-        -namespace=openshift-operators \
-        -kubeconfig=${KUBECONFIG} \
-        -olmNamespace=openshift-operator-lifecycle-manager \
-        -dummyImage=bitnami/nginx:latest
+.PHONY: lint
+lint: $(GOLANGCI_LINT) #HELP Run linters
+	$(GOLANGCI_LINT) run $(GOLANGCI_LINT_ARGS)
 
-### Start: End To End Tests ###
+.PHONY: vet
+vet: #HELP Run go vet
+	go vet $(GO_BUILD_FLAGS) ./...
 
-# Phony prerequisite for targets that rely on the go build cache to determine staleness.
-.PHONY: FORCE
-FORCE:
+.PHONY: fmt
+fmt: #HELP Run go fmt
+	go fmt ./...
 
-# main entry point for running end to end tests. used by .github/workflows/e2e-tests.yml See test/e2e/README.md for details
-.PHONY: e2e-local
-e2e-local: bin/e2e-local.test test/e2e-local.image.tar
-	$(GINKGO) -nodes $(or $(NODES),1) -flakeAttempts 3 -randomizeAllSpecs $(if $(TEST),-focus '$(TEST)') -v -timeout 90m $< -- -namespace=operators -olmNamespace=operator-lifecycle-manager -dummyImage=bitnami/nginx:latest -kind.images=../test/e2e-local.image.tar
-
-# this target updates the zz_chart.go file with files found in deploy/chart
-# this will always fire since it has been marked as phony
-.PHONY: test/e2e/assets/chart/zz_chart.go
-test/e2e/assets/chart/zz_chart.go: $(shell find deploy/chart -type f)
-	$(BINDATA) -o $@ -pkg chart -prefix deploy/chart/ $^
-
-# execute kind and helm end to end tests
-bin/e2e-local.test: FORCE test/e2e/assets/chart/zz_chart.go
-	$(GO) test -c -tags kind,helm -o $@ ./test/e2e
-
-# set go env and other vars, ensure that the dockerfile exists, and then build wait, cpb, and other command binaries and finally the kind image archive
-test/e2e-local.image.tar: export GOOS=linux
-test/e2e-local.image.tar: export GOARCH=386
-test/e2e-local.image.tar: build_cmd=build
-test/e2e-local.image.tar: e2e.Dockerfile bin/wait bin/cpb $(CMDS)
-	docker build -t quay.io/operator-framework/olm:local -f $< bin
-	docker save -o $@ quay.io/operator-framework/olm:local
-
-### Finish: End To End Tests ###
-
-e2e-bare: setup-bare
-	. ./scripts/run_e2e_bare.sh $(TEST)
-
-e2e-local-docker:
-	. ./scripts/build_local.sh
-	. ./scripts/run_e2e_docker.sh $(TEST)
-
-vendor:
+vendor: #HELP Update vendored dependencies
 	go mod tidy
 	go mod vendor
 
-container:
-	docker build -t $(IMAGE_REPO):$(IMAGE_TAG) .
+.PHONY: bingo-upgrade
+bingo-upgrade: $(BINGO) #EXHELP Upgrade tools
+	@for pkg in $$($(BINGO) list | awk '{ print $$3 }' | tail -n +3 | sed 's/@.*//'); do \
+		echo -e "Upgrading \033[35m$$pkg\033[0m to latest..."; \
+		$(BINGO) get "$$pkg@latest"; \
+	done
 
-clean-e2e:
-	kubectl delete crds --all
-	kubectl delete apiservices.apiregistration.k8s.io v1.packages.operators.coreos.com || true
-	kubectl delete -f test/e2e/resources/0000_50_olm_00-namespace.yaml
+#SECTION Testing
 
-clean:
-	@rm -rf cover.out
-	@rm -rf bin
-	@rm -rf test/e2e/resources
-	@rm -rf test/e2e/test-resources
-	@rm -rf test/e2e/log
-	@rm -rf e2e.namespace
+# Note: We want to use TESTCMD = because we need it to be re-evaluated every time it is used
+# since different targets might have different settings
+UNIT_TEST_CMD = $(GO_TEST_ENV) go test $(GO_BUILD_FLAGS) -tags '$(GO_BUILD_TAGS)' $(GO_TEST_FLAGS)
 
-lint:
-	find . -name '*.go' -not -path "./vendor/*" -not -path "./pkg/lib/operatorclient/operatorclientmocks/*" | xargs gofmt -w
-	find . -name '*.go' -not -path "./vendor/*" -not -path "./pkg/lib/operatorclient/operatorclientmocks/*" | xargs goimports -w
+.PHONE: test
+test: clean unit test-split #HELP Run all tests
 
-# Copy CRD manifests
-manifests: vendor
+.PHONY: unit
+unit: GO_TEST_ENV += KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)"
+unit: $(SETUP_ENVTEST) #HELP Run OLM unit tests with setup-envtest for kubernetes $(KUBE_MINOR).x
+	$(UNIT_TEST_CMD) ./pkg/controller/... ./pkg/...
+
+.PHONY: test-split
+test-split: #HELP Run e2e test split utility unit tests
+	# Test the e2e test split utility
+	$(UNIT_TEST_CMD) ./test/e2e/split/...
+
+.PHONY: coverage
+coverage: GO_TEST_FLAGS += -coverprofile=cover.out -covermode=atomic -coverpkg
+coverage: unit #HELP Run OLM unit tests with coverage
+	go tool cover -func=cover.out
+
+#SECTION Deployment
+
+.PHONY: kind-clean
+kind-clean: $(KIND) #HELP Delete kind cluster $KIND_CLUSTER_NAME (default: kind-olmv0)
+	$(KIND) delete cluster --name $(KIND_CLUSTER_NAME) || true
+
+.PHONY: kind-create
+kind-create: kind-clean #HELP Create a new kind cluster $KIND_CLUSTER_NAME (default: kind-olmv0)
+	env K8S_VERSION=v$(KUBE_MINOR) KIND=$(KIND) GOBIN=$(GOBIN) hack/tools/validate_kindest_node.sh
+	$(KIND) create cluster --name $(KIND_CLUSTER_NAME) $(KIND_CREATE_OPTS)
+	$(KIND) export kubeconfig --name $(KIND_CLUSTER_NAME)
+
+.PHONY: deploy
+OLM_IMAGE := quay.io/operator-framework/olm:local
+deploy: $(KIND) $(HELM) #HELP Deploy OLM to kind cluster $KIND_CLUSTER_NAME (default: kind-olmv0) using $OLM_IMAGE (default: quay.io/operator-framework/olm:local)
+	$(KIND) load docker-image $(OLM_IMAGE) --name $(KIND_CLUSTER_NAME); \
+	$(HELM) upgrade --install olm deploy/chart \
+		--set debug=true \
+		--set olm.image.ref=$(OLM_IMAGE) \
+		--set olm.image.pullPolicy=IfNotPresent \
+		--set catalog.image.ref=$(OLM_IMAGE) \
+		--set catalog.image.pullPolicy=IfNotPresent \
+		--set catalog.commandArgs=--configmapServerImage=$(CONFIGMAP_SERVER_IMAGE) \
+		--set catalog.opmImageArgs=--opmImage=$(OPERATOR_REGISTRY_IMAGE) \
+		--set package.image.ref=$(OLM_IMAGE) \
+		--set package.image.pullPolicy=IfNotPresent \
+		$(HELM_INSTALL_OPTS) \
+		--wait;
+
+.PHONY: undeploy
+undeploy: $(KIND) $(HELM) #HELP Uninstall OLM from kind cluster $KIND_CLUSTER_NAME (default: kind-olmv0)
+	$(KIND) export kubeconfig --name $(KIND_CLUSTER_NAME)
+
+	# Uninstall Helm chart and remove CRDs
+	kubectl delete --all-namespaces --all sub
+	kubectl delete --all-namespaces --all ip
+	kubectl delete --all-namespaces --all csv
+	kubectl delete --all-namespaces --all catsrc
+	$(HELM) uninstall olm
+	kubectl delete -f deploy/chart/crds
+
+#SECTION e2e
+
+# E2E test configuration
+# Can be overridden when running make e2e, e.g. E2E_TIMEOUT=60m make e2e/e2e-local
+E2E_TIMEOUT ?= 90m
+E2E_TEST_NS ?= operators
+E2E_INSTALL_NS ?= operator-lifecycle-manager
+E2E_CATALOG_NS ?= $(E2E_INSTALL_NS)
+GINKGO_OPTS += -v -randomize-suites -race -trace $(if $(E2E_FLAKE_ATTEMPTS),--flake-attempts='$(E2E_FLAKE_ATTEMPTS)') $(if $(E2E_SEED),-seed '$(E2E_SEED)') $(if $(TEST),-focus '$(TEST)',) $(if $(SKIP), -skip '$(SKIP)')
+
+.PHONY: e2e
+e2e: #HELP Run e2e tests against a cluster running OLM (params: $E2E_TEST_NS (operator), $E2E_INSTALL_NS (operator-lifecycle-manager), $E2E_CATALOG_NS (operator-lifecycle-manager), $E2E_TIMEOUT (90m), $E2E_FLAKE_ATTEMPTS (1), $TEST(undefined))
+	$(GO_TEST_ENV) $(GINKGO) -timeout $(E2E_TIMEOUT) $(GINKGO_OPTS) $(E2E_GINKGO_OPTS) ./test/e2e -- -namespace=$(E2E_TEST_NS) -olmNamespace=$(E2E_INSTALL_NS) -catalogNamespace=$(E2E_CATALOG_NS) $(E2E_OPTS)
+
+.PHONY: e2e-local
+e2e-local: e2e-build kind-create cert-manager-install e2e-local-deploy e2e
+
+.PHONY: e2e-local-deploy
+e2e-local-deploy: $(KIND) $(HELM) #HELP Deploy OLM for e2e testing
+	$(KIND) load docker-image $(OLM_IMAGE) --name $(KIND_CLUSTER_NAME); \
+	$(HELM) upgrade --install olm deploy/chart \
+		--set debug=true \
+		--set certManager.enabled=true \
+		--set olm.image.ref=$(OLM_IMAGE) \
+		--set olm.image.pullPolicy=IfNotPresent \
+		--set catalog.image.ref=$(OLM_IMAGE) \
+		--set catalog.image.pullPolicy=IfNotPresent \
+		--set catalog.commandArgs=--configmapServerImage=$(CONFIGMAP_SERVER_IMAGE) \
+		--set catalog.opmImageArgs=--opmImage=$(OPERATOR_REGISTRY_IMAGE) \
+		--set package.image.ref=$(OLM_IMAGE) \
+		--set package.image.pullPolicy=IfNotPresent \
+		$(HELM_INSTALL_OPTS) \
+		--wait;
+
+#SECTION Code Generation
+
+.PHONY: gen-all #HELP Update OLM API, generate code and mocks
+gen-all: manifests openshift-test-crds codegen mockgen
+
+.PHONY: manifests
+manifests: vendor #HELP Copy OLM API CRD manifests to deploy/chart/crds
 	./scripts/copy_crds.sh
 
-# Generate deepcopy, conversion, clients, listers, and informers
-codegen:
-	# Clients, listers, and informers
-	$(CODEGEN)
+.PHONY: openshift-test-crds
+openshift-test-crds: #HELP Generate OpenShift CRDs for openshift controller unit tests (ClusterOperator, ClusterVersion)
+	./scripts/generate_openshift_crds.sh
 
-# Generate mock types.
-mockgen:
-	$(MOCKGEN)
+.PHONY: codegen
+codegen: #HELP Generate clients, deepcopy, listers, and informers
+	./scripts/update_codegen.sh
 
-# Generates everything.
-gen-all: codegen mockgen manifests
+.PHONY: mockgen
+mockgen: #HELP Generate mocks
+	# Generate mocks and silence the following warning:
+	# WARNING: Invoking counterfeiter multiple times from "go generate" is slow.
+	# Consider using counterfeiter:generate directives to speed things up.
+	# See https://github.com/maxbrunsfeld/counterfeiter#step-2b---add-counterfeitergenerate-directives for more information.
+	# Set the "COUNTERFEITER_NO_GENERATE_WARNING" environment variable to suppress this message.
+	GO111MODULE=on GOWORK=off COUNTERFEITER_NO_GENERATE_WARNING=1 go generate ./pkg/...
 
+#SECTION Verification
+
+.PHONY: diff
 diff:
 	git diff --exit-code
 
-verify-codegen: codegen
+.PHONY: verify-codegen
+verify-codegen: codegen #HELP Check client, deepcopy, listers, and informers are up to date
 	$(MAKE) diff
 
-verify-mockgen: mockgen
+.PHONY: verify-mockgen
+verify-mockgen: mockgen #HELP Check mocks are up to date
 	$(MAKE) diff
 
-verify-manifests: manifests
+.PHONY: verify-manifests
+verify-manifests: manifests #HELP Check CRD manifests are up to date
 	$(MAKE) diff
 
-verify: verify-codegen verify-mockgen verify-manifests
-
-# before running release, bump the version in OLM_VERSION and push to master,
-# then tag those builds in quay with the version in OLM_VERSION
-release: ver=v$(shell cat OLM_VERSION)
-release: manifests
-	@echo "Generating the $(ver) release"
-	docker pull $(IMAGE_REPO):$(ver)
-	$(MAKE) target=upstream ver=$(ver) quickstart=true package
-
-verify-release: release
+.PHONY: verify
+verify: vendor verify-codegen verify-mockgen verify-manifests #HELP Run all verification checks
 	$(MAKE) diff
 
-package: olmref=$(shell docker inspect --format='{{index .RepoDigests 0}}' $(IMAGE_REPO):$(ver))
+#SECTION Release
+
+.PHONY: package
+package: $(YQ) $(HELM) #HELP Package OLM for release
 package:
-ifndef target
-	$(error target is undefined)
+ifndef TARGET
+	$(error TARGET is undefined)
 endif
-ifndef ver
-	$(error ver is undefined)
+ifndef RELEASE_VERSION
+	$(error RELEASE_VERSION is undefined)
 endif
-	$(YQ_INTERNAL) w -i deploy/$(target)/values.yaml olm.image.ref $(olmref)
-	$(YQ_INTERNAL) w -i deploy/$(target)/values.yaml catalog.image.ref $(olmref)
-	$(YQ_INTERNAL) w -i deploy/$(target)/values.yaml package.image.ref $(olmref)
-	./scripts/package_release.sh $(ver) deploy/$(target)/manifests/$(ver) deploy/$(target)/values.yaml
-	ln -sfFn ./$(ver) deploy/$(target)/manifests/latest
-ifeq ($(quickstart), true)
-	./scripts/package_quickstart.sh deploy/$(target)/manifests/$(ver) deploy/$(target)/quickstart/olm.yaml deploy/$(target)/quickstart/crds.yaml deploy/$(target)/quickstart/install.sh
+	./scripts/package_release.sh $(RELEASE_VERSION) deploy/$(TARGET)/manifests/$(RELEASE_VERSION) deploy/$(TARGET)/values.yaml
+	ln -sfFn ./$(RELEASE_VERSION) deploy/$(TARGET)/manifests/latest
+ifeq ($(PACKAGE_QUICKSTART), true)
+	./scripts/package_quickstart.sh deploy/$(TARGET)/manifests/$(RELEASE_VERSION) deploy/$(TARGET)/quickstart/olm.yaml deploy/$(TARGET)/quickstart/crds.yaml deploy/$(TARGET)/quickstart/install.sh
 endif
 
-################################
-#  OLM - Install/Uninstall/Run #
-################################
+.PHONY: release
+release: manifests
+	@echo "Generating the $(RELEASE_VERSION) release"
+	$(MAKE) TARGET=upstream RELEASE_VERSION=$(RELEASE_VERSION) PACKAGE_QUICKSTART=true package
 
-.PHONY: run-console-local
-run-console-local:
-	@echo Running script to run the OLM console locally:
-	. ./scripts/run_console_local.sh
-
-.PHONY: uninstall
-uninstall:
-	@echo Uninstalling OLM:
-	- kubectl delete -f deploy/upstream/quickstart/crds.yaml
-	- kubectl delete -f deploy/upstream/quickstart/olm.yaml
-	- kubectl delete catalogsources.operators.coreos.com
-	- kubectl delete clusterserviceversions.operators.coreos.com
-	- kubectl delete installplans.operators.coreos.com
-	- kubectl delete operatorgroups.operators.coreos.com subscriptions.operators.coreos.com
-	- kubectl delete apiservices.apiregistration.k8s.io v1.packages.operators.coreos.com
-	- kubectl delete ns olm
-	- kubectl delete ns openshift-operator-lifecycle-manager
-	- kubectl delete ns openshift-operators
-	- kubectl delete ns operators
-	- kubectl delete clusterrole.rbac.authorization.k8s.io/aggregate-olm-edit
-	- kubectl delete clusterrole.rbac.authorization.k8s.io/aggregate-olm-view
-	- kubectl delete clusterrole.rbac.authorization.k8s.io/system:controller:operator-lifecycle-manager
-	- kubectl delete clusterroles.rbac.authorization.k8s.io "system:controller:operator-lifecycle-manager"
-	- kubectl delete clusterrolebindings.rbac.authorization.k8s.io "olm-operator-binding-openshift-operator-lifecycle-manager"
-
-.PHONY: run-local
-run-local: build-linux build-wait build-util-linux
-	rm -rf build
-	. ./scripts/build_local.sh
-	mkdir -p build/resources
-	. ./scripts/package_release.sh 1.0.0 build/resources doc/install/local-values.yaml
-	. ./scripts/install_local.sh $(LOCAL_NAMESPACE) build/resources
-	rm -rf build
+.PHONY: FORCE
+FORCE:

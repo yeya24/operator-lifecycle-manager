@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -19,25 +17,54 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"context"
+	context "context"
 	time "time"
 
-	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+	pkgoperatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	versioned "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
 	internalinterfaces "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/informers/externalversions/internalinterfaces"
-	v1alpha1 "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1alpha1"
+	operatorsv1alpha1 "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1alpha1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
 )
 
 // CatalogSourceInformer provides access to a shared informer and lister for
-// CatalogSources.
+// CatalogSources. Prefer using the type-safe variant (see [TypedCatalogSourceInformer]).
 type CatalogSourceInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1alpha1.CatalogSourceLister
+	Lister() operatorsv1alpha1.CatalogSourceLister
 }
+
+// TypedCatalogSourceInformer provides access to a shared informer and lister for
+// CatalogSources, including the type-safe TypedInformer variant.
+// It is a superset of CatalogSourceInformer.
+type TypedCatalogSourceInformer interface {
+	Informer() cache.SharedIndexInformer
+	TypedInformer() CatalogSourceIndexInformer
+	Lister() operatorsv1alpha1.CatalogSourceLister
+}
+
+// CatalogSourceIndexInformer is a wrapper around the underlying [cache.SharedIndexInformer]
+// with type-safe variants of several methods.
+type CatalogSourceIndexInformer cache.TypedSharedIndexInformer[*pkgoperatorsv1alpha1.CatalogSource]
+
+// CatalogSourceHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerFuncs] for CatalogSource.
+type CatalogSourceHandlerFuncs = cache.TypedResourceEventHandlerFuncs[*pkgoperatorsv1alpha1.CatalogSource]
+
+// CatalogSourceDetailedHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerDetailedFuncs] for CatalogSource.
+type CatalogSourceDetailedHandlerFuncs = cache.TypedResourceEventHandlerDetailedFuncs[*pkgoperatorsv1alpha1.CatalogSource]
+
+// CatalogSourceFilteringHandler is a specialization of [cache.TypedFilteringResourceEventHandler] for CatalogSource.
+type CatalogSourceFilteringHandler = cache.TypedFilteringResourceEventHandler[*pkgoperatorsv1alpha1.CatalogSource]
+
+// CatalogSourceIndexers is a specialization of [cache.TypedIndexers] for CatalogSource.
+type CatalogSourceIndexers = cache.TypedIndexers[*pkgoperatorsv1alpha1.CatalogSource]
+
+// DeletedCatalogSource is a specialization of [cache.DeletedObject] for CatalogSource.
+type DeletedCatalogSource = cache.DeletedObject[*pkgoperatorsv1alpha1.CatalogSource]
 
 type catalogSourceInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
@@ -48,43 +75,132 @@ type catalogSourceInformer struct {
 // NewCatalogSourceInformer constructs a new informer for CatalogSource type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCatalogSourceInformer]).
 func NewCatalogSourceInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredCatalogSourceInformer(client, namespace, resyncPeriod, indexers, nil)
+	return NewCatalogSourceInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers})
+}
+
+// NewTypedCatalogSourceInformer constructs a new informer for CatalogSource type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCatalogSourceInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CatalogSourceIndexers) CatalogSourceIndexInformer {
+	return NewTypedCatalogSourceInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers)})
 }
 
 // NewFilteredCatalogSourceInformer constructs a new informer for CatalogSource type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedFilteredCatalogSourceInformer]).
 func NewFilteredCatalogSourceInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
-	return cache.NewSharedIndexInformer(
-		&cache.ListWatch{
-			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
+	return NewTypedCatalogSourceInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers, TweakListOptions: tweakListOptions})
+}
+
+// NewTypedFilteredCatalogSourceInformer constructs a new informer for CatalogSource type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedFilteredCatalogSourceInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CatalogSourceIndexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) CatalogSourceIndexInformer {
+	return NewTypedCatalogSourceInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers), TweakListOptions: tweakListOptions})
+}
+
+// NewCatalogSourceInformerWithOptions constructs a new informer for CatalogSource type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCatalogSourceInformerWithOptions]).
+func NewCatalogSourceInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) cache.SharedIndexInformer {
+	return NewTypedCatalogSourceInformerWithOptions(client, namespace, options)
+}
+
+// NewTypedCatalogSourceInformerWithOptions constructs a new informer for CatalogSource type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCatalogSourceInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) CatalogSourceIndexInformer {
+	gvr := schema.GroupVersionResource{Group: "operators.coreos.com", Version: "v1alpha1", Resource: "catalogsources"}
+	identifier := options.InformerName.WithResource(gvr)
+	tweakListOptions := options.TweakListOptions
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1alpha1.CatalogSource](cache.NewSharedIndexInformerWithOptions(
+		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
+			ListFunc: func(opts v1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.OperatorsV1alpha1().CatalogSources(namespace).List(context.TODO(), options)
+				return client.OperatorsV1alpha1().CatalogSources(namespace).List(context.Background(), opts)
 			},
-			WatchFunc: func(options v1.ListOptions) (watch.Interface, error) {
+			WatchFunc: func(opts v1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.OperatorsV1alpha1().CatalogSources(namespace).Watch(context.TODO(), options)
+				return client.OperatorsV1alpha1().CatalogSources(namespace).Watch(context.Background(), opts)
 			},
+			ListWithContextFunc: func(ctx context.Context, opts v1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.OperatorsV1alpha1().CatalogSources(namespace).List(ctx, opts)
+			},
+			WatchFuncWithContext: func(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.OperatorsV1alpha1().CatalogSources(namespace).Watch(ctx, opts)
+			},
+		}, client),
+		&pkgoperatorsv1alpha1.CatalogSource{},
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: options.ResyncPeriod,
+			Indexers:     options.Indexers,
+			Identifier:   identifier,
 		},
-		&operatorsv1alpha1.CatalogSource{},
-		resyncPeriod,
-		indexers,
-	)
+	))
 }
 
 func (f *catalogSourceInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredCatalogSourceInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+	return NewTypedCatalogSourceInformerWithOptions(client, f.namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, InformerName: f.factory.InformerName(), TweakListOptions: f.tweakListOptions})
 }
 
 func (f *catalogSourceInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&operatorsv1alpha1.CatalogSource{}, f.defaultInformer)
+	return f.TypedInformer()
 }
 
-func (f *catalogSourceInformer) Lister() v1alpha1.CatalogSourceLister {
-	return v1alpha1.NewCatalogSourceLister(f.Informer().GetIndexer())
+func (f *catalogSourceInformer) TypedInformer() CatalogSourceIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1alpha1.CatalogSource](f.factory.InformerFor(&pkgoperatorsv1alpha1.CatalogSource{}, f.defaultInformer))
+}
+
+func (f *catalogSourceInformer) Lister() operatorsv1alpha1.CatalogSourceLister {
+	return operatorsv1alpha1.NewCatalogSourceLister(f.Informer().GetIndexer())
+}
+
+// ToTypedCatalogSourceInformer converts an untyped informer into a TypedCatalogSourceInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CatalogSource. If that is not the case, calling type-safe methods of the returned
+// TypedCatalogSourceInformer leads to runtime panics. A safer alternative is to pass
+// around a TypedCatalogSourceInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToTypedCatalogSourceInformer(informer CatalogSourceInformer) TypedCatalogSourceInformer {
+	if informer, ok := informer.(TypedCatalogSourceInformer); ok {
+		return informer
+	}
+	return &catalogSourceTypedInformerAdapter{informer}
+}
+
+type catalogSourceTypedInformerAdapter struct {
+	CatalogSourceInformer
+}
+
+func (a *catalogSourceTypedInformerAdapter) TypedInformer() CatalogSourceIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1alpha1.CatalogSource](a.Informer())
+}
+
+// ToCatalogSourceIndexInformer converts an untyped informer into a CatalogSourceIndexInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CatalogSource. If that is not the case, calling type-safe methods of the returned
+// CatalogSourceIndexInformer leads to runtime panics. A safer alternative is to pass
+// around a CatalogSourceIndexInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToCatalogSourceIndexInformer(informer cache.SharedIndexInformer) CatalogSourceIndexInformer {
+	if informer, ok := informer.(CatalogSourceIndexInformer); ok {
+		return informer
+	}
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1alpha1.CatalogSource](informer)
 }

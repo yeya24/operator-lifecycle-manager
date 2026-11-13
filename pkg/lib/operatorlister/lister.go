@@ -1,10 +1,11 @@
 package operatorlister
 
 import (
-	aextv1 "k8s.io/apiextensions-apiserver/pkg/client/listers/apiextensions/v1"
 	appsv1 "k8s.io/client-go/listers/apps/v1"
 	corev1 "k8s.io/client-go/listers/core/v1"
+	networkingv1 "k8s.io/client-go/listers/networking/v1"
 	rbacv1 "k8s.io/client-go/listers/rbac/v1"
+	"k8s.io/client-go/metadata/metadatalister"
 	aregv1 "k8s.io/kube-aggregator/pkg/client/listers/apiregistration/v1"
 
 	v1 "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1"
@@ -24,15 +25,17 @@ import (
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 -o ../../fakes/client-go/listers/fake_rbac_v1_rolebinding_namespace_lister.go k8s.io/client-go/listers/rbac/v1.RoleBindingNamespaceLister
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 -o ../../fakes/client-go/listers/fake_rbac_v1_clusterrolebinding_lister.go k8s.io/client-go/listers/rbac/v1.ClusterRoleBindingLister
 
-//go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 -o ./operatorlisterfakes/fake_clusterserviceversion_v1alpha1_lister.go ../../api/client/listers/operators/v1alpha1.ClusterServiceVersionLister
-//go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 -o ./operatorlisterfakes/fake_clusterserviceversion_v1alpha1_namespace_lister.go ../../api/client/listers/operators/v1alpha1.ClusterServiceVersionNamespaceLister
+//go:generate ../../../hack/scripts/run-counterfeiter.sh ./operatorlisterfakes/fake_clusterserviceversion_v1alpha1_lister.go ../../api/client/listers/operators/v1alpha1 ClusterServiceVersionLister
+//go:generate ../../../hack/scripts/run-counterfeiter.sh ./operatorlisterfakes/fake_clusterserviceversion_v1alpha1_namespace_lister.go ../../api/client/listers/operators/v1alpha1 ClusterServiceVersionNamespaceLister
 
 // OperatorLister is a union of versioned informer listers
+//
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 . OperatorLister
 type OperatorLister interface {
 	AppsV1() AppsV1Lister
 	CoreV1() CoreV1Lister
 	RbacV1() RbacV1Lister
+	NetworkingV1() NetworkingV1Lister
 	APIRegistrationV1() APIRegistrationV1Lister
 	APIExtensionsV1() APIExtensionsV1Lister
 
@@ -78,6 +81,13 @@ type RbacV1Lister interface {
 	RoleBindingLister() rbacv1.RoleBindingLister
 }
 
+//go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 . RbacV1Lister
+type NetworkingV1Lister interface {
+	RegisterNetworkPolicyLister(namespace string, lister networkingv1.NetworkPolicyLister)
+
+	NetworkPolicyLister() networkingv1.NetworkPolicyLister
+}
+
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 . APIRegistrationV1Lister
 type APIRegistrationV1Lister interface {
 	RegisterAPIServiceLister(lister aregv1.APIServiceLister)
@@ -87,8 +97,8 @@ type APIRegistrationV1Lister interface {
 
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 . APIExtensionsV1Lister
 type APIExtensionsV1Lister interface {
-	RegisterCustomResourceDefinitionLister(lister aextv1.CustomResourceDefinitionLister)
-	CustomResourceDefinitionLister() aextv1.CustomResourceDefinitionLister
+	RegisterCustomResourceDefinitionLister(lister metadatalister.Lister)
+	CustomResourceDefinitionLister() metadatalister.Lister
 }
 
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 . OperatorsV1alpha1Lister
@@ -164,6 +174,16 @@ func newRbacV1Lister() *rbacV1Lister {
 	}
 }
 
+type networkingV1Lister struct {
+	networkPolicyLister *UnionNetworkPolicyLister
+}
+
+func newNetworkingV1Lister() *networkingV1Lister {
+	return &networkingV1Lister{
+		networkPolicyLister: &UnionNetworkPolicyLister{},
+	}
+}
+
 type apiRegistrationV1Lister struct {
 	apiServiceLister *UnionAPIServiceLister
 }
@@ -227,6 +247,7 @@ type lister struct {
 	appsV1Lister            *appsV1Lister
 	coreV1Lister            *coreV1Lister
 	rbacV1Lister            *rbacV1Lister
+	networkingv1Lister      *networkingV1Lister
 	apiRegistrationV1Lister *apiRegistrationV1Lister
 	apiExtensionsV1Lister   *apiExtensionsV1Lister
 	operatorsV1alpha1Lister *operatorsV1alpha1Lister
@@ -244,6 +265,10 @@ func (l *lister) CoreV1() CoreV1Lister {
 
 func (l *lister) RbacV1() RbacV1Lister {
 	return l.rbacV1Lister
+}
+
+func (l *lister) NetworkingV1() NetworkingV1Lister {
+	return l.networkingv1Lister
 }
 
 func (l *lister) APIRegistrationV1() APIRegistrationV1Lister {
@@ -272,6 +297,7 @@ func NewLister() OperatorLister {
 		appsV1Lister:            newAppsV1Lister(),
 		coreV1Lister:            newCoreV1Lister(),
 		rbacV1Lister:            newRbacV1Lister(),
+		networkingv1Lister:      newNetworkingV1Lister(),
 		apiRegistrationV1Lister: newAPIRegistrationV1Lister(),
 		apiExtensionsV1Lister:   newAPIExtensionsV1Lister(),
 		operatorsV1alpha1Lister: newOperatorsV1alpha1Lister(),

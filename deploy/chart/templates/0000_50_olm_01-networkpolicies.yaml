@@ -1,0 +1,132 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all-traffic
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector: { }
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: olm-operator
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: olm-operator
+  ingress:
+    - {{ .Values.networkPolicy.metrics | toYaml | nindent 6 | trimSuffix "\n" }}
+  egress:
+    - {{ .Values.networkPolicy.kubeAPIServer | toYaml | nindent 6 | trimSuffix "\n" }}
+    - {{ .Values.networkPolicy.dns | toYaml | nindent 6 | trimSuffix "\n" }}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: catalog-operator
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: catalog-operator
+  ingress:
+    - {{ .Values.networkPolicy.metrics | toYaml | nindent 6 | trimSuffix "\n" }}
+  egress:
+    - {{ .Values.networkPolicy.kubeAPIServer | toYaml | nindent 6 | trimSuffix "\n" }}
+    - {{ .Values.networkPolicy.dns | toYaml | nindent 6 | trimSuffix "\n" }}
+    - ports:
+      - protocol: TCP
+        port: {{ .Values.catalogGrpcPodPort }}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: packageserver
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: packageserver
+  ingress:
+    - ports:
+      - protocol: TCP
+        port: {{ .Values.package.service.internalPort }}
+  egress:
+    - {{ .Values.networkPolicy.kubeAPIServer | toYaml | nindent 6 | trimSuffix "\n" }}
+    - {{ .Values.networkPolicy.dns | toYaml | nindent 6 | trimSuffix "\n" }}
+    - ports:
+      - protocol: TCP
+        port: {{ .Values.catalogGrpcPodPort }}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-allow-all
+  namespace: {{ .Values.operator_namespace }}
+spec:
+  podSelector: { }
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - { }
+  egress:
+    - { }
+---
+# Complements per-CatalogSource NPs from the controller; covers the bootstrapping window before reconciliation.
+# Effective only when catalog_namespace == namespace (the default). When they differ, no OLM-managed
+# deny-all exists in catalog_namespace, so this rule has no effect; adding one there is unsafe since
+# OLM does not exclusively own that namespace.
+# No 'from:' restriction is intentional, matching current dynamic NP behavior. If the controller ever
+# restricts ingress sources, this Helm-owned NP (which the controller cannot delete) will silently
+# override that — treat as a permanent design constraint.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: olm-catalog-grpc-ingress
+  namespace: {{ .Values.catalog_namespace }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: olm.catalogSource
+        operator: Exists
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+      - protocol: TCP
+        port: {{ .Values.catalogGrpcPodPort }}
+---
+# Wildcard egress; API server port omitted intentionally — it is implementation-defined and not statically knowable.
+# Carries the same split-namespace limitation as olm-catalog-grpc-ingress above.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bundle-unpack-egress
+  namespace: {{ .Values.catalog_namespace }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: operatorframework.io/bundle-unpack-ref
+        operator: Exists
+      - key: olm.managed
+        operator: In
+        values:
+          - "true"
+  policyTypes:
+    - Egress
+  egress:
+    - { }

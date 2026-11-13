@@ -3,10 +3,11 @@ package operators
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -21,9 +22,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	// +kubebuilder:scaffold:imports
 
@@ -72,14 +73,19 @@ var (
 	)
 )
 
+// TestMain disables WatchListClient feature for all tests in this package.
+// This is required because envtest doesn't fully support WatchList semantics in K8s 1.35.
+// See: https://github.com/kubernetes/kubernetes/issues/135895
+func TestMain(m *testing.M) {
+	// Disable WatchListClient feature gate
+	os.Setenv("KUBE_FEATURE_WatchListClient", "false")
+	os.Exit(m.Run())
+}
+
 func TestAPIs(t *testing.T) {
 	RegisterFailHandler(Fail)
 
-	RunSpecsWithDefaultAndCustomReporters(
-		t,
-		"Controller Suite",
-		[]Reporter{printer.NewlineReporter{}},
-	)
+	RunSpecs(t, "Controller Suite")
 }
 
 var _ = BeforeSuite(func() {
@@ -88,7 +94,7 @@ var _ = BeforeSuite(func() {
 	useExisting := false
 	testEnv = &envtest.Environment{
 		UseExistingCluster: &useExisting,
-		CRDs: []client.Object{
+		CRDs: []*apiextensionsv1.CustomResourceDefinition{
 			crds.CatalogSource(),
 			crds.ClusterServiceVersion(),
 			crds.InstallPlan(),
@@ -108,8 +114,8 @@ var _ = BeforeSuite(func() {
 	Expect(metav1.AddMetaToScheme(scheme)).To(Succeed())
 	Expect(AddToScheme(scheme)).To(Succeed())
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		MetricsBindAddress: "0", // Prevents conflicts with other test suites that might bind metrics
-		Scheme:             scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
+		Scheme:  scheme,
 	})
 	Expect(err).ToNot(HaveOccurred())
 
@@ -160,15 +166,14 @@ var _ = BeforeSuite(func() {
 
 	k8sClient = mgr.GetClient()
 	Expect(k8sClient).ToNot(BeNil())
-}, 60)
+})
 
 var _ = AfterSuite(func() {
 	By("stopping the controller manager")
 	ctx.Done()
 
 	By("tearing down the test environment")
-	err := testEnv.Stop()
-	Expect(err).ToNot(HaveOccurred())
+	testEnv.Stop()
 })
 
 func newOperator(name string) *decorators.Operator {

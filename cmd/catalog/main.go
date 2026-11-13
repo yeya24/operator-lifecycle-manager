@@ -2,27 +2,28 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"net/http"
 	"os"
 	"time"
 
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
+
 	configv1client "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
-	log "github.com/sirupsen/logrus"
-	utilclock "k8s.io/apimachinery/pkg/util/clock"
+	"github.com/sirupsen/logrus"
 	k8sscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
+	utilclock "k8s.io/utils/clock"
 
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/operators/catalog"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/operators/catalogtemplate"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/apiserver"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorclient"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorstatus"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/server"
-	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/signals"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/metrics"
-	olmversion "github.com/operator-framework/operator-lifecycle-manager/pkg/version"
 )
 
 const (
@@ -30,88 +31,67 @@ const (
 	defaultWakeupInterval       = 15 * time.Minute
 	defaultCatalogNamespace     = "olm"
 	defaultConfigMapServerImage = "quay.io/operator-framework/configmap-operator-registry:latest"
-	defaultOPMImage             = "quay.io/operator-framework/upstream-opm-builder:latest"
+	defaultOPMImage             = "quay.io/operator-framework/opm:latest"
 	defaultUtilImage            = "quay.io/operator-framework/olm:latest"
 	defaultOperatorName         = ""
+	defaultWorkLoadUserID       = int64(1001)
 )
 
 // config flags defined globally so that they appear on the test binary as well
-var (
-	kubeConfigPath = flag.String(
-		"kubeconfig", "", "absolute path to the kubeconfig file")
-
-	wakeupInterval = flag.Duration(
-		"interval", defaultWakeupInterval, "wakeup interval")
-
-	catalogNamespace = flag.String(
-		"namespace", defaultCatalogNamespace, "namespace where catalog will run and install catalog resources")
-
-	configmapServerImage = flag.String(
-		"configmapServerImage", defaultConfigMapServerImage, "the image to use for serving the operator registry api for a configmap")
-
-	opmImage = flag.String(
-		"opmImage", defaultOPMImage, "the image to use for unpacking bundle content with opm")
-
-	utilImage = flag.String(
-		"util-image", defaultUtilImage, "an image containing custom olm utilities")
-
-	writeStatusName = flag.String(
-		"writeStatusName", defaultOperatorName, "ClusterOperator name in which to write status, set to \"\" to disable.")
-
-	debug = flag.Bool(
-		"debug", false, "use debug log level")
-
-	version = flag.Bool("version", false, "displays olm version")
-
-	tlsKeyPath = flag.String(
-		"tls-key", "", "Path to use for private key (requires tls-cert)")
-
-	tlsCertPath = flag.String(
-		"tls-cert", "", "Path to use for certificate key (requires tls-key)")
-
-	profiling = flag.Bool("profiling", false, "deprecated")
-
-	clientCAPath = flag.String("client-ca", "", "path to watch for client ca bundle")
-
-	installPlanTimeout  = flag.Duration("install-plan-retry-timeout", 1*time.Minute, "time since first attempt at which plan execution errors are considered fatal")
-	bundleUnpackTimeout = flag.Duration("bundle-unpack-timeout", 10*time.Minute, "The time limit for bundle unpacking, after which InstallPlan execution is considered to have failed. 0 is considered as having no timeout.")
-)
 
 func init() {
 	metrics.RegisterCatalog()
 }
 
 func main() {
-	// Get exit signal context
-	ctx, cancel := context.WithCancel(signals.Context())
-	defer cancel()
-
-	// Parse the command-line flags.
-	flag.Parse()
-
-	// Check if version flag was set
-	if *version {
-		fmt.Print(olmversion.String())
-
-		// Exit early
-		os.Exit(0)
+	cmd := newRootCmd()
+	if err := cmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
+}
 
-	logger := log.New()
-	if *debug {
-		logger.SetLevel(log.DebugLevel)
-	}
-	logger.Infof("log level %s", logger.Level)
-
+func (o *options) run(ctx context.Context, logger *logrus.Logger) error {
 	// If the catalogNamespaceEnvVarName environment variable is set, then  update the value of catalogNamespace.
 	if catalogNamespaceEnvVarValue := os.Getenv(catalogNamespaceEnvVarName); catalogNamespaceEnvVarValue != "" {
 		logger.Infof("%s environment variable is set. Updating Global Catalog Namespace to %s", catalogNamespaceEnvVarName, catalogNamespaceEnvVarValue)
-		*catalogNamespace = catalogNamespaceEnvVarValue
+		o.catalogNamespace = catalogNamespaceEnvVarValue
 	}
 
-	listenAndServe, err := server.GetListenAndServeFunc(logger, tlsCertPath, tlsKeyPath, clientCAPath)
+	// create a config client for operator status
+	config, err := clientcmd.BuildConfigFromFlags("", o.kubeconfig)
 	if err != nil {
-		logger.Fatal("Error setting up health/metric/pprof service: %v", err)
+		return fmt.Errorf("error configuring client: %s", err.Error())
+	}
+
+	configClient, err := configv1client.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("error configuring client: %s", err.Error())
+	}
+	opClient := operatorclient.NewClientFromConfig(o.kubeconfig, logger)
+	crClient, err := client.NewClient(o.kubeconfig)
+	if err != nil {
+		return fmt.Errorf("error configuring client: %s", err.Error())
+	}
+
+	// Setup APIServer TLS configuration for HTTPS servers
+	apiServerTLSQuerier, apiServerFactory, err := apiserver.SetupAPIServerTLSConfig(logger, config)
+	if err != nil {
+		return fmt.Errorf("error setting up APIServer TLS configuration: %w", err)
+	}
+
+	// Setup metrics/health server with TLS configuration
+	listenAndServe, err := server.GetListenAndServeFunc(
+		server.WithLogger(logger),
+		server.WithTLS(&o.tlsCertPath, &o.tlsKeyPath, &o.clientCAPath),
+		server.WithClientCAAuthorization(o.clientCAAuthorization),
+		server.WithClientCAAllowedCommonNames(o.clientCAAllowedCommonNames),
+		server.WithKubeConfig(config),
+		server.WithAPIServerTLSQuerier(apiServerTLSQuerier),
+		server.WithDebug(o.debug),
+	)
+	if err != nil {
+		return fmt.Errorf("error setting up health/metric/pprof service: %v", err)
 	}
 
 	go func() {
@@ -120,30 +100,48 @@ func main() {
 		}
 	}()
 
-	// create a config client for operator status
-	config, err := clientcmd.BuildConfigFromFlags("", *kubeConfigPath)
-	if err != nil {
-		log.Fatalf("error configuring client: %s", err.Error())
-	}
-	configClient, err := configv1client.NewForConfig(config)
-	if err != nil {
-		log.Fatalf("error configuring client: %s", err.Error())
-	}
-	opClient := operatorclient.NewClientFromConfig(*kubeConfigPath, logger)
-	crClient, err := client.NewClient(*kubeConfigPath)
-	if err != nil {
-		log.Fatalf("error configuring client: %s", err.Error())
+	workloadUserID := int64(-1)
+	if o.setWorkloadUserID {
+		workloadUserID = defaultWorkLoadUserID
 	}
 
+	// the scheme is used by the catalog operator to create
+	// a validatingroundtripper that ensures that all created
+	// resources are appropriately labeled
+	scheme := k8sscheme.Scheme
+	_ = apiextensionsv1.AddToScheme(scheme)   // required by opClient
+	_ = apiregistrationv1.AddToScheme(scheme) // required by opClient
+
+	// TODO(tflannag): Use options pattern for catalog operator
 	// Create a new instance of the operator.
-	op, err := catalog.NewOperator(ctx, *kubeConfigPath, utilclock.RealClock{}, logger, *wakeupInterval, *configmapServerImage, *opmImage, *utilImage, *catalogNamespace, k8sscheme.Scheme, *installPlanTimeout, *bundleUnpackTimeout)
+	op, err := catalog.NewOperator(
+		ctx,
+		o.kubeconfig,
+		utilclock.RealClock{},
+		logger,
+		o.wakeupInterval,
+		o.configMapServerImage,
+		o.opmImage,
+		o.utilImage,
+		o.catalogNamespace,
+		scheme,
+		o.installPlanTimeout,
+		o.bundleUnpackTimeout,
+		workloadUserID,
+	)
 	if err != nil {
-		log.Panicf("error configuring catalog operator: %s", err.Error())
+		return fmt.Errorf("error configuring catalog operator: %s", err.Error())
 	}
 
-	opCatalogTemplate, err := catalogtemplate.NewOperator(ctx, *kubeConfigPath, logger, *wakeupInterval, *catalogNamespace)
+	opCatalogTemplate, err := catalogtemplate.NewOperator(
+		ctx,
+		o.kubeconfig,
+		logger,
+		o.wakeupInterval,
+		o.catalogNamespace,
+	)
 	if err != nil {
-		log.Panicf("error configuring catalog template operator: %s", err.Error())
+		return fmt.Errorf("error configuring catalog template operator: %s", err.Error())
 	}
 
 	op.Run(ctx)
@@ -152,9 +150,16 @@ func main() {
 	opCatalogTemplate.Run(ctx)
 	<-opCatalogTemplate.Ready()
 
-	if *writeStatusName != "" {
-		operatorstatus.MonitorClusterStatus(*writeStatusName, op.AtLevel(), op.Done(), opClient, configClient, crClient)
+	// Start APIServer TLS informer factory if on OpenShift
+	if apiServerFactory != nil {
+		apiServerFactory.Start(ctx.Done())
+	}
+
+	if o.writeStatusName != "" {
+		operatorstatus.MonitorClusterStatus(o.writeStatusName, op.AtLevel(), op.Done(), opClient, configClient, crClient, logger)
 	}
 
 	<-op.Done()
+
+	return nil
 }

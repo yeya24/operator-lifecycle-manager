@@ -3,14 +3,12 @@ package install
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
 
 	log "github.com/sirupsen/logrus"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/client-go/util/retry"
 
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
@@ -24,18 +22,18 @@ func ValidWebhookRules(rules []admissionregistrationv1.RuleWithOperations) error
 
 		// protect OLM resources
 		if contains(apiGroupMap, "*") {
-			return fmt.Errorf("Webhook rules cannot include all groups")
+			return fmt.Errorf("webhook rules cannot include all groups")
 		}
 
 		if contains(apiGroupMap, "operators.coreos.com") {
-			return fmt.Errorf("Webhook rules cannot include the OLM group")
+			return fmt.Errorf("webhook rules cannot include the OLM group")
 		}
 
 		// protect Admission Webhook resources
 		if contains(apiGroupMap, "admissionregistration.k8s.io") {
 			resourceGroupMap := listToMap(rule.Resources)
 			if contains(resourceGroupMap, "*") || contains(resourceGroupMap, "MutatingWebhookConfiguration") || contains(resourceGroupMap, "ValidatingWebhookConfiguration") {
-				return fmt.Errorf("Webhook rules cannot include MutatingWebhookConfiguration or ValidatingWebhookConfiguration resources")
+				return fmt.Errorf("webhook rules cannot include MutatingWebhookConfiguration or ValidatingWebhookConfiguration resources")
 			}
 		}
 	}
@@ -58,7 +56,7 @@ func contains(m map[string]struct{}, tar string) bool {
 func (i *StrategyDeploymentInstaller) createOrUpdateWebhook(caPEM []byte, desc v1alpha1.WebhookDescription) error {
 	operatorGroups, err := i.strategyClient.GetOpLister().OperatorsV1().OperatorGroupLister().OperatorGroups(i.owner.GetNamespace()).List(labels.Everything())
 	if err != nil || len(operatorGroups) != 1 {
-		return fmt.Errorf("Error retrieving OperatorGroup info")
+		return fmt.Errorf("error retrieving OperatorGroup info")
 	}
 	ogNamespacelabelSelector, err := operatorGroups[0].NamespaceLabelSelector()
 	if err != nil {
@@ -67,11 +65,11 @@ func (i *StrategyDeploymentInstaller) createOrUpdateWebhook(caPEM []byte, desc v
 
 	switch desc.Type {
 	case v1alpha1.ValidatingAdmissionWebhook:
-		i.createOrUpdateValidatingWebhook(ogNamespacelabelSelector, caPEM, desc)
+		return i.createOrUpdateValidatingWebhook(ogNamespacelabelSelector, caPEM, desc)
 	case v1alpha1.MutatingAdmissionWebhook:
-		i.createOrUpdateMutatingWebhook(ogNamespacelabelSelector, caPEM, desc)
+		return i.createOrUpdateMutatingWebhook(ogNamespacelabelSelector, caPEM, desc)
 	case v1alpha1.ConversionWebhook:
-		i.createOrUpdateConversionWebhook(caPEM, desc)
+		return i.createOrUpdateConversionWebhook(caPEM, desc)
 	}
 	return nil
 }
@@ -106,6 +104,7 @@ func (i *StrategyDeploymentInstaller) createOrUpdateMutatingWebhook(ogNamespacel
 		}
 	}
 	for _, webhook := range existingWebhooks.Items {
+		webhook = *webhook.DeepCopy()
 		// Update the list of webhooks
 		webhook.Webhooks = []admissionregistrationv1.MutatingWebhook{
 			desc.GetMutatingWebhook(i.owner.GetNamespace(), ogNamespacelabelSelector, caPEM),
@@ -154,6 +153,7 @@ func (i *StrategyDeploymentInstaller) createOrUpdateValidatingWebhook(ogNamespac
 		return nil
 	}
 	for _, webhook := range existingWebhooks.Items {
+		webhook = *webhook.DeepCopy()
 		// Update the list of webhooks
 		webhook.Webhooks = []admissionregistrationv1.ValidatingWebhook{
 			desc.GetValidatingWebhook(i.owner.GetNamespace(), ogNamespacelabelSelector, caPEM),
@@ -188,15 +188,14 @@ func (i *StrategyDeploymentInstaller) createOrUpdateConversionWebhook(caPEM []by
 	// get a list of owned CRDs
 	csv, ok := i.owner.(*v1alpha1.ClusterServiceVersion)
 	if !ok {
-		return fmt.Errorf("ConversionWebhook owner must be a ClusterServiceVersion")
+		return fmt.Errorf("unable to manage conversion webhook: conversion webhook owner must be a ClusterServiceVersion")
 	}
-
 	if !isSingletonOperator(*csv) {
-		return fmt.Errorf("CSVs with conversion webhooks must support only AllNamespaces")
+		return fmt.Errorf("unable to manage conversion webhook: CSVs with conversion webhooks must support only AllNamespaces")
 	}
 
 	if len(desc.ConversionCRDs) == 0 {
-		return fmt.Errorf("Conversion Webhook must have at least one CRD specified")
+		return fmt.Errorf("unable to manager conversion webhook: conversion webhook must have at least one CRD specified")
 	}
 
 	// iterate over all the ConversionCRDs
@@ -205,7 +204,7 @@ func (i *StrategyDeploymentInstaller) createOrUpdateConversionWebhook(caPEM []by
 			// Get existing CRD on cluster
 			crd, err := i.strategyClient.GetOpClient().ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), conversionCRD, metav1.GetOptions{})
 			if err != nil {
-				return fmt.Errorf("Unable to get CRD %s specified in Conversion Webhook: %v", conversionCRD, err)
+				return fmt.Errorf("unable to get CRD %s specified in Conversion Webhook: %v", conversionCRD, err)
 			}
 
 			// check if this CRD is an owned CRD
@@ -217,7 +216,7 @@ func (i *StrategyDeploymentInstaller) createOrUpdateConversionWebhook(caPEM []by
 				}
 			}
 			if !foundCRD {
-				return fmt.Errorf("CSV %s does not own CRD %s", csv.GetName(), conversionCRD)
+				return fmt.Errorf("csv %s does not own CRD %s", csv.GetName(), conversionCRD)
 			}
 
 			// crd.Spec.Conversion.Strategy specifies how custom resources are converted between versions.
@@ -230,7 +229,7 @@ func (i *StrategyDeploymentInstaller) createOrUpdateConversionWebhook(caPEM []by
 			// By default the strategy is none
 			// Reference:
 			// 	- https://v1-15.docs.kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definition-versioning/#specify-multiple-versions
-			if crd.Spec.PreserveUnknownFields != false {
+			if crd.Spec.PreserveUnknownFields {
 				return fmt.Errorf("crd.Spec.PreserveUnknownFields must be false to let API Server call webhook to do the conversion")
 			}
 
@@ -284,16 +283,14 @@ func addWebhookLabels(object metav1.Object, webhookDesc v1alpha1.WebhookDescript
 	if labels == nil {
 		labels = map[string]string{}
 	}
+	hash, err := hashutil.DeepHashObject(&webhookDesc)
+	if err != nil {
+		return err
+	}
 	labels[WebhookDescKey] = webhookDesc.GenerateName
-	labels[WebhookHashKey] = HashWebhookDesc(webhookDesc)
+	labels[WebhookHashKey] = hash
+	labels[OLMManagedLabelKey] = OLMManagedLabelValue
 	object.SetLabels(labels)
 
 	return nil
-}
-
-// HashWebhookDesc calculates a hash given a webhookDescription
-func HashWebhookDesc(webhookDesc v1alpha1.WebhookDescription) string {
-	hasher := fnv.New32a()
-	hashutil.DeepHashObject(hasher, &webhookDesc)
-	return rand.SafeEncodeString(fmt.Sprint(hasher.Sum32()))
 }

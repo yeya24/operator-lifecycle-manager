@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -19,13 +17,16 @@ limitations under the License.
 package v1
 
 import (
-	v1 "github.com/operator-framework/api/pkg/operators/v1"
-	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned/scheme"
+	http "net/http"
+
+	operatorsv1 "github.com/operator-framework/api/pkg/operators/v1"
+	scheme "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned/scheme"
 	rest "k8s.io/client-go/rest"
 )
 
 type OperatorsV1Interface interface {
 	RESTClient() rest.Interface
+	OLMConfigsGetter
 	OperatorsGetter
 	OperatorConditionsGetter
 	OperatorGroupsGetter
@@ -34,6 +35,10 @@ type OperatorsV1Interface interface {
 // OperatorsV1Client is used to interact with features provided by the operators.coreos.com group.
 type OperatorsV1Client struct {
 	restClient rest.Interface
+}
+
+func (c *OperatorsV1Client) OLMConfigs() OLMConfigInterface {
+	return newOLMConfigs(c)
 }
 
 func (c *OperatorsV1Client) Operators() OperatorInterface {
@@ -49,12 +54,24 @@ func (c *OperatorsV1Client) OperatorGroups(namespace string) OperatorGroupInterf
 }
 
 // NewForConfig creates a new OperatorsV1Client for the given config.
+// NewForConfig is equivalent to NewForConfigAndClient(c, httpClient),
+// where httpClient was generated with rest.HTTPClientFor(c).
 func NewForConfig(c *rest.Config) (*OperatorsV1Client, error) {
 	config := *c
-	if err := setConfigDefaults(&config); err != nil {
+	setConfigDefaults(&config)
+	httpClient, err := rest.HTTPClientFor(&config)
+	if err != nil {
 		return nil, err
 	}
-	client, err := rest.RESTClientFor(&config)
+	return NewForConfigAndClient(&config, httpClient)
+}
+
+// NewForConfigAndClient creates a new OperatorsV1Client for the given config and http client.
+// Note the http client provided takes precedence over the configured transport values.
+func NewForConfigAndClient(c *rest.Config, h *http.Client) (*OperatorsV1Client, error) {
+	config := *c
+	setConfigDefaults(&config)
+	client, err := rest.RESTClientForConfigAndClient(&config, h)
 	if err != nil {
 		return nil, err
 	}
@@ -76,17 +93,15 @@ func New(c rest.Interface) *OperatorsV1Client {
 	return &OperatorsV1Client{c}
 }
 
-func setConfigDefaults(config *rest.Config) error {
-	gv := v1.SchemeGroupVersion
+func setConfigDefaults(config *rest.Config) {
+	gv := operatorsv1.SchemeGroupVersion
 	config.GroupVersion = &gv
 	config.APIPath = "/apis"
-	config.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
+	config.NegotiatedSerializer = rest.CodecFactoryForGeneratedClient(scheme.Scheme, scheme.Codecs).WithoutConversion()
 
 	if config.UserAgent == "" {
 		config.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
-
-	return nil
 }
 
 // RESTClient returns a RESTClient that is used to communicate

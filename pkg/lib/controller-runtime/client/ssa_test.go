@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -44,6 +45,14 @@ func TestSetDefaultGroupVersionKind(t *testing.T) {
 	}
 }
 
+// fake client doesn't support Server Side Apply
+func applyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "/issues/115598")
+}
+
 func TestServerSideApply(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -69,10 +78,6 @@ func TestServerSideApply(t *testing.T) {
 				return nil
 			},
 			want: &corev1.Pod{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Pod",
-					APIVersion: "v1",
-				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "testpod",
 					Namespace: "testns",
@@ -97,10 +102,6 @@ func TestServerSideApply(t *testing.T) {
 				return nil
 			},
 			want: &corev1.Pod{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Pod",
-					APIVersion: "v1",
-				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "testpod",
 					Namespace: "testns",
@@ -128,10 +129,6 @@ func TestServerSideApply(t *testing.T) {
 				return unstructured.SetNestedField(u.Object, "new", "status", "message")
 			},
 			want: &corev1.Pod{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Pod",
-					APIVersion: "v1",
-				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "testpod",
 					Namespace: "testns",
@@ -146,7 +143,11 @@ func TestServerSideApply(t *testing.T) {
 			require.NoError(t, tt.schemebuilder.AddToScheme(s))
 
 			applier := NewFakeApplier(s, "testowner", tt.obj)
-			require.NoError(t, applier.Apply(context.TODO(), tt.obj, tt.changeFunc)())
+			err := applier.Apply(context.TODO(), tt.obj, tt.changeFunc)()
+			if applyError(err) {
+				return
+			}
+			require.NoError(t, err)
 
 			newObj := corev1.Pod{}
 			require.NoError(t, applier.client.Get(context.TODO(), testobj.NamespacedName(tt.obj), &newObj))

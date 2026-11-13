@@ -6,10 +6,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/distribution/distribution/reference"
+	"github.com/distribution/reference"
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/clientcmd"
@@ -101,7 +102,10 @@ func NewOperator(ctx context.Context, kubeconfigPath string, logger *logrus.Logg
 	// Wire CatalogSources
 	catsrcInformer := crInformerFactory.Operators().V1alpha1().CatalogSources()
 	op.lister.OperatorsV1alpha1().RegisterCatalogSourceLister(metav1.NamespaceAll, catsrcInformer.Lister())
-	catalogTemplateSrcQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "catalogSourceTemplate")
+	catalogTemplateSrcQueue := workqueue.NewTypedRateLimitingQueueWithConfig[types.NamespacedName](workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName](),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: "catalogSourceTemplate",
+		})
 	op.catalogSourceTemplateQueueSet.Set(metav1.NamespaceAll, catalogTemplateSrcQueue)
 	catsrcQueueInformer, err := queueinformer.NewQueueInformer(
 		ctx,
@@ -137,7 +141,7 @@ func (o *Operator) syncCatalogSources(obj interface{}) error {
 		"catSrcName":      outputCatalogSource.GetName(),
 		"id":              queueinformer.NewLoopID(),
 	})
-	logger.Info("syncing catalog source for annotation templates")
+	logger.Debug("syncing catalog source for annotation templates")
 
 	catalogImageTemplate := catalogsource.GetCatalogTemplateAnnotation(outputCatalogSource)
 	if catalogImageTemplate == "" {
@@ -175,7 +179,6 @@ func (o *Operator) syncCatalogSources(obj interface{}) error {
 
 		// make sure that the processed image reference is actually different
 		if outputCatalogSource.Spec.Image != processedCatalogImageTemplate {
-
 			outputCatalogSource.Spec.Image = processedCatalogImageTemplate
 
 			if err := catalogsource.UpdateSpecAndStatusConditions(logger, o.client, outputCatalogSource, conditions...); err != nil {
@@ -226,7 +229,7 @@ func (o *Operator) syncCatalogSources(obj interface{}) error {
 		return err
 	}
 
-	logger.Infof(message)
+	logger.Info(message)
 
 	return nil
 }

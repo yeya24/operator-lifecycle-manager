@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -19,25 +17,54 @@ limitations under the License.
 package v1
 
 import (
-	"context"
+	context "context"
 	time "time"
 
-	operatorsv1 "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/apis/operators/v1"
+	apisoperatorsv1 "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/apis/operators/v1"
 	versioned "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/client/clientset/versioned"
 	internalinterfaces "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/client/informers/externalversions/internalinterfaces"
-	v1 "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/client/listers/operators/v1"
+	operatorsv1 "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/client/listers/operators/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
 )
 
 // PackageManifestInformer provides access to a shared informer and lister for
-// PackageManifests.
+// PackageManifests. Prefer using the type-safe variant (see [TypedPackageManifestInformer]).
 type PackageManifestInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1.PackageManifestLister
+	Lister() operatorsv1.PackageManifestLister
 }
+
+// TypedPackageManifestInformer provides access to a shared informer and lister for
+// PackageManifests, including the type-safe TypedInformer variant.
+// It is a superset of PackageManifestInformer.
+type TypedPackageManifestInformer interface {
+	Informer() cache.SharedIndexInformer
+	TypedInformer() PackageManifestIndexInformer
+	Lister() operatorsv1.PackageManifestLister
+}
+
+// PackageManifestIndexInformer is a wrapper around the underlying [cache.SharedIndexInformer]
+// with type-safe variants of several methods.
+type PackageManifestIndexInformer cache.TypedSharedIndexInformer[*apisoperatorsv1.PackageManifest]
+
+// PackageManifestHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerFuncs] for PackageManifest.
+type PackageManifestHandlerFuncs = cache.TypedResourceEventHandlerFuncs[*apisoperatorsv1.PackageManifest]
+
+// PackageManifestDetailedHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerDetailedFuncs] for PackageManifest.
+type PackageManifestDetailedHandlerFuncs = cache.TypedResourceEventHandlerDetailedFuncs[*apisoperatorsv1.PackageManifest]
+
+// PackageManifestFilteringHandler is a specialization of [cache.TypedFilteringResourceEventHandler] for PackageManifest.
+type PackageManifestFilteringHandler = cache.TypedFilteringResourceEventHandler[*apisoperatorsv1.PackageManifest]
+
+// PackageManifestIndexers is a specialization of [cache.TypedIndexers] for PackageManifest.
+type PackageManifestIndexers = cache.TypedIndexers[*apisoperatorsv1.PackageManifest]
+
+// DeletedPackageManifest is a specialization of [cache.DeletedObject] for PackageManifest.
+type DeletedPackageManifest = cache.DeletedObject[*apisoperatorsv1.PackageManifest]
 
 type packageManifestInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
@@ -48,43 +75,132 @@ type packageManifestInformer struct {
 // NewPackageManifestInformer constructs a new informer for PackageManifest type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedPackageManifestInformer]).
 func NewPackageManifestInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredPackageManifestInformer(client, namespace, resyncPeriod, indexers, nil)
+	return NewPackageManifestInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers})
+}
+
+// NewTypedPackageManifestInformer constructs a new informer for PackageManifest type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedPackageManifestInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers PackageManifestIndexers) PackageManifestIndexInformer {
+	return NewTypedPackageManifestInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers)})
 }
 
 // NewFilteredPackageManifestInformer constructs a new informer for PackageManifest type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedFilteredPackageManifestInformer]).
 func NewFilteredPackageManifestInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
-	return cache.NewSharedIndexInformer(
-		&cache.ListWatch{
-			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+	return NewTypedPackageManifestInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers, TweakListOptions: tweakListOptions})
+}
+
+// NewTypedFilteredPackageManifestInformer constructs a new informer for PackageManifest type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedFilteredPackageManifestInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers PackageManifestIndexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) PackageManifestIndexInformer {
+	return NewTypedPackageManifestInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers), TweakListOptions: tweakListOptions})
+}
+
+// NewPackageManifestInformerWithOptions constructs a new informer for PackageManifest type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedPackageManifestInformerWithOptions]).
+func NewPackageManifestInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) cache.SharedIndexInformer {
+	return NewTypedPackageManifestInformerWithOptions(client, namespace, options)
+}
+
+// NewTypedPackageManifestInformerWithOptions constructs a new informer for PackageManifest type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedPackageManifestInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) PackageManifestIndexInformer {
+	gvr := schema.GroupVersionResource{Group: "packages.operators.coreos.com", Version: "v1", Resource: "packagemanifests"}
+	identifier := options.InformerName.WithResource(gvr)
+	tweakListOptions := options.TweakListOptions
+	return cache.NewTypedSharedIndexInformer[*apisoperatorsv1.PackageManifest](cache.NewSharedIndexInformerWithOptions(
+		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
+			ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.OperatorsV1().PackageManifests(namespace).List(context.TODO(), options)
+				return client.PackagesV1().PackageManifests(namespace).List(context.Background(), opts)
 			},
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.OperatorsV1().PackageManifests(namespace).Watch(context.TODO(), options)
+				return client.PackagesV1().PackageManifests(namespace).Watch(context.Background(), opts)
 			},
+			ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.PackagesV1().PackageManifests(namespace).List(ctx, opts)
+			},
+			WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.PackagesV1().PackageManifests(namespace).Watch(ctx, opts)
+			},
+		}, client),
+		&apisoperatorsv1.PackageManifest{},
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: options.ResyncPeriod,
+			Indexers:     options.Indexers,
+			Identifier:   identifier,
 		},
-		&operatorsv1.PackageManifest{},
-		resyncPeriod,
-		indexers,
-	)
+	))
 }
 
 func (f *packageManifestInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredPackageManifestInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+	return NewTypedPackageManifestInformerWithOptions(client, f.namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, InformerName: f.factory.InformerName(), TweakListOptions: f.tweakListOptions})
 }
 
 func (f *packageManifestInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&operatorsv1.PackageManifest{}, f.defaultInformer)
+	return f.TypedInformer()
 }
 
-func (f *packageManifestInformer) Lister() v1.PackageManifestLister {
-	return v1.NewPackageManifestLister(f.Informer().GetIndexer())
+func (f *packageManifestInformer) TypedInformer() PackageManifestIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apisoperatorsv1.PackageManifest](f.factory.InformerFor(&apisoperatorsv1.PackageManifest{}, f.defaultInformer))
+}
+
+func (f *packageManifestInformer) Lister() operatorsv1.PackageManifestLister {
+	return operatorsv1.NewPackageManifestLister(f.Informer().GetIndexer())
+}
+
+// ToTypedPackageManifestInformer converts an untyped informer into a TypedPackageManifestInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *PackageManifest. If that is not the case, calling type-safe methods of the returned
+// TypedPackageManifestInformer leads to runtime panics. A safer alternative is to pass
+// around a TypedPackageManifestInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToTypedPackageManifestInformer(informer PackageManifestInformer) TypedPackageManifestInformer {
+	if informer, ok := informer.(TypedPackageManifestInformer); ok {
+		return informer
+	}
+	return &packageManifestTypedInformerAdapter{informer}
+}
+
+type packageManifestTypedInformerAdapter struct {
+	PackageManifestInformer
+}
+
+func (a *packageManifestTypedInformerAdapter) TypedInformer() PackageManifestIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apisoperatorsv1.PackageManifest](a.Informer())
+}
+
+// ToPackageManifestIndexInformer converts an untyped informer into a PackageManifestIndexInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *PackageManifest. If that is not the case, calling type-safe methods of the returned
+// PackageManifestIndexInformer leads to runtime panics. A safer alternative is to pass
+// around a PackageManifestIndexInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToPackageManifestIndexInformer(informer cache.SharedIndexInformer) PackageManifestIndexInformer {
+	if informer, ok := informer.(PackageManifestIndexInformer); ok {
+		return informer
+	}
+	return cache.NewTypedSharedIndexInformer[*apisoperatorsv1.PackageManifest](informer)
 }

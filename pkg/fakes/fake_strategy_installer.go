@@ -3,17 +3,34 @@ package fakes
 
 import (
 	"sync"
+	"time"
 
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 )
 
 type FakeStrategyInstaller struct {
+	CertsRotateAtStub        func() time.Time
+	certsRotateAtMutex       sync.RWMutex
+	certsRotateAtArgsForCall []struct{}
+	certsRotateAtReturns     struct {
+		result1 time.Time
+	}
+	certsRotateAtReturnsOnCall map[int]struct {
+		result1 time.Time
+	}
+	CertsRotatedStub        func() bool
+	certsRotatedMutex       sync.RWMutex
+	certsRotatedArgsForCall []struct{}
+	certsRotatedReturns     struct {
+		result1 bool
+	}
+	certsRotatedReturnsOnCall map[int]struct {
+		result1 bool
+	}
 	CheckInstalledStub        func(install.Strategy) (bool, error)
 	checkInstalledMutex       sync.RWMutex
-	checkInstalledArgsForCall []struct {
-		arg1 install.Strategy
-	}
-	checkInstalledReturns struct {
+	checkInstalledArgsForCall []FakeStrategyInstallerCheckInstalledArgs
+	checkInstalledReturns     struct {
 		result1 bool
 		result2 error
 	}
@@ -23,34 +40,162 @@ type FakeStrategyInstaller struct {
 	}
 	InstallStub        func(install.Strategy) error
 	installMutex       sync.RWMutex
-	installArgsForCall []struct {
-		arg1 install.Strategy
-	}
-	installReturns struct {
+	installArgsForCall []FakeStrategyInstallerInstallArgs
+	installReturns     struct {
 		result1 error
 	}
 	installReturnsOnCall map[int]struct {
 		result1 error
 	}
+	ShouldRotateCertsStub        func(install.Strategy) (bool, error)
+	shouldRotateCertsMutex       sync.RWMutex
+	shouldRotateCertsArgsForCall []FakeStrategyInstallerShouldRotateCertsArgs
+	shouldRotateCertsReturns     struct {
+		result1 bool
+		result2 error
+	}
+	shouldRotateCertsReturnsOnCall map[int]struct {
+		result1 bool
+		result2 error
+	}
 	invocations      map[string][][]interface{}
+	callOrder        []string
 	invocationsMutex sync.RWMutex
+}
+
+// FakeStrategyInstallerCheckInstalledArgs holds the arguments of one call to CheckInstalled.
+type FakeStrategyInstallerCheckInstalledArgs struct {
+	Arg1 install.Strategy
+}
+
+// FakeStrategyInstallerInstallArgs holds the arguments of one call to Install.
+type FakeStrategyInstallerInstallArgs struct {
+	Arg1 install.Strategy
+}
+
+// FakeStrategyInstallerShouldRotateCertsArgs holds the arguments of one call to ShouldRotateCerts.
+type FakeStrategyInstallerShouldRotateCertsArgs struct {
+	Arg1 install.Strategy
+}
+
+func (fake *FakeStrategyInstaller) CertsRotateAt() time.Time {
+	fake.certsRotateAtMutex.Lock()
+	ret, specificReturn := fake.certsRotateAtReturnsOnCall[len(fake.certsRotateAtArgsForCall)]
+	fake.certsRotateAtArgsForCall = append(fake.certsRotateAtArgsForCall, struct{}{})
+	stub := fake.CertsRotateAtStub
+	fakeReturns := fake.certsRotateAtReturns
+	fake.recordInvocation("CertsRotateAt", []interface{}{})
+	fake.certsRotateAtMutex.Unlock()
+	if stub != nil {
+		return stub()
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *FakeStrategyInstaller) CertsRotateAtCallCount() int {
+	fake.certsRotateAtMutex.RLock()
+	defer fake.certsRotateAtMutex.RUnlock()
+	return len(fake.certsRotateAtArgsForCall)
+}
+
+func (fake *FakeStrategyInstaller) CertsRotateAtCalls(stub func() time.Time) {
+	fake.certsRotateAtMutex.Lock()
+	defer fake.certsRotateAtMutex.Unlock()
+	fake.CertsRotateAtStub = stub
+}
+
+func (fake *FakeStrategyInstaller) CertsRotateAtReturns(result1 time.Time) {
+	fake.certsRotateAtMutex.Lock()
+	defer fake.certsRotateAtMutex.Unlock()
+	fake.CertsRotateAtStub = nil
+	fake.certsRotateAtReturns = struct {
+		result1 time.Time
+	}{result1}
+}
+
+func (fake *FakeStrategyInstaller) CertsRotateAtReturnsOnCall(i int, result1 time.Time) {
+	fake.certsRotateAtMutex.Lock()
+	defer fake.certsRotateAtMutex.Unlock()
+	fake.CertsRotateAtStub = nil
+	if fake.certsRotateAtReturnsOnCall == nil {
+		fake.certsRotateAtReturnsOnCall = make(map[int]struct {
+			result1 time.Time
+		})
+	}
+	fake.certsRotateAtReturnsOnCall[i] = struct {
+		result1 time.Time
+	}{result1}
+}
+
+func (fake *FakeStrategyInstaller) CertsRotated() bool {
+	fake.certsRotatedMutex.Lock()
+	ret, specificReturn := fake.certsRotatedReturnsOnCall[len(fake.certsRotatedArgsForCall)]
+	fake.certsRotatedArgsForCall = append(fake.certsRotatedArgsForCall, struct{}{})
+	stub := fake.CertsRotatedStub
+	fakeReturns := fake.certsRotatedReturns
+	fake.recordInvocation("CertsRotated", []interface{}{})
+	fake.certsRotatedMutex.Unlock()
+	if stub != nil {
+		return stub()
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *FakeStrategyInstaller) CertsRotatedCallCount() int {
+	fake.certsRotatedMutex.RLock()
+	defer fake.certsRotatedMutex.RUnlock()
+	return len(fake.certsRotatedArgsForCall)
+}
+
+func (fake *FakeStrategyInstaller) CertsRotatedCalls(stub func() bool) {
+	fake.certsRotatedMutex.Lock()
+	defer fake.certsRotatedMutex.Unlock()
+	fake.CertsRotatedStub = stub
+}
+
+func (fake *FakeStrategyInstaller) CertsRotatedReturns(result1 bool) {
+	fake.certsRotatedMutex.Lock()
+	defer fake.certsRotatedMutex.Unlock()
+	fake.CertsRotatedStub = nil
+	fake.certsRotatedReturns = struct {
+		result1 bool
+	}{result1}
+}
+
+func (fake *FakeStrategyInstaller) CertsRotatedReturnsOnCall(i int, result1 bool) {
+	fake.certsRotatedMutex.Lock()
+	defer fake.certsRotatedMutex.Unlock()
+	fake.CertsRotatedStub = nil
+	if fake.certsRotatedReturnsOnCall == nil {
+		fake.certsRotatedReturnsOnCall = make(map[int]struct {
+			result1 bool
+		})
+	}
+	fake.certsRotatedReturnsOnCall[i] = struct {
+		result1 bool
+	}{result1}
 }
 
 func (fake *FakeStrategyInstaller) CheckInstalled(arg1 install.Strategy) (bool, error) {
 	fake.checkInstalledMutex.Lock()
 	ret, specificReturn := fake.checkInstalledReturnsOnCall[len(fake.checkInstalledArgsForCall)]
-	fake.checkInstalledArgsForCall = append(fake.checkInstalledArgsForCall, struct {
-		arg1 install.Strategy
-	}{arg1})
+	fake.checkInstalledArgsForCall = append(fake.checkInstalledArgsForCall, FakeStrategyInstallerCheckInstalledArgs{arg1})
+	stub := fake.CheckInstalledStub
+	fakeReturns := fake.checkInstalledReturns
 	fake.recordInvocation("CheckInstalled", []interface{}{arg1})
 	fake.checkInstalledMutex.Unlock()
-	if fake.CheckInstalledStub != nil {
-		return fake.CheckInstalledStub(arg1)
+	if stub != nil {
+		return stub(arg1)
 	}
 	if specificReturn {
 		return ret.result1, ret.result2
 	}
-	fakeReturns := fake.checkInstalledReturns
 	return fakeReturns.result1, fakeReturns.result2
 }
 
@@ -70,7 +215,15 @@ func (fake *FakeStrategyInstaller) CheckInstalledArgsForCall(i int) install.Stra
 	fake.checkInstalledMutex.RLock()
 	defer fake.checkInstalledMutex.RUnlock()
 	argsForCall := fake.checkInstalledArgsForCall[i]
-	return argsForCall.arg1
+	return argsForCall.Arg1
+}
+
+func (fake *FakeStrategyInstaller) CheckInstalledArgs() []FakeStrategyInstallerCheckInstalledArgs {
+	fake.checkInstalledMutex.RLock()
+	defer fake.checkInstalledMutex.RUnlock()
+	args := make([]FakeStrategyInstallerCheckInstalledArgs, len(fake.checkInstalledArgsForCall))
+	copy(args, fake.checkInstalledArgsForCall)
+	return args
 }
 
 func (fake *FakeStrategyInstaller) CheckInstalledReturns(result1 bool, result2 error) {
@@ -102,18 +255,17 @@ func (fake *FakeStrategyInstaller) CheckInstalledReturnsOnCall(i int, result1 bo
 func (fake *FakeStrategyInstaller) Install(arg1 install.Strategy) error {
 	fake.installMutex.Lock()
 	ret, specificReturn := fake.installReturnsOnCall[len(fake.installArgsForCall)]
-	fake.installArgsForCall = append(fake.installArgsForCall, struct {
-		arg1 install.Strategy
-	}{arg1})
+	fake.installArgsForCall = append(fake.installArgsForCall, FakeStrategyInstallerInstallArgs{arg1})
+	stub := fake.InstallStub
+	fakeReturns := fake.installReturns
 	fake.recordInvocation("Install", []interface{}{arg1})
 	fake.installMutex.Unlock()
-	if fake.InstallStub != nil {
-		return fake.InstallStub(arg1)
+	if stub != nil {
+		return stub(arg1)
 	}
 	if specificReturn {
 		return ret.result1
 	}
-	fakeReturns := fake.installReturns
 	return fakeReturns.result1
 }
 
@@ -133,7 +285,15 @@ func (fake *FakeStrategyInstaller) InstallArgsForCall(i int) install.Strategy {
 	fake.installMutex.RLock()
 	defer fake.installMutex.RUnlock()
 	argsForCall := fake.installArgsForCall[i]
-	return argsForCall.arg1
+	return argsForCall.Arg1
+}
+
+func (fake *FakeStrategyInstaller) InstallArgs() []FakeStrategyInstallerInstallArgs {
+	fake.installMutex.RLock()
+	defer fake.installMutex.RUnlock()
+	args := make([]FakeStrategyInstallerInstallArgs, len(fake.installArgsForCall))
+	copy(args, fake.installArgsForCall)
+	return args
 }
 
 func (fake *FakeStrategyInstaller) InstallReturns(result1 error) {
@@ -159,13 +319,79 @@ func (fake *FakeStrategyInstaller) InstallReturnsOnCall(i int, result1 error) {
 	}{result1}
 }
 
+func (fake *FakeStrategyInstaller) ShouldRotateCerts(arg1 install.Strategy) (bool, error) {
+	fake.shouldRotateCertsMutex.Lock()
+	ret, specificReturn := fake.shouldRotateCertsReturnsOnCall[len(fake.shouldRotateCertsArgsForCall)]
+	fake.shouldRotateCertsArgsForCall = append(fake.shouldRotateCertsArgsForCall, FakeStrategyInstallerShouldRotateCertsArgs{arg1})
+	stub := fake.ShouldRotateCertsStub
+	fakeReturns := fake.shouldRotateCertsReturns
+	fake.recordInvocation("ShouldRotateCerts", []interface{}{arg1})
+	fake.shouldRotateCertsMutex.Unlock()
+	if stub != nil {
+		return stub(arg1)
+	}
+	if specificReturn {
+		return ret.result1, ret.result2
+	}
+	return fakeReturns.result1, fakeReturns.result2
+}
+
+func (fake *FakeStrategyInstaller) ShouldRotateCertsCallCount() int {
+	fake.shouldRotateCertsMutex.RLock()
+	defer fake.shouldRotateCertsMutex.RUnlock()
+	return len(fake.shouldRotateCertsArgsForCall)
+}
+
+func (fake *FakeStrategyInstaller) ShouldRotateCertsCalls(stub func(install.Strategy) (bool, error)) {
+	fake.shouldRotateCertsMutex.Lock()
+	defer fake.shouldRotateCertsMutex.Unlock()
+	fake.ShouldRotateCertsStub = stub
+}
+
+func (fake *FakeStrategyInstaller) ShouldRotateCertsArgsForCall(i int) install.Strategy {
+	fake.shouldRotateCertsMutex.RLock()
+	defer fake.shouldRotateCertsMutex.RUnlock()
+	argsForCall := fake.shouldRotateCertsArgsForCall[i]
+	return argsForCall.Arg1
+}
+
+func (fake *FakeStrategyInstaller) ShouldRotateCertsArgs() []FakeStrategyInstallerShouldRotateCertsArgs {
+	fake.shouldRotateCertsMutex.RLock()
+	defer fake.shouldRotateCertsMutex.RUnlock()
+	args := make([]FakeStrategyInstallerShouldRotateCertsArgs, len(fake.shouldRotateCertsArgsForCall))
+	copy(args, fake.shouldRotateCertsArgsForCall)
+	return args
+}
+
+func (fake *FakeStrategyInstaller) ShouldRotateCertsReturns(result1 bool, result2 error) {
+	fake.shouldRotateCertsMutex.Lock()
+	defer fake.shouldRotateCertsMutex.Unlock()
+	fake.ShouldRotateCertsStub = nil
+	fake.shouldRotateCertsReturns = struct {
+		result1 bool
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *FakeStrategyInstaller) ShouldRotateCertsReturnsOnCall(i int, result1 bool, result2 error) {
+	fake.shouldRotateCertsMutex.Lock()
+	defer fake.shouldRotateCertsMutex.Unlock()
+	fake.ShouldRotateCertsStub = nil
+	if fake.shouldRotateCertsReturnsOnCall == nil {
+		fake.shouldRotateCertsReturnsOnCall = make(map[int]struct {
+			result1 bool
+			result2 error
+		})
+	}
+	fake.shouldRotateCertsReturnsOnCall[i] = struct {
+		result1 bool
+		result2 error
+	}{result1, result2}
+}
+
 func (fake *FakeStrategyInstaller) Invocations() map[string][][]interface{} {
 	fake.invocationsMutex.RLock()
 	defer fake.invocationsMutex.RUnlock()
-	fake.checkInstalledMutex.RLock()
-	defer fake.checkInstalledMutex.RUnlock()
-	fake.installMutex.RLock()
-	defer fake.installMutex.RUnlock()
 	copiedInvocations := map[string][][]interface{}{}
 	for key, value := range fake.invocations {
 		copiedInvocations[key] = value
@@ -173,9 +399,18 @@ func (fake *FakeStrategyInstaller) Invocations() map[string][][]interface{} {
 	return copiedInvocations
 }
 
+func (fake *FakeStrategyInstaller) CallOrder() []string {
+	fake.invocationsMutex.RLock()
+	defer fake.invocationsMutex.RUnlock()
+	order := make([]string, len(fake.callOrder))
+	copy(order, fake.callOrder)
+	return order
+}
+
 func (fake *FakeStrategyInstaller) recordInvocation(key string, args []interface{}) {
 	fake.invocationsMutex.Lock()
 	defer fake.invocationsMutex.Unlock()
+	fake.callOrder = append(fake.callOrder, key)
 	if fake.invocations == nil {
 		fake.invocations = map[string][][]interface{}{}
 	}

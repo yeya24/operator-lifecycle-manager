@@ -3,6 +3,8 @@ package configmap
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -32,10 +34,11 @@ type BundleLoader struct {
 // creates an operator registry Bundle object.
 // If the Data section has a PackageManifest resource then it is also
 // deserialized and included in the result.
-func (l *BundleLoader) Load(cm *corev1.ConfigMap) (bundle *api.Bundle, err error) {
+func (l *BundleLoader) Load(cm *corev1.ConfigMap) (*api.Bundle, error) {
+	var err error
 	if cm == nil {
 		err = errors.New("ConfigMap must not be <nil>")
-		return
+		return nil, err
 	}
 
 	logger := l.logger.WithFields(logrus.Fields{
@@ -45,15 +48,15 @@ func (l *BundleLoader) Load(cm *corev1.ConfigMap) (bundle *api.Bundle, err error
 	bundle, skipped, bundleErr := loadBundle(logger, cm)
 	if bundleErr != nil {
 		err = fmt.Errorf("failed to extract bundle from configmap - %v", bundleErr)
-		return
+		return nil, err
 	}
 	l.logger.Debugf("couldn't unpack skipped: %#v", skipped)
-	return
+	return bundle, nil
 }
 
-func loadBundle(entry *logrus.Entry, cm *corev1.ConfigMap) (bundle *api.Bundle, skipped map[string]string, err error) {
-	bundle = &api.Bundle{Object: []string{}}
-	skipped = map[string]string{}
+func loadBundle(entry *logrus.Entry, cm *corev1.ConfigMap) (*api.Bundle, map[string]string, error) {
+	bundle := &api.Bundle{Object: []string{}}
+	skipped := map[string]string{}
 
 	data := cm.Data
 	if hasGzipEncodingAnnotation(cm) {
@@ -67,7 +70,9 @@ func loadBundle(entry *logrus.Entry, cm *corev1.ConfigMap) (bundle *api.Bundle, 
 	}
 
 	// Add kube resources to the bundle.
-	for name, content := range data {
+	// Sort keys by name to guarantee consistent ordering of bundle objects.
+	for _, name := range slices.Sorted(maps.Keys(data)) {
+		content := data[name]
 		reader := strings.NewReader(content)
 		logger := entry.WithFields(logrus.Fields{
 			"key": name,
@@ -95,7 +100,7 @@ func loadBundle(entry *logrus.Entry, cm *corev1.ConfigMap) (bundle *api.Bundle, 
 		logger.Infof("added to bundle, Kind=%s", resource.GetKind())
 	}
 
-	return
+	return bundle, skipped, nil
 }
 
 func decodeGzipBinaryData(cm *corev1.ConfigMap) (map[string]string, error) {

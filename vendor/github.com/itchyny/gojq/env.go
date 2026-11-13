@@ -4,37 +4,39 @@ import "context"
 
 type env struct {
 	pc        int
-	stack     *stack
-	scopes    *stack
-	paths     *stack
-	values    []interface{}
+	stack     *stack[any]
+	paths     *stack[pathValue]
+	scopes    *stack[scope]
+	values    []any
 	codes     []*code
 	codeinfos []codeinfo
-	forks     []*fork
+	forks     []fork
 	backtrack bool
 	offset    int
 	expdepth  int
+	label     int
+	args      [32]any // len(env.args) > maxarity
 	ctx       context.Context
 }
 
 func newEnv(ctx context.Context) *env {
 	return &env{
-		stack:  newStack(),
-		scopes: newStack(),
-		paths:  newStack(),
+		stack:  newStack[any](),
+		paths:  newStack[pathValue](),
+		scopes: newStack[scope](),
 		ctx:    ctx,
 	}
 }
 
 type scope struct {
-	id        int
-	offset    int
-	pc        int
-	saveindex int
+	id         int
+	offset     int
+	pc         int
+	saveindex  int
+	outerindex int
 }
 
 type fork struct {
-	op         opcode
 	pc         int
 	stackindex int
 	stacklimit int
@@ -42,5 +44,6 @@ type fork struct {
 	scopelimit int
 	pathindex  int
 	pathlimit  int
+	offset     int
 	expdepth   int
 }

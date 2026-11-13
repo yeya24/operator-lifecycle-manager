@@ -6,21 +6,13 @@ import (
 
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/resolver"
-	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/resolver/cache"
 )
 
 type FakeStepResolver struct {
-	ExpireStub        func(cache.SourceKey)
-	expireMutex       sync.RWMutex
-	expireArgsForCall []struct {
-		arg1 cache.SourceKey
-	}
 	ResolveStepsStub        func(string) ([]*v1alpha1.Step, []v1alpha1.BundleLookup, []*v1alpha1.Subscription, error)
 	resolveStepsMutex       sync.RWMutex
-	resolveStepsArgsForCall []struct {
-		arg1 string
-	}
-	resolveStepsReturns struct {
+	resolveStepsArgsForCall []FakeStepResolverResolveStepsArgs
+	resolveStepsReturns     struct {
 		result1 []*v1alpha1.Step
 		result2 []v1alpha1.BundleLookup
 		result3 []*v1alpha1.Subscription
@@ -33,55 +25,29 @@ type FakeStepResolver struct {
 		result4 error
 	}
 	invocations      map[string][][]interface{}
+	callOrder        []string
 	invocationsMutex sync.RWMutex
 }
 
-func (fake *FakeStepResolver) Expire(arg1 cache.SourceKey) {
-	fake.expireMutex.Lock()
-	fake.expireArgsForCall = append(fake.expireArgsForCall, struct {
-		arg1 cache.SourceKey
-	}{arg1})
-	fake.recordInvocation("Expire", []interface{}{arg1})
-	fake.expireMutex.Unlock()
-	if fake.ExpireStub != nil {
-		fake.ExpireStub(arg1)
-	}
-}
-
-func (fake *FakeStepResolver) ExpireCallCount() int {
-	fake.expireMutex.RLock()
-	defer fake.expireMutex.RUnlock()
-	return len(fake.expireArgsForCall)
-}
-
-func (fake *FakeStepResolver) ExpireCalls(stub func(cache.SourceKey)) {
-	fake.expireMutex.Lock()
-	defer fake.expireMutex.Unlock()
-	fake.ExpireStub = stub
-}
-
-func (fake *FakeStepResolver) ExpireArgsForCall(i int) cache.SourceKey {
-	fake.expireMutex.RLock()
-	defer fake.expireMutex.RUnlock()
-	argsForCall := fake.expireArgsForCall[i]
-	return argsForCall.arg1
+// FakeStepResolverResolveStepsArgs holds the arguments of one call to ResolveSteps.
+type FakeStepResolverResolveStepsArgs struct {
+	Arg1 string
 }
 
 func (fake *FakeStepResolver) ResolveSteps(arg1 string) ([]*v1alpha1.Step, []v1alpha1.BundleLookup, []*v1alpha1.Subscription, error) {
 	fake.resolveStepsMutex.Lock()
 	ret, specificReturn := fake.resolveStepsReturnsOnCall[len(fake.resolveStepsArgsForCall)]
-	fake.resolveStepsArgsForCall = append(fake.resolveStepsArgsForCall, struct {
-		arg1 string
-	}{arg1})
+	fake.resolveStepsArgsForCall = append(fake.resolveStepsArgsForCall, FakeStepResolverResolveStepsArgs{arg1})
+	stub := fake.ResolveStepsStub
+	fakeReturns := fake.resolveStepsReturns
 	fake.recordInvocation("ResolveSteps", []interface{}{arg1})
 	fake.resolveStepsMutex.Unlock()
-	if fake.ResolveStepsStub != nil {
-		return fake.ResolveStepsStub(arg1)
+	if stub != nil {
+		return stub(arg1)
 	}
 	if specificReturn {
 		return ret.result1, ret.result2, ret.result3, ret.result4
 	}
-	fakeReturns := fake.resolveStepsReturns
 	return fakeReturns.result1, fakeReturns.result2, fakeReturns.result3, fakeReturns.result4
 }
 
@@ -101,7 +67,15 @@ func (fake *FakeStepResolver) ResolveStepsArgsForCall(i int) string {
 	fake.resolveStepsMutex.RLock()
 	defer fake.resolveStepsMutex.RUnlock()
 	argsForCall := fake.resolveStepsArgsForCall[i]
-	return argsForCall.arg1
+	return argsForCall.Arg1
+}
+
+func (fake *FakeStepResolver) ResolveStepsArgs() []FakeStepResolverResolveStepsArgs {
+	fake.resolveStepsMutex.RLock()
+	defer fake.resolveStepsMutex.RUnlock()
+	args := make([]FakeStepResolverResolveStepsArgs, len(fake.resolveStepsArgsForCall))
+	copy(args, fake.resolveStepsArgsForCall)
+	return args
 }
 
 func (fake *FakeStepResolver) ResolveStepsReturns(result1 []*v1alpha1.Step, result2 []v1alpha1.BundleLookup, result3 []*v1alpha1.Subscription, result4 error) {
@@ -139,10 +113,6 @@ func (fake *FakeStepResolver) ResolveStepsReturnsOnCall(i int, result1 []*v1alph
 func (fake *FakeStepResolver) Invocations() map[string][][]interface{} {
 	fake.invocationsMutex.RLock()
 	defer fake.invocationsMutex.RUnlock()
-	fake.expireMutex.RLock()
-	defer fake.expireMutex.RUnlock()
-	fake.resolveStepsMutex.RLock()
-	defer fake.resolveStepsMutex.RUnlock()
 	copiedInvocations := map[string][][]interface{}{}
 	for key, value := range fake.invocations {
 		copiedInvocations[key] = value
@@ -150,9 +120,18 @@ func (fake *FakeStepResolver) Invocations() map[string][][]interface{} {
 	return copiedInvocations
 }
 
+func (fake *FakeStepResolver) CallOrder() []string {
+	fake.invocationsMutex.RLock()
+	defer fake.invocationsMutex.RUnlock()
+	order := make([]string, len(fake.callOrder))
+	copy(order, fake.callOrder)
+	return order
+}
+
 func (fake *FakeStepResolver) recordInvocation(key string, args []interface{}) {
 	fake.invocationsMutex.Lock()
 	defer fake.invocationsMutex.Unlock()
+	fake.callOrder = append(fake.callOrder, key)
 	if fake.invocations == nil {
 		fake.invocations = map[string][][]interface{}{}
 	}

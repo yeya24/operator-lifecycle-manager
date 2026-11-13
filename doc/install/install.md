@@ -8,30 +8,21 @@ OLM deployment resources are templated so that they can be easily configured for
 
 Installing the CRDs first gives them a chance to register before installing the rest, which requires the CRDs exist.
 ```bash
-kubectl create -f deploy/upstream/quickstart/crds.yaml
-kubectl create -f deploy/upstream/quickstart/olm.yaml
+kubectl create -f https://github.com/operator-framework/operator-lifecycle-manager/releases/latest/download/crds.yaml
+kubectl create -f https://github.com/operator-framework/operator-lifecycle-manager/releases/latest/download/olm.yaml
 ```
 
 ## Install a Release
 
 Check out the latest [releases on github](https://github.com/operator-framework/operator-lifecycle-manager/releases) for release-specific install instructions.
 
-## Run locally with minikube
-
-This command starts minikube, builds the OLM containers locally with the minikube-provided docker, and uses the local configuration in [local-values.yaml](local-values.yaml) to build localized deployment resources for OLM.
-
-```bash
-# To install and run locally
-$ make run-local
-```
-
-You can verify that the OLM components have been successfully deployed by running `kubectl -n local get deployments`
-
-**NOTE** It is recommended for development purposes and will use the source locally
-
 ## OpenShift
 
 **IMPORTANT:** OLM is installed by default in OpenShift 4.0 and above.
+
+## Install with `operator-sdk olm install`
+
+OLM can be installed with the operator-sdk command `operator-sdk olm install` more information is available in the [operator-sdk documentation.](https://sdk.operatorframework.io/docs/cli/operator-sdk_olm_install/)
 
 ## Customizing OLM installation 
 
@@ -130,6 +121,4 @@ spec:
 
 # Uninstall
 
-Run the command `make uninstall`.
-
-**NOTE** Valid just for local/manual installs. 
+OLM can be uninstalled with the `operator-sdk olm uninstall` command. More information is available in the [operator-sdk documentation](https://sdk.operatorframework.io/docs/cli/operator-sdk_olm_uninstall/)

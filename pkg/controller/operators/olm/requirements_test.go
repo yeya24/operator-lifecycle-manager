@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -80,6 +81,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 						Name:      "sa",
 						Namespace: namespace,
 						UID:       types.UID("sa"),
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 						OwnerReferences: []metav1.OwnerReference{
 							{
 								Kind: v1alpha1.ClusterServiceVersionKind,
@@ -92,6 +94,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "role",
 						Namespace: namespace,
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Rules: []rbacv1.PolicyRule{
 						{
@@ -105,6 +108,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "roleBinding",
 						Namespace: namespace,
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Subjects: []rbacv1.Subject{
 						{
@@ -122,7 +126,8 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 				},
 				&rbacv1.ClusterRole{
 					ObjectMeta: metav1.ObjectMeta{
-						Name: "clusterRole",
+						Name:   "clusterRole",
+						Labels: map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Rules: []rbacv1.PolicyRule{
 						{
@@ -133,7 +138,8 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 				},
 				&rbacv1.ClusterRoleBinding{
 					ObjectMeta: metav1.ObjectMeta{
-						Name: "clusterRoleBinding",
+						Name:   "clusterRoleBinding",
+						Labels: map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Subjects: []rbacv1.Subject{
 						{
@@ -224,6 +230,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 						Name:      "sa",
 						Namespace: namespace,
 						UID:       types.UID("sa"),
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 						OwnerReferences: []metav1.OwnerReference{
 							{
 								Kind: v1alpha1.ClusterServiceVersionKind,
@@ -236,6 +243,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "role",
 						Namespace: namespace,
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Rules: []rbacv1.PolicyRule{
 						{
@@ -249,6 +257,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "roleBinding",
 						Namespace: namespace,
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Subjects: []rbacv1.Subject{
 						{
@@ -266,7 +275,8 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 				},
 				&rbacv1.ClusterRole{
 					ObjectMeta: metav1.ObjectMeta{
-						Name: "clusterRole",
+						Name:   "clusterRole",
+						Labels: map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Rules: []rbacv1.PolicyRule{
 						{
@@ -277,7 +287,8 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 				},
 				&rbacv1.ClusterRoleBinding{
 					ObjectMeta: metav1.ObjectMeta{
-						Name: "clusterRoleBinding",
+						Name:   "clusterRoleBinding",
+						Labels: map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Subjects: []rbacv1.Subject{
 						{
@@ -368,6 +379,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 						Name:      "sa",
 						Namespace: namespace,
 						UID:       types.UID("sa"),
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 						OwnerReferences: []metav1.OwnerReference{
 							{
 								Kind: v1alpha1.ClusterServiceVersionKind,
@@ -380,6 +392,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "role",
 						Namespace: namespace,
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Rules: []rbacv1.PolicyRule{
 						{
@@ -393,6 +406,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "roleBinding",
 						Namespace: namespace,
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Subjects: []rbacv1.Subject{
 						{
@@ -410,7 +424,8 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 				},
 				&rbacv1.ClusterRole{
 					ObjectMeta: metav1.ObjectMeta{
-						Name: "clusterRole",
+						Name:   "clusterRole",
+						Labels: map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Rules: []rbacv1.PolicyRule{
 						{
@@ -421,7 +436,8 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 				},
 				&rbacv1.ClusterRoleBinding{
 					ObjectMeta: metav1.ObjectMeta{
-						Name: "clusterRoleBinding",
+						Name:   "clusterRoleBinding",
+						Labels: map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Subjects: []rbacv1.Subject{
 						{
@@ -491,6 +507,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 						Name:      "sa",
 						Namespace: namespace,
 						UID:       types.UID("sa"),
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 						OwnerReferences: []metav1.OwnerReference{
 							{
 								Kind: v1alpha1.ClusterServiceVersionKind,
@@ -503,6 +520,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "role",
 						Namespace: namespace,
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Rules: []rbacv1.PolicyRule{
 						{
@@ -516,6 +534,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "roleBinding",
 						Namespace: namespace,
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 					},
 					Subjects: []rbacv1.Subject{
 						{
@@ -770,6 +789,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 						Name:      "sa",
 						Namespace: namespace,
 						UID:       types.UID("sa"),
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 						OwnerReferences: []metav1.OwnerReference{
 							{
 								Kind: v1alpha1.ClusterServiceVersionKind,
@@ -824,6 +844,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 						Name:      "sa",
 						Namespace: namespace,
 						UID:       types.UID("sa"),
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 						OwnerReferences: []metav1.OwnerReference{
 							{
 								Kind: v1alpha1.SubscriptionKind, // arbitrary non-CSV kind
@@ -877,6 +898,7 @@ func TestRequirementAndPermissionStatus(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "sa",
 						Namespace: namespace,
+						Labels:    map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue},
 						UID:       types.UID("sa"),
 					},
 				},
@@ -948,7 +970,7 @@ func TestMinKubeVersionStatus(t *testing.T) {
 		namespace,
 		"0.0.0",
 		"",
-		v1alpha1.NamedInstallStrategy{"deployment", v1alpha1.StrategyDetailsDeployment{}},
+		v1alpha1.NamedInstallStrategy{StrategyName: "deployment", StrategySpec: v1alpha1.StrategyDetailsDeployment{}},
 		nil,
 		nil,
 		v1alpha1.CSVPhasePending,
@@ -974,7 +996,7 @@ func TestMinKubeVersionStatus(t *testing.T) {
 			minKubeVersion: "0.0.0",
 			expectedMet:    true,
 			expectedRequirementStatuses: []v1alpha1.RequirementStatus{
-				v1alpha1.RequirementStatus{
+				{
 					Status:  v1alpha1.RequirementStatusReasonPresent,
 					Message: fmt.Sprintf("CSV minKubeVersion (%s) less than server version", "0.0.0"),
 					Group:   "operators.coreos.com",
@@ -990,7 +1012,7 @@ func TestMinKubeVersionStatus(t *testing.T) {
 			minKubeVersion: "999.999.999",
 			expectedMet:    false,
 			expectedRequirementStatuses: []v1alpha1.RequirementStatus{
-				v1alpha1.RequirementStatus{
+				{
 					Status:  v1alpha1.RequirementStatusReasonPresentNotSatisfied,
 					Message: fmt.Sprintf("CSV version requirement not met: minKubeVersion (%s)", "999.999.999"),
 					Group:   "operators.coreos.com",
@@ -1006,7 +1028,7 @@ func TestMinKubeVersionStatus(t *testing.T) {
 			minKubeVersion: "a.b.c",
 			expectedMet:    false,
 			expectedRequirementStatuses: []v1alpha1.RequirementStatus{
-				v1alpha1.RequirementStatus{
+				{
 					Status:  v1alpha1.RequirementStatusReasonPresentNotSatisfied,
 					Message: "CSV version parsing error",
 					Group:   "operators.coreos.com",

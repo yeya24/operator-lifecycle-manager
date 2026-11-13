@@ -11,37 +11,51 @@ import (
 	"sync"
 	"time"
 
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/operators/labeller"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/operators/validatingroundtripper"
 	errorwrap "github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/connectivity"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
-	extinf "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/selection"
-	utilclock "k8s.io/apimachinery/pkg/util/clock"
+	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/util/yaml"
+	batchv1applyconfigurations "k8s.io/client-go/applyconfigurations/batch/v1"
+	corev1applyconfigurations "k8s.io/client-go/applyconfigurations/core/v1"
+	networkingv1applyconfigurations "k8s.io/client-go/applyconfigurations/networking/v1"
+	rbacv1applyconfigurations "k8s.io/client-go/applyconfigurations/rbac/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
+	"k8s.io/client-go/metadata"
+	"k8s.io/client-go/metadata/metadatainformer"
+	"k8s.io/client-go/metadata/metadatalister"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/pager"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
+	utilclock "k8s.io/utils/clock"
 
 	"github.com/operator-framework/api/pkg/operators/reference"
+	operatorsv1 "github.com/operator-framework/api/pkg/operators/v1"
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/informers/externalversions"
@@ -50,7 +64,7 @@ import (
 	olmerrors "github.com/operator-framework/operator-lifecycle-manager/pkg/controller/errors"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/operators/catalog/subscription"
-	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/operators/internal/pruning"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/operators/internal/listerwatcher"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/grpc"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/reconciler"
@@ -102,7 +116,8 @@ type Operator struct {
 	catsrcQueueSet           *queueinformer.ResourceQueueSet
 	subQueueSet              *queueinformer.ResourceQueueSet
 	ipQueueSet               *queueinformer.ResourceQueueSet
-	nsResolveQueue           workqueue.RateLimitingInterface
+	ogQueueSet               *queueinformer.ResourceQueueSet
+	nsResolveQueue           workqueue.TypedRateLimitingInterface[types.NamespacedName]
 	namespace                string
 	recorder                 record.EventRecorder
 	sources                  *grpc.SourceStore
@@ -116,12 +131,15 @@ type Operator struct {
 	installPlanTimeout       time.Duration
 	bundleUnpackTimeout      time.Duration
 	clientFactory            clients.Factory
+	muInstallPlan            sync.Mutex
+	resolverSourceProvider   *resolver.RegistrySourceProvider
+	operatorCacheProvider    resolvercache.OperatorCacheProvider
 }
 
 type CatalogSourceSyncFunc func(logger *logrus.Entry, in *v1alpha1.CatalogSource) (out *v1alpha1.CatalogSource, continueSync bool, syncError error)
 
 // NewOperator creates a new Catalog Operator.
-func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clock, logger *logrus.Logger, resync time.Duration, configmapRegistryImage, opmImage, utilImage string, operatorNamespace string, scheme *runtime.Scheme, installPlanTimeout time.Duration, bundleUnpackTimeout time.Duration) (*Operator, error) {
+func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clock, logger *logrus.Logger, resync time.Duration, configmapRegistryImage, opmImage, utilImage string, operatorNamespace string, scheme *runtime.Scheme, installPlanTimeout time.Duration, bundleUnpackTimeout time.Duration, workloadUserID int64) (*Operator, error) {
 	resyncPeriod := queueinformer.ResyncWithJitter(resync, 0.2)
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
 	if err != nil {
@@ -134,14 +152,22 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 		return nil, err
 	}
 
+	// create a config that validates we're creating objects with labels
+	validatingConfig := validatingroundtripper.Wrap(config, scheme)
+
 	// Create a new client for dynamic types (CRs)
-	dynamicClient, err := dynamic.NewForConfig(config)
+	dynamicClient, err := dynamic.NewForConfig(validatingConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	metadataClient, err := metadata.NewForConfig(config)
 	if err != nil {
 		return nil, err
 	}
 
 	// Create a new queueinformer-based operator.
-	opClient, err := operatorclient.NewClientFromRestConfig(config)
+	opClient, err := operatorclient.NewClientFromRestConfig(validatingConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -165,6 +191,11 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 		return nil, err
 	}
 
+	canFilter, err := labeller.Validate(ctx, logger, metadataClient, crClient, labeller.IdentityCatalogOperator)
+	if err != nil {
+		return nil, err
+	}
+
 	// Allocate the new instance of an Operator.
 	op := &Operator{
 		Operator:                 queueOperator,
@@ -179,16 +210,19 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 		catsrcQueueSet:           queueinformer.NewEmptyResourceQueueSet(),
 		subQueueSet:              queueinformer.NewEmptyResourceQueueSet(),
 		ipQueueSet:               queueinformer.NewEmptyResourceQueueSet(),
+		ogQueueSet:               queueinformer.NewEmptyResourceQueueSet(),
 		catalogSubscriberIndexer: map[string]cache.Indexer{},
 		serviceAccountQuerier:    scoped.NewUserDefinedServiceAccountQuerier(logger, crClient),
-		clientAttenuator:         scoped.NewClientAttenuator(logger, config, opClient),
+		clientAttenuator:         scoped.NewClientAttenuator(logger, validatingConfig, opClient),
 		installPlanTimeout:       installPlanTimeout,
 		bundleUnpackTimeout:      bundleUnpackTimeout,
-		clientFactory:            clients.NewFactory(config),
+		clientFactory:            clients.NewFactory(validatingConfig),
 	}
 	op.sources = grpc.NewSourceStore(logger, 10*time.Second, 10*time.Minute, op.syncSourceState)
-	op.reconciler = reconciler.NewRegistryReconcilerFactory(lister, opClient, configmapRegistryImage, op.now, ssaClient)
-	res := resolver.NewOperatorStepResolver(lister, crClient, opClient.KubernetesInterface(), operatorNamespace, op.sources, logger)
+	op.resolverSourceProvider = resolver.SourceProviderFromRegistryClientProvider(op.sources, lister.OperatorsV1alpha1().CatalogSourceLister(), logger)
+	op.operatorCacheProvider = resolver.NewOperatorCacheProvider(lister, crClient, op.resolverSourceProvider, logger)
+	op.reconciler = reconciler.NewRegistryReconcilerFactory(lister, opClient, configmapRegistryImage, op.now, ssaClient, workloadUserID, opmImage, utilImage)
+	res := resolver.NewOperatorStepResolver(lister, crClient, operatorNamespace, op.operatorCacheProvider, logger)
 	op.resolver = resolver.NewInstrumentedResolver(res, metrics.RegisterDependencyResolutionSuccess, metrics.RegisterDependencyResolutionFailure)
 
 	// Wire OLM CR sharedIndexInformers
@@ -196,8 +230,26 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 
 	// Fields are pruned from local copies of the objects managed
 	// by this informer in order to reduce cached size.
-	prunedCSVInformer := cache.NewSharedIndexInformer(
-		pruning.NewListerWatcher(op.client, metav1.NamespaceAll, func(*metav1.ListOptions) {}, pruning.PrunerFunc(func(csv *v1alpha1.ClusterServiceVersion) {
+	prunedCSVInformer := cache.NewSharedIndexInformerWithOptions(
+		listerwatcher.NewListerWatcher(
+			op.client,
+			metav1.NamespaceAll,
+			func(options *metav1.ListOptions) {
+				options.LabelSelector = fmt.Sprintf("!%s", v1alpha1.CopiedLabelKey)
+			},
+		),
+		&v1alpha1.ClusterServiceVersion{},
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: resyncPeriod(),
+			Indexers: cache.Indexers{
+				cache.NamespaceIndex: cache.MetaNamespaceIndexFunc,
+			},
+		},
+	)
+
+	// Transformed the CSV to be just the necessary data
+	prunedCSVTransformFunc := func(i interface{}) (interface{}, error) {
+		if csv, ok := i.(*v1alpha1.ClusterServiceVersion); ok {
 			*csv = v1alpha1.ClusterServiceVersion{
 				TypeMeta: csv.TypeMeta,
 				ObjectMeta: metav1.ObjectMeta{
@@ -217,13 +269,14 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 					Reason: csv.Status.Reason,
 				},
 			}
-		})),
-		&v1alpha1.ClusterServiceVersion{},
-		resyncPeriod(),
-		cache.Indexers{
-			cache.NamespaceIndex: cache.MetaNamespaceIndexFunc,
-		},
-	)
+			return csv, nil
+		}
+		return nil, fmt.Errorf("unable to convert input to CSV")
+	}
+
+	if err := prunedCSVInformer.SetTransform(prunedCSVTransformFunc); err != nil {
+		return nil, err
+	}
 	csvLister := operatorsv1alpha1listers.NewClusterServiceVersionLister(prunedCSVInformer.GetIndexer())
 	op.lister.OperatorsV1alpha1().RegisterClusterServiceVersionLister(metav1.NamespaceAll, csvLister)
 	if err := op.RegisterInformer(prunedCSVInformer); err != nil {
@@ -235,7 +288,10 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 	// Wire InstallPlans
 	ipInformer := crInformerFactory.Operators().V1alpha1().InstallPlans()
 	op.lister.OperatorsV1alpha1().RegisterInstallPlanLister(metav1.NamespaceAll, ipInformer.Lister())
-	ipQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "ips")
+	ipQueue := workqueue.NewTypedRateLimitingQueueWithConfig[types.NamespacedName](workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName](),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: "ips",
+		})
 	op.ipQueueSet.Set(metav1.NamespaceAll, ipQueue)
 	ipQueueInformer, err := queueinformer.NewQueueInformer(
 		ctx,
@@ -252,10 +308,34 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 		return nil, err
 	}
 
+	operatorGroupInformer := crInformerFactory.Operators().V1().OperatorGroups()
+	op.lister.OperatorsV1().RegisterOperatorGroupLister(metav1.NamespaceAll, operatorGroupInformer.Lister())
+	ogQueue := workqueue.NewTypedRateLimitingQueueWithConfig[types.NamespacedName](workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName](),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: "ogs",
+		})
+	op.ogQueueSet.Set(metav1.NamespaceAll, ogQueue)
+	operatorGroupQueueInformer, err := queueinformer.NewQueueInformer(
+		ctx,
+		queueinformer.WithLogger(op.logger),
+		queueinformer.WithQueue(ogQueue),
+		queueinformer.WithInformer(operatorGroupInformer.Informer()),
+		queueinformer.WithSyncer(queueinformer.LegacySyncHandler(op.syncOperatorGroups).ToSyncer()),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := op.RegisterQueueInformer(operatorGroupQueueInformer); err != nil {
+		return nil, err
+	}
+
 	// Wire CatalogSources
 	catsrcInformer := crInformerFactory.Operators().V1alpha1().CatalogSources()
 	op.lister.OperatorsV1alpha1().RegisterCatalogSourceLister(metav1.NamespaceAll, catsrcInformer.Lister())
-	catsrcQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "catsrcs")
+	catsrcQueue := workqueue.NewTypedRateLimitingQueueWithConfig[types.NamespacedName](workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName](),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: "catsrcs",
+		})
 	op.catsrcQueueSet.Set(metav1.NamespaceAll, catsrcQueue)
 	catsrcQueueInformer, err := queueinformer.NewQueueInformer(
 		ctx,
@@ -263,7 +343,8 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 		queueinformer.WithLogger(op.logger),
 		queueinformer.WithQueue(catsrcQueue),
 		queueinformer.WithInformer(catsrcInformer.Informer()),
-		queueinformer.WithSyncer(queueinformer.LegacySyncHandler(op.syncCatalogSources).ToSyncerWithDelete(op.handleCatSrcDeletion)),
+		queueinformer.WithSyncer(queueinformer.LegacySyncHandler(op.syncCatalogSources).ToSyncer()),
+		queueinformer.WithDeletionHandler(op.handleCatSrcDeletion),
 	)
 	if err != nil {
 		return nil, err
@@ -281,7 +362,10 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 	subIndexer := subInformer.Informer().GetIndexer()
 	op.catalogSubscriberIndexer[metav1.NamespaceAll] = subIndexer
 
-	subQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "subs")
+	subQueue := workqueue.NewTypedRateLimitingQueueWithConfig[types.NamespacedName](workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName](),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: "subs",
+		})
 	op.subQueueSet.Set(metav1.NamespaceAll, subQueue)
 	subSyncer, err := subscription.NewSyncer(
 		ctx,
@@ -292,9 +376,10 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 		subscription.WithCatalogInformer(catsrcInformer.Informer()),
 		subscription.WithInstallPlanInformer(ipInformer.Informer()),
 		subscription.WithSubscriptionQueue(subQueue),
-		subscription.WithAppendedReconcilers(subscription.ReconcilerFromLegacySyncHandler(op.syncSubscriptions, nil)),
+		subscription.WithAppendedReconcilers(subscription.ReconcilerFromLegacySyncHandler(op.syncSubscriptions)),
 		subscription.WithRegistryReconcilerFactory(op.reconciler),
 		subscription.WithGlobalCatalogNamespace(op.namespace),
+		subscription.WithOperatorCacheProvider(op.operatorCacheProvider),
 	)
 	if err != nil {
 		return nil, err
@@ -315,7 +400,14 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 	}
 
 	// Wire k8s sharedIndexInformers
-	k8sInformerFactory := informers.NewSharedInformerFactoryWithOptions(op.opClient.KubernetesInterface(), resyncPeriod())
+	k8sInformerFactory := informers.NewSharedInformerFactoryWithOptions(op.opClient.KubernetesInterface(), resyncPeriod(), func() []informers.SharedInformerOption {
+		if !canFilter {
+			return nil
+		}
+		return []informers.SharedInformerOption{informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = labels.SelectorFromSet(labels.Set{install.OLMManagedLabelKey: install.OLMManagedLabelValue}).String()
+		})}
+	}()...)
 	sharedIndexInformers := []cache.SharedIndexInformer{}
 
 	// Wire Roles
@@ -323,20 +415,224 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 	op.lister.RbacV1().RegisterRoleLister(metav1.NamespaceAll, roleInformer.Lister())
 	sharedIndexInformers = append(sharedIndexInformers, roleInformer.Informer())
 
+	complete := map[schema.GroupVersionResource][]bool{}
+	completeLock := &sync.Mutex{}
+
+	labelObjects := func(gvr schema.GroupVersionResource, informer cache.SharedIndexInformer, sync func(done func() bool) queueinformer.LegacySyncHandler) error {
+		if canFilter {
+			return nil
+		}
+
+		// for each GVR, we may have more than one labelling controller active; each of which detects
+		// when it is done; we allocate a space in complete[gvr][idx] to hold that outcome and track it
+		var idx int
+		if _, exists := complete[gvr]; exists {
+			idx = len(complete[gvr])
+			complete[gvr] = append(complete[gvr], false)
+		} else {
+			idx = 0
+			complete[gvr] = []bool{false}
+		}
+		logger := op.logger.WithFields(logrus.Fields{"gvr": gvr.String(), "index": idx})
+		logger.Info("registering labeller")
+
+		queue := workqueue.NewTypedRateLimitingQueueWithConfig[types.NamespacedName](workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName](), workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: gvr.String(),
+		})
+		queueInformer, err := queueinformer.NewQueueInformer(
+			ctx,
+			queueinformer.WithQueue(queue),
+			queueinformer.WithLogger(op.logger),
+			queueinformer.WithInformer(informer),
+			queueinformer.WithSyncer(sync(func() bool {
+				// this function is called by the processor when it detects that it's work is done - so, for that
+				// particular labelling action on that particular GVR, all objects are in the correct state. when
+				// that action is done, we need to further know if that was the last action to be completed, as
+				// when every action we know about has been completed, we re-start the process to allow the future
+				// invocation of this process to filter informers (canFilter = true) and elide all this logic
+				completeLock.Lock()
+				logger.Info("labeller complete")
+				complete[gvr][idx] = true
+				allDone := true
+				for _, items := range complete {
+					for _, done := range items {
+						allDone = allDone && done
+					}
+				}
+				completeLock.Unlock()
+				return allDone
+			}).ToSyncer()),
+		)
+		if err != nil {
+			return err
+		}
+
+		if err := op.RegisterQueueInformer(queueInformer); err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	rolesgvk := rbacv1.SchemeGroupVersion.WithResource("roles")
+	if err := labelObjects(rolesgvk, roleInformer.Informer(), labeller.ObjectLabeler[*rbacv1.Role, *rbacv1applyconfigurations.RoleApplyConfiguration](
+		ctx, op.logger, labeller.Filter(rolesgvk),
+		roleInformer.Lister().List,
+		rbacv1applyconfigurations.Role,
+		func(namespace string, ctx context.Context, cfg *rbacv1applyconfigurations.RoleApplyConfiguration, opts metav1.ApplyOptions) (*rbacv1.Role, error) {
+			return op.opClient.KubernetesInterface().RbacV1().Roles(namespace).Apply(ctx, cfg, opts)
+		},
+	)); err != nil {
+		return nil, err
+	}
+	if err := labelObjects(rolesgvk, roleInformer.Informer(), labeller.ContentHashLabeler[*rbacv1.Role, *rbacv1applyconfigurations.RoleApplyConfiguration](
+		ctx, op.logger, labeller.ContentHashFilter,
+		func(role *rbacv1.Role) (string, error) {
+			return resolver.PolicyRuleHashLabelValue(role.Rules)
+		},
+		roleInformer.Lister().List,
+		rbacv1applyconfigurations.Role,
+		func(namespace string, ctx context.Context, cfg *rbacv1applyconfigurations.RoleApplyConfiguration, opts metav1.ApplyOptions) (*rbacv1.Role, error) {
+			return op.opClient.KubernetesInterface().RbacV1().Roles(namespace).Apply(ctx, cfg, opts)
+		},
+	)); err != nil {
+		return nil, err
+	}
+
 	// Wire RoleBindings
 	roleBindingInformer := k8sInformerFactory.Rbac().V1().RoleBindings()
 	op.lister.RbacV1().RegisterRoleBindingLister(metav1.NamespaceAll, roleBindingInformer.Lister())
 	sharedIndexInformers = append(sharedIndexInformers, roleBindingInformer.Informer())
+
+	rolebindingsgvk := rbacv1.SchemeGroupVersion.WithResource("rolebindings")
+	if err := labelObjects(rolebindingsgvk, roleBindingInformer.Informer(), labeller.ObjectLabeler[*rbacv1.RoleBinding, *rbacv1applyconfigurations.RoleBindingApplyConfiguration](
+		ctx, op.logger, labeller.Filter(rolebindingsgvk),
+		roleBindingInformer.Lister().List,
+		rbacv1applyconfigurations.RoleBinding,
+		func(namespace string, ctx context.Context, cfg *rbacv1applyconfigurations.RoleBindingApplyConfiguration, opts metav1.ApplyOptions) (*rbacv1.RoleBinding, error) {
+			return op.opClient.KubernetesInterface().RbacV1().RoleBindings(namespace).Apply(ctx, cfg, opts)
+		},
+	)); err != nil {
+		return nil, err
+	}
+	if err := labelObjects(rolebindingsgvk, roleBindingInformer.Informer(), labeller.ContentHashLabeler[*rbacv1.RoleBinding, *rbacv1applyconfigurations.RoleBindingApplyConfiguration](
+		ctx, op.logger, labeller.ContentHashFilter,
+		func(roleBinding *rbacv1.RoleBinding) (string, error) {
+			return resolver.RoleReferenceAndSubjectHashLabelValue(roleBinding.RoleRef, roleBinding.Subjects)
+		},
+		roleBindingInformer.Lister().List,
+		rbacv1applyconfigurations.RoleBinding,
+		func(namespace string, ctx context.Context, cfg *rbacv1applyconfigurations.RoleBindingApplyConfiguration, opts metav1.ApplyOptions) (*rbacv1.RoleBinding, error) {
+			return op.opClient.KubernetesInterface().RbacV1().RoleBindings(namespace).Apply(ctx, cfg, opts)
+		},
+	)); err != nil {
+		return nil, err
+	}
 
 	// Wire ServiceAccounts
 	serviceAccountInformer := k8sInformerFactory.Core().V1().ServiceAccounts()
 	op.lister.CoreV1().RegisterServiceAccountLister(metav1.NamespaceAll, serviceAccountInformer.Lister())
 	sharedIndexInformers = append(sharedIndexInformers, serviceAccountInformer.Informer())
 
+	serviceaccountsgvk := corev1.SchemeGroupVersion.WithResource("serviceaccounts")
+	if err := labelObjects(serviceaccountsgvk, serviceAccountInformer.Informer(), labeller.ObjectLabeler[*corev1.ServiceAccount, *corev1applyconfigurations.ServiceAccountApplyConfiguration](
+		ctx, op.logger, labeller.ServiceAccountFilter(func(namespace, name string) bool {
+			operatorGroups, err := operatorGroupInformer.Lister().OperatorGroups(namespace).List(labels.Everything())
+			if err != nil {
+				return false
+			}
+			for _, operatorGroup := range operatorGroups {
+				if operatorGroup.Spec.ServiceAccountName == name {
+					return true
+				}
+			}
+			return false
+		}),
+		serviceAccountInformer.Lister().List,
+		corev1applyconfigurations.ServiceAccount,
+		func(namespace string, ctx context.Context, cfg *corev1applyconfigurations.ServiceAccountApplyConfiguration, opts metav1.ApplyOptions) (*corev1.ServiceAccount, error) {
+			return op.opClient.KubernetesInterface().CoreV1().ServiceAccounts(namespace).Apply(ctx, cfg, opts)
+		},
+	)); err != nil {
+		return nil, err
+	}
+
 	// Wire Services
 	serviceInformer := k8sInformerFactory.Core().V1().Services()
 	op.lister.CoreV1().RegisterServiceLister(metav1.NamespaceAll, serviceInformer.Lister())
 	sharedIndexInformers = append(sharedIndexInformers, serviceInformer.Informer())
+
+	servicesgvk := corev1.SchemeGroupVersion.WithResource("services")
+	if err := labelObjects(servicesgvk, serviceInformer.Informer(), labeller.ObjectLabeler[*corev1.Service, *corev1applyconfigurations.ServiceApplyConfiguration](
+		ctx, op.logger, labeller.Filter(servicesgvk),
+		serviceInformer.Lister().List,
+		corev1applyconfigurations.Service,
+		func(namespace string, ctx context.Context, cfg *corev1applyconfigurations.ServiceApplyConfiguration, opts metav1.ApplyOptions) (*corev1.Service, error) {
+			return op.opClient.KubernetesInterface().CoreV1().Services(namespace).Apply(ctx, cfg, opts)
+		},
+	)); err != nil {
+		return nil, err
+	}
+
+	{
+		gvr := servicesgvk
+		informer := serviceInformer.Informer()
+
+		logger := op.logger.WithFields(logrus.Fields{"gvr": gvr.String()})
+		logger.Info("registering owner reference fixer")
+
+		queue := workqueue.NewTypedRateLimitingQueueWithConfig[types.NamespacedName](workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName](), workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: gvr.String(),
+		})
+		queueInformer, err := queueinformer.NewQueueInformer(
+			ctx,
+			queueinformer.WithQueue(queue),
+			queueinformer.WithLogger(op.logger),
+			queueinformer.WithInformer(informer),
+			queueinformer.WithSyncer(queueinformer.LegacySyncHandler(func(obj interface{}) error {
+				service, ok := obj.(*corev1.Service)
+				if !ok {
+					err := fmt.Errorf("wrong type %T, expected %T: %#v", obj, new(*corev1.Service), obj)
+					logger.WithError(err).Error("casting failed")
+					return fmt.Errorf("casting failed: %w", err)
+				}
+
+				deduped := deduplicateOwnerReferences(service.OwnerReferences)
+				if len(deduped) != len(service.OwnerReferences) {
+					localCopy := service.DeepCopy()
+					localCopy.OwnerReferences = deduped
+					if _, err := op.opClient.KubernetesInterface().CoreV1().Services(service.Namespace).Update(ctx, localCopy, metav1.UpdateOptions{}); err != nil {
+						return err
+					}
+				}
+				return nil
+			}).ToSyncer()),
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := op.RegisterQueueInformer(queueInformer); err != nil {
+			return nil, err
+		}
+	}
+
+	// Wire NetworkPolicies
+	networkPolicyInformer := k8sInformerFactory.Networking().V1().NetworkPolicies()
+	op.lister.NetworkingV1().RegisterNetworkPolicyLister(metav1.NamespaceAll, networkPolicyInformer.Lister())
+	sharedIndexInformers = append(sharedIndexInformers, networkPolicyInformer.Informer())
+
+	networkPoliciesGVR := networkingv1.SchemeGroupVersion.WithResource("networkpolicies")
+	if err := labelObjects(networkPoliciesGVR, networkPolicyInformer.Informer(), labeller.ObjectLabeler[*networkingv1.NetworkPolicy, *networkingv1applyconfigurations.NetworkPolicyApplyConfiguration](
+		ctx, op.logger, labeller.Filter(networkPoliciesGVR),
+		networkPolicyInformer.Lister().List,
+		networkingv1applyconfigurations.NetworkPolicy,
+		func(namespace string, ctx context.Context, cfg *networkingv1applyconfigurations.NetworkPolicyApplyConfiguration, opts metav1.ApplyOptions) (*networkingv1.NetworkPolicy, error) {
+			return op.opClient.KubernetesInterface().NetworkingV1().NetworkPolicies(namespace).Apply(ctx, cfg, opts)
+		},
+	)); err != nil {
+		return nil, err
+	}
 
 	// Wire Pods for CatalogSource
 	catsrcReq, err := labels.NewRequirement(reconciler.CatalogSourceLabelKey, selection.Exists, nil)
@@ -352,6 +648,18 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 	op.lister.CoreV1().RegisterPodLister(metav1.NamespaceAll, csPodInformer.Lister())
 	sharedIndexInformers = append(sharedIndexInformers, csPodInformer.Informer())
 
+	podsgvk := corev1.SchemeGroupVersion.WithResource("pods")
+	if err := labelObjects(podsgvk, csPodInformer.Informer(), labeller.ObjectLabeler[*corev1.Pod, *corev1applyconfigurations.PodApplyConfiguration](
+		ctx, op.logger, labeller.Filter(podsgvk),
+		csPodInformer.Lister().List,
+		corev1applyconfigurations.Pod,
+		func(namespace string, ctx context.Context, cfg *corev1applyconfigurations.PodApplyConfiguration, opts metav1.ApplyOptions) (*corev1.Pod, error) {
+			return op.opClient.KubernetesInterface().CoreV1().Pods(namespace).Apply(ctx, cfg, opts)
+		},
+	)); err != nil {
+		return nil, err
+	}
+
 	// Wire Pods for BundleUnpack job
 	buReq, err := labels.NewRequirement(bundle.BundleUnpackPodLabel, selection.Exists, nil)
 	if err != nil {
@@ -366,24 +674,48 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 	sharedIndexInformers = append(sharedIndexInformers, buPodInformer.Informer())
 
 	// Wire ConfigMaps
-	configMapInformer := informers.NewSharedInformerFactoryWithOptions(op.opClient.KubernetesInterface(), resyncPeriod(), informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-		options.LabelSelector = install.OLMManagedLabelKey
-	})).Core().V1().ConfigMaps()
+	configMapInformer := k8sInformerFactory.Core().V1().ConfigMaps()
 	op.lister.CoreV1().RegisterConfigMapLister(metav1.NamespaceAll, configMapInformer.Lister())
 	sharedIndexInformers = append(sharedIndexInformers, configMapInformer.Informer())
+	configmapsgvk := corev1.SchemeGroupVersion.WithResource("configmaps")
+	if err := labelObjects(configmapsgvk, configMapInformer.Informer(), labeller.ObjectLabeler[*corev1.ConfigMap, *corev1applyconfigurations.ConfigMapApplyConfiguration](
+		ctx, op.logger, labeller.Filter(configmapsgvk),
+		configMapInformer.Lister().List,
+		corev1applyconfigurations.ConfigMap,
+		func(namespace string, ctx context.Context, cfg *corev1applyconfigurations.ConfigMapApplyConfiguration, opts metav1.ApplyOptions) (*corev1.ConfigMap, error) {
+			return op.opClient.KubernetesInterface().CoreV1().ConfigMaps(namespace).Apply(ctx, cfg, opts)
+		},
+	)); err != nil {
+		return nil, err
+	}
 
 	// Wire Jobs
 	jobInformer := k8sInformerFactory.Batch().V1().Jobs()
 	sharedIndexInformers = append(sharedIndexInformers, jobInformer.Informer())
 
+	jobsgvk := batchv1.SchemeGroupVersion.WithResource("jobs")
+	if err := labelObjects(jobsgvk, jobInformer.Informer(), labeller.ObjectLabeler[*batchv1.Job, *batchv1applyconfigurations.JobApplyConfiguration](
+		ctx, op.logger, labeller.JobFilter(func(namespace, name string) (metav1.Object, error) {
+			return configMapInformer.Lister().ConfigMaps(namespace).Get(name)
+		}),
+		jobInformer.Lister().List,
+		batchv1applyconfigurations.Job,
+		func(namespace string, ctx context.Context, cfg *batchv1applyconfigurations.JobApplyConfiguration, opts metav1.ApplyOptions) (*batchv1.Job, error) {
+			return op.opClient.KubernetesInterface().BatchV1().Jobs(namespace).Apply(ctx, cfg, opts)
+		},
+	)); err != nil {
+		return nil, err
+	}
+
 	// Generate and register QueueInformers for k8s resources
-	k8sSyncer := queueinformer.LegacySyncHandler(op.syncObject).ToSyncerWithDelete(op.handleDeletion)
+	k8sSyncer := queueinformer.LegacySyncHandler(op.syncObject).ToSyncer()
 	for _, informer := range sharedIndexInformers {
 		queueInformer, err := queueinformer.NewQueueInformer(
 			ctx,
 			queueinformer.WithLogger(op.logger),
 			queueinformer.WithInformer(informer),
 			queueinformer.WithSyncer(k8sSyncer),
+			queueinformer.WithDeletionHandler(op.handleDeletion),
 		)
 		if err != nil {
 			return nil, err
@@ -404,23 +736,36 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 		bundle.WithPodLister(buPodInformer.Lister()),
 		bundle.WithRoleLister(roleInformer.Lister()),
 		bundle.WithRoleBindingLister(roleBindingInformer.Lister()),
+		bundle.WithServiceAccountLister(serviceAccountInformer.Lister()),
 		bundle.WithOPMImage(opmImage),
 		bundle.WithUtilImage(utilImage),
 		bundle.WithNow(op.now),
 		bundle.WithUnpackTimeout(op.bundleUnpackTimeout),
+		bundle.WithUserID(workloadUserID),
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	// Register CustomResourceDefinition QueueInformer
-	crdInformer := extinf.NewSharedInformerFactory(op.opClient.ApiextensionsInterface(), resyncPeriod()).Apiextensions().V1().CustomResourceDefinitions()
-	op.lister.APIExtensionsV1().RegisterCustomResourceDefinitionLister(crdInformer.Lister())
+	// Register CustomResourceDefinition QueueInformer. Object metadata requests are used
+	// by this informer in order to reduce cached size.
+	gvr := apiextensionsv1.SchemeGroupVersion.WithResource("customresourcedefinitions")
+	crdInformer := metadatainformer.NewFilteredMetadataInformer(
+		metadataClient,
+		gvr,
+		metav1.NamespaceAll,
+		resyncPeriod(),
+		cache.Indexers{},
+		nil,
+	).Informer()
+	crdLister := metadatalister.New(crdInformer.GetIndexer(), gvr)
+	op.lister.APIExtensionsV1().RegisterCustomResourceDefinitionLister(crdLister)
 	crdQueueInformer, err := queueinformer.NewQueueInformer(
 		ctx,
 		queueinformer.WithLogger(op.logger),
-		queueinformer.WithInformer(crdInformer.Informer()),
-		queueinformer.WithSyncer(queueinformer.LegacySyncHandler(op.syncObject).ToSyncerWithDelete(op.handleDeletion)),
+		queueinformer.WithInformer(crdInformer),
+		queueinformer.WithSyncer(queueinformer.LegacySyncHandler(op.syncObject).ToSyncer()),
+		queueinformer.WithDeletionHandler(op.handleDeletion),
 	)
 	if err != nil {
 		return nil, err
@@ -429,10 +774,22 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 		return nil, err
 	}
 
+	customresourcedefinitionsgvk := apiextensionsv1.SchemeGroupVersion.WithResource("customresourcedefinitions")
+	if err := labelObjects(customresourcedefinitionsgvk, crdInformer, labeller.ObjectPatchLabeler(
+		ctx, op.logger, labeller.Filter(customresourcedefinitionsgvk),
+		crdLister.List,
+		op.opClient.ApiextensionsInterface().ApiextensionsV1().CustomResourceDefinitions().Patch,
+	)); err != nil {
+		return nil, err
+	}
+
 	// Namespace sync for resolving subscriptions
 	namespaceInformer := informers.NewSharedInformerFactory(op.opClient.KubernetesInterface(), resyncPeriod()).Core().V1().Namespaces()
 	op.lister.CoreV1().RegisterNamespaceLister(namespaceInformer.Lister())
-	op.nsResolveQueue = workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "resolver")
+	op.nsResolveQueue = workqueue.NewTypedRateLimitingQueueWithConfig[types.NamespacedName](workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName](),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: "resolve",
+		})
 	namespaceQueueInformer, err := queueinformer.NewQueueInformer(
 		ctx,
 		queueinformer.WithLogger(op.logger),
@@ -461,22 +818,23 @@ func (o *Operator) syncSourceState(state grpc.SourceState) {
 
 	o.logger.Infof("state.Key.Namespace=%s state.Key.Name=%s state.State=%s", state.Key.Namespace, state.Key.Name, state.State.String())
 	metrics.RegisterCatalogSourceState(state.Key.Name, state.Key.Namespace, state.State)
+	metrics.RegisterCatalogSourceSnapshotsTotal(state.Key.Name, state.Key.Namespace)
 
 	switch state.State {
 	case connectivity.Ready:
-		o.resolver.Expire(resolvercache.SourceKey(state.Key))
+		o.resolverSourceProvider.Invalidate(resolvercache.SourceKey(state.Key))
 		if o.namespace == state.Key.Namespace {
 			namespaces, err := index.CatalogSubscriberNamespaces(o.catalogSubscriberIndexer,
 				state.Key.Name, state.Key.Namespace)
 
 			if err == nil {
 				for ns := range namespaces {
-					o.nsResolveQueue.Add(ns)
+					o.nsResolveQueue.Add(types.NamespacedName{Name: ns})
 				}
 			}
 		}
 
-		o.nsResolveQueue.Add(state.Key.Namespace)
+		o.nsResolveQueue.Add(types.NamespacedName{Name: state.Key.Namespace})
 	}
 	if err := o.catsrcQueueSet.Requeue(state.Key.Namespace, state.Key.Name); err != nil {
 		o.logger.WithError(err).Info("couldn't requeue catalogsource from catalog status change")
@@ -552,25 +910,21 @@ func (o *Operator) handleDeletion(obj interface{}) {
 	}).Debug("handling object deletion")
 
 	o.requeueOwners(metaObj)
-
-	return
 }
 
 func (o *Operator) handleCatSrcDeletion(obj interface{}) {
 	catsrc, ok := obj.(metav1.Object)
 	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
-			tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-			if !ok {
-				utilruntime.HandleError(fmt.Errorf("Couldn't get object from tombstone %#v", obj))
-				return
-			}
+			utilruntime.HandleError(fmt.Errorf("couldn't get object from tombstone %#v", obj))
+			return
+		}
 
-			catsrc, ok = tombstone.Obj.(metav1.Object)
-			if !ok {
-				utilruntime.HandleError(fmt.Errorf("Tombstone contained object that is not a Namespace %#v", obj))
-				return
-			}
+		catsrc, ok = tombstone.Obj.(metav1.Object)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("tombstone contained object that is not a Namespace %#v", obj))
+			return
 		}
 	}
 	sourceKey := registry.CatalogKey{Name: catsrc.GetName(), Namespace: catsrc.GetNamespace()}
@@ -580,6 +934,7 @@ func (o *Operator) handleCatSrcDeletion(obj interface{}) {
 	o.logger.WithField("source", sourceKey).Info("removed client for deleted catalogsource")
 
 	metrics.DeleteCatalogSourceStateMetric(catsrc.GetName(), catsrc.GetNamespace())
+	metrics.DeleteCatalogSourceSnapshotsTotal(catsrc.GetName(), catsrc.GetNamespace())
 }
 
 func validateSourceType(logger *logrus.Entry, in *v1alpha1.CatalogSource) (out *v1alpha1.CatalogSource, continueSync bool, _ error) {
@@ -598,6 +953,7 @@ func validateSourceType(logger *logrus.Entry, in *v1alpha1.CatalogSource) (out *
 		err = fmt.Errorf("unknown sourcetype: %s", sourceType)
 	}
 	if err != nil {
+		logger.WithError(err).Error("error validating catalog source type")
 		out.SetError(v1alpha1.CatalogSourceSpecInvalidError, err)
 		return
 	}
@@ -609,7 +965,6 @@ func validateSourceType(logger *logrus.Entry, in *v1alpha1.CatalogSource) (out *
 		}
 	}
 	continueSync = true
-
 	return
 }
 
@@ -622,23 +977,22 @@ func (o *Operator) syncConfigMap(logger *logrus.Entry, in *v1alpha1.CatalogSourc
 
 	out = in.DeepCopy()
 
-	logger.Debug("checking catsrc configmap state")
-
 	var updateLabel bool
 	// Get the catalog source's config map
 	configMap, err := o.lister.CoreV1().ConfigMapLister().ConfigMaps(in.GetNamespace()).Get(in.Spec.ConfigMap)
 	// Attempt to look up the CM via api call if there is a cache miss
-	if k8serrors.IsNotFound(err) {
+	if apierrors.IsNotFound(err) {
+		// TODO: Don't reach out via live client if its not found in the cache (https://github.com/operator-framework/operator-lifecycle-manager/issues/3415)
 		configMap, err = o.opClient.KubernetesInterface().CoreV1().ConfigMaps(in.GetNamespace()).Get(context.TODO(), in.Spec.ConfigMap, metav1.GetOptions{})
 		// Found cm in the cluster, add managed label to configmap
 		if err == nil {
-			labels := configMap.GetLabels()
-			if labels == nil {
-				labels = make(map[string]string)
+			cmLabels := configMap.GetLabels()
+			if cmLabels == nil {
+				cmLabels = make(map[string]string)
 			}
 
-			labels[install.OLMManagedLabelKey] = "false"
-			configMap.SetLabels(labels)
+			cmLabels[install.OLMManagedLabelKey] = "false"
+			configMap.SetLabels(cmLabels)
 			updateLabel = true
 		}
 	}
@@ -655,12 +1009,9 @@ func (o *Operator) syncConfigMap(logger *logrus.Entry, in *v1alpha1.CatalogSourc
 			out.SetError(v1alpha1.CatalogSourceConfigMapError, syncError)
 			return
 		}
-
-		logger.Debug("adopted configmap")
 	}
 
 	if in.Status.ConfigMapResource == nil || !in.Status.ConfigMapResource.IsAMatch(&configMap.ObjectMeta) {
-		logger.Debug("updating catsrc configmap state")
 		// configmap ref nonexistent or updated, write out the new configmap ref to status and exit
 		out.Status.ConfigMapResource = &v1alpha1.ConfigMapResourceReference{
 			Name:            configMap.GetName(),
@@ -689,17 +1040,14 @@ func (o *Operator) syncRegistryServer(logger *logrus.Entry, in *v1alpha1.Catalog
 		return
 	}
 
-	healthy, err := srcReconciler.CheckRegistryServer(in)
+	healthy, err := srcReconciler.CheckRegistryServer(logger, in)
 	if err != nil {
 		syncError = err
 		out.SetError(v1alpha1.CatalogSourceRegistryServerError, syncError)
 		return
 	}
 
-	logger.Debugf("check registry server healthy: %t", healthy)
-
 	if healthy && in.Status.RegistryServiceStatus != nil {
-		logger.Debug("registry state good")
 		continueSync = true
 		// return here if catalog does not have polling enabled
 		if !out.Poll() {
@@ -708,33 +1056,37 @@ func (o *Operator) syncRegistryServer(logger *logrus.Entry, in *v1alpha1.Catalog
 	}
 
 	// Registry pod hasn't been created or hasn't been updated since the last configmap update, recreate it
-	logger.Debug("ensuring registry server")
-
-	err = srcReconciler.EnsureRegistryServer(out)
+	err = srcReconciler.EnsureRegistryServer(logger, out)
 	if err != nil {
 		if _, ok := err.(reconciler.UpdateNotReadyErr); ok {
-			logger.Debug("requeueing registry server for catalog update check: update pod not yet ready")
+			logger.Info("requeueing registry server for catalog update check: update pod not yet ready")
 			o.catsrcQueueSet.RequeueAfter(out.GetNamespace(), out.GetName(), reconciler.CatalogPollingRequeuePeriod)
 			return
-		} else {
-			syncError = fmt.Errorf("couldn't ensure registry server - %v", err)
-			out.SetError(v1alpha1.CatalogSourceRegistryServerError, syncError)
-			return
 		}
+		syncError = fmt.Errorf("couldn't ensure registry server - %v", err)
+		out.SetError(v1alpha1.CatalogSourceRegistryServerError, syncError)
+		return
 	}
 
-	logger.Debug("ensured registry server")
-
 	// requeue the catalog sync based on the polling interval, for accurate syncs of catalogs with polling enabled
-	if out.Spec.UpdateStrategy != nil {
-		logger.Debugf("requeuing registry server sync based on polling interval %s", out.Spec.UpdateStrategy.Interval.Duration.String())
+	if out.Spec.UpdateStrategy != nil && out.Spec.UpdateStrategy.RegistryPoll != nil {
+		if out.Spec.UpdateStrategy.Interval == nil {
+			syncError = fmt.Errorf("empty polling interval; cannot requeue registry server sync without a provided polling interval")
+			out.SetError(v1alpha1.CatalogSourceIntervalInvalidError, syncError)
+			return
+		}
+		if out.Spec.UpdateStrategy.RegistryPoll.ParsingError != "" && out.Status.Reason != v1alpha1.CatalogSourceIntervalInvalidError {
+			err := errors.New(out.Spec.UpdateStrategy.RegistryPoll.ParsingError)
+			logger.WithError(err).Error("registry server sync error: failed to parse registry poll interval")
+			out.SetError(v1alpha1.CatalogSourceIntervalInvalidError, err)
+		}
 		resyncPeriod := reconciler.SyncRegistryUpdateInterval(out, time.Now())
 		o.catsrcQueueSet.RequeueAfter(out.GetNamespace(), out.GetName(), queueinformer.ResyncWithJitter(resyncPeriod, 0.1)())
 		return
 	}
 
 	if err := o.sources.Remove(sourceKey); err != nil {
-		o.logger.WithError(err).Debug("error closing client connection")
+		o.logger.WithError(err).Error("registry server sync error: error closing client connection")
 	}
 
 	return
@@ -785,8 +1137,6 @@ func (o *Operator) syncConnection(logger *logrus.Entry, in *v1alpha1.CatalogSour
 		return
 	}
 
-	logger = logger.WithField("address", address).WithField("currentSource", sourceKey)
-
 	if source.Address != address {
 		source, syncError = connectFunc()
 		if syncError != nil {
@@ -798,11 +1148,17 @@ func (o *Operator) syncConnection(logger *logrus.Entry, in *v1alpha1.CatalogSour
 		updateConnectionStateFunc(out, source)
 	}
 
+	// GRPCConnectionState update must fail before
+	if out.Status.GRPCConnectionState == nil {
+		updateConnectionStateFunc(out, source)
+	}
+
 	// connection is already good, but we need to update the sync time
-	if out.Status.GRPCConnectionState != nil && o.sourcesLastUpdate.After(out.Status.GRPCConnectionState.LastConnectTime.Time) {
+	if o.sourcesLastUpdate.After(out.Status.GRPCConnectionState.LastConnectTime.Time) {
 		// Set connection status and return.
 		out.Status.GRPCConnectionState.LastConnectTime = now
 		out.Status.GRPCConnectionState.LastObservedState = source.ConnectionState.String()
+		out.Status.GRPCConnectionState.Address = source.Address
 	}
 
 	return
@@ -811,16 +1167,16 @@ func (o *Operator) syncConnection(logger *logrus.Entry, in *v1alpha1.CatalogSour
 func (o *Operator) syncCatalogSources(obj interface{}) (syncError error) {
 	catsrc, ok := obj.(*v1alpha1.CatalogSource)
 	if !ok {
-		o.logger.Debugf("wrong type: %#v", obj)
+		o.logger.Infof("wrong type: %#v", obj)
 		syncError = nil
 		return
 	}
 
 	logger := o.logger.WithFields(logrus.Fields{
-		"source": catsrc.GetName(),
-		"id":     queueinformer.NewLoopID(),
+		"catalogsource.namespace": catsrc.Namespace,
+		"catalogsource.name":      catsrc.Name,
+		"id":                      queueinformer.NewLoopID(),
 	})
-	logger.Debug("syncing catsrc")
 
 	syncFunc := func(in *v1alpha1.CatalogSource, chain []CatalogSourceSyncFunc) (out *v1alpha1.CatalogSource, syncErr error) {
 		out = in
@@ -876,7 +1232,7 @@ func (o *Operator) syncCatalogSources(obj interface{}) (syncError error) {
 func (o *Operator) syncResolvingNamespace(obj interface{}) error {
 	ns, ok := obj.(*corev1.Namespace)
 	if !ok {
-		o.logger.Debugf("wrong type: %#v", obj)
+		o.logger.Infof("wrong type: %#v", obj)
 		return fmt.Errorf("casting Namespace failed")
 	}
 	namespace := ns.GetName()
@@ -889,15 +1245,35 @@ func (o *Operator) syncResolvingNamespace(obj interface{}) error {
 	o.gcInstallPlans(logger, namespace)
 
 	// get the set of sources that should be used for resolution and best-effort get their connections working
-	logger.Debug("resolving sources")
+	logger.Info("resolving sources")
 
-	querier := NewNamespaceSourceQuerier(o.sources.AsClients(o.namespace, namespace))
-
-	logger.Debug("checking if subscriptions need update")
+	logger.Info("checking if subscriptions need update")
 
 	subs, err := o.listSubscriptions(namespace)
 	if err != nil {
 		logger.WithError(err).Debug("couldn't list subscriptions")
+		return err
+	}
+
+	// If there are no subscriptions, don't attempt to sync the namespace.
+	if len(subs) == 0 {
+		logger.Info(fmt.Sprintf("No subscriptions were found in namespace %v", namespace))
+		return nil
+	}
+
+	ogLister := o.lister.OperatorsV1().OperatorGroupLister().OperatorGroups(namespace)
+	failForwardEnabled, err := resolver.IsFailForwardEnabled(ogLister)
+	if err != nil {
+		return err
+	}
+
+	unpackTimeout, err := bundle.OperatorGroupBundleUnpackTimeout(ogLister)
+	if err != nil {
+		return err
+	}
+
+	minUnpackRetryInterval, err := bundle.OperatorGroupBundleUnpackRetryInterval(ogLister)
+	if err != nil {
 		return err
 	}
 
@@ -917,17 +1293,17 @@ func (o *Operator) syncResolvingNamespace(obj interface{}) error {
 		}
 
 		// ensure the installplan reference is correct
-		sub, changedIP, err := o.ensureSubscriptionInstallPlanState(logger, sub)
+		sub, changedIP, err := o.ensureSubscriptionInstallPlanState(logger, sub, failForwardEnabled)
 		if err != nil {
-			logger.Debugf("error ensuring installplan state: %v", err)
+			logger.Infof("error ensuring installplan state: %v", err)
 			return err
 		}
 		subscriptionUpdated = subscriptionUpdated || changedIP
 
 		// record the current state of the desired corresponding CSV in the status. no-op if we don't know the csv yet.
-		sub, changedCSV, err := o.ensureSubscriptionCSVState(logger, sub, querier)
+		sub, changedCSV, err := o.ensureSubscriptionCSVState(logger, sub, failForwardEnabled)
 		if err != nil {
-			logger.Debugf("error recording current state of CSV in status: %v", err)
+			logger.Infof("error recording current state of CSV in status: %v", err)
 			return err
 		}
 
@@ -935,7 +1311,7 @@ func (o *Operator) syncResolvingNamespace(obj interface{}) error {
 		subs[i] = sub
 	}
 	if subscriptionUpdated {
-		logger.Debug("subscriptions were updated, wait for a new resolution")
+		logger.Info("subscriptions were updated, wait for a new resolution")
 		return nil
 	}
 
@@ -944,11 +1320,11 @@ func (o *Operator) syncResolvingNamespace(obj interface{}) error {
 		shouldUpdate = shouldUpdate || !o.nothingToUpdate(logger, sub)
 	}
 	if !shouldUpdate {
-		logger.Debug("all subscriptions up to date")
+		logger.Info("all subscriptions up to date")
 		return nil
 	}
 
-	logger.Debug("resolving subscriptions in namespace")
+	logger.Info("resolving subscriptions in namespace")
 
 	// resolve a set of steps to apply to a cluster, a set of subscriptions to create/update, and any errors
 	steps, bundleLookups, updatedSubs, err := o.resolver.ResolveSteps(namespace)
@@ -962,16 +1338,27 @@ func (o *Operator) syncResolvingNamespace(obj interface{}) error {
 		// not-satisfiable error
 		if _, ok := err.(solver.NotSatisfiable); ok {
 			logger.WithError(err).Debug("resolution failed")
-			subs = o.setSubsCond(subs, v1alpha1.SubscriptionResolutionFailed, "ConstraintsNotSatisfiable", err.Error(), true)
-			_, updateErr := o.updateSubscriptionStatuses(subs)
+			_, updateErr := o.updateSubscriptionStatuses(
+				o.setSubsCond(subs, v1alpha1.SubscriptionCondition{
+					Type:    v1alpha1.SubscriptionResolutionFailed,
+					Reason:  "ConstraintsNotSatisfiable",
+					Message: err.Error(),
+					Status:  corev1.ConditionTrue,
+				}))
 			if updateErr != nil {
 				logger.WithError(updateErr).Debug("failed to update subs conditions")
 				return updateErr
 			}
 			return nil
 		}
-		subs = o.setSubsCond(subs, v1alpha1.SubscriptionResolutionFailed, "ErrorPreventedResolution", err.Error(), true)
-		_, updateErr := o.updateSubscriptionStatuses(subs)
+
+		_, updateErr := o.updateSubscriptionStatuses(
+			o.setSubsCond(subs, v1alpha1.SubscriptionCondition{
+				Type:    v1alpha1.SubscriptionResolutionFailed,
+				Reason:  "ErrorPreventedResolution",
+				Message: err.Error(),
+				Status:  corev1.ConditionTrue,
+			}))
 		if updateErr != nil {
 			logger.WithError(updateErr).Debug("failed to update subs conditions")
 			return updateErr
@@ -979,17 +1366,178 @@ func (o *Operator) syncResolvingNamespace(obj interface{}) error {
 		return err
 	}
 
-	defer func() {
-		subs = o.setSubsCond(subs, v1alpha1.SubscriptionResolutionFailed, "", "", false)
-		_, updateErr := o.updateSubscriptionStatuses(subs)
-		if updateErr != nil {
-			logger.WithError(updateErr).Warn("failed to update subscription conditions")
+	// Attempt to unpack bundles before installing
+	// Note: This should probably use the attenuated client to prevent users from resolving resources they otherwise don't have access to.
+	if len(bundleLookups) > 0 {
+		logger.Info("unpacking bundles")
+
+		var unpacked bool
+		unpacked, steps, bundleLookups, err = o.unpackBundles(namespace, steps, bundleLookups, unpackTimeout, minUnpackRetryInterval)
+		if err != nil {
+			// If the error was fatal capture and fail
+			if olmerrors.IsFatal(err) {
+				_, updateErr := o.updateSubscriptionStatuses(
+					o.setSubsCond(subs, v1alpha1.SubscriptionCondition{
+						Type:    v1alpha1.SubscriptionBundleUnpackFailed,
+						Reason:  "ErrorPreventedUnpacking",
+						Message: err.Error(),
+						Status:  corev1.ConditionTrue,
+					}))
+				if updateErr != nil {
+					logger.WithError(updateErr).Debug("failed to update subs conditions")
+					return updateErr
+				}
+				return nil
+			}
+			// Retry sync if non-fatal error
+			return fmt.Errorf("bundle unpacking failed with an error: %w", err)
 		}
-	}()
+
+		// Check BundleLookup status conditions to see if the BundleLookupFailed condtion is true
+		// which means bundle lookup has failed and subscriptions need to be updated
+		// with a condition indicating the failure.
+		isFailed, cond := hasBundleLookupFailureCondition(bundleLookups)
+		if isFailed {
+			// Check if any subscription is transitioning to failed state (not already failed)
+			// to avoid scheduling redundant delayed requeues on every reconcile
+			isNewFailure := false
+			for _, sub := range subs {
+				existingCond := sub.Status.GetCondition(v1alpha1.SubscriptionBundleUnpackFailed)
+				if existingCond.Status != corev1.ConditionTrue {
+					isNewFailure = true
+					break
+				}
+			}
+
+			// Keep the condition message concise to avoid bloating etcd
+			conditionMessage := fmt.Sprintf("Bundle unpacking failed - %v: %v", cond.Reason, cond.Message)
+
+			// Detailed troubleshooting guidance (only append if not already in underlying condition)
+			guidance := "Auto-retry in ~5 min after job cleanup (TTL). " +
+				"Common causes: Missing ICSP (ppc64le/s390x/arm64), auth failure, invalid image. " +
+				"Manual retry: in the CatalogSource namespace, run `kubectl get jobs -l operatorframework.io/bundle-unpack-ref` and delete the specific failing job."
+
+			// Only append guidance if not already present to avoid duplication
+			if !strings.Contains(cond.Message, "Auto-retry") && !strings.Contains(cond.Message, "Common causes") {
+				conditionMessage = fmt.Sprintf("%s. %s", conditionMessage, guidance)
+			}
+
+			logger.Infof("bundle unpacking failed. Reason: %v, Message: %v", cond.Reason, cond.Message)
+
+			// Set BundleUnpackFailed=True and remove BundleUnpacking to avoid contradictory states
+			updatedSubs = o.setSubsCond(subs, v1alpha1.SubscriptionCondition{
+				Type:    v1alpha1.SubscriptionBundleUnpackFailed,
+				Reason:  "BundleUnpackFailed",
+				Message: conditionMessage,
+				Status:  corev1.ConditionTrue,
+			})
+
+			// Emit detailed troubleshooting event for each affected subscription
+			// to reduce etcd payload while keeping full context available
+			detailedEventMessage := fmt.Sprintf("Bundle unpacking failed - %v: %v. %s",
+				cond.Reason, cond.Message, guidance)
+			for _, sub := range subs {
+				go o.recorder.Event(sub, corev1.EventTypeWarning, "BundleUnpackFailed", detailedEventMessage)
+			}
+			// Remove BundleUnpacking condition entirely from all affected subscriptions and
+			// make sure every changed subscription is included in the update list, even if
+			// the BundleUnpackFailed condition was already present and unchanged.
+			subscriptionsToUpdate := make([]*v1alpha1.Subscription, 0, len(subs))
+			seenSubs := make(map[string]struct{}, len(subs))
+			for _, sub := range updatedSubs {
+				sub.Status.RemoveConditions(v1alpha1.SubscriptionBundleUnpacking)
+				key := sub.GetNamespace() + "/" + sub.GetName()
+				if _, ok := seenSubs[key]; ok {
+					continue
+				}
+				seenSubs[key] = struct{}{}
+				subscriptionsToUpdate = append(subscriptionsToUpdate, sub)
+			}
+			for _, sub := range subs {
+				unpackingCond := sub.Status.GetCondition(v1alpha1.SubscriptionBundleUnpacking)
+				// if status is ConditionUnknown, the condition doesn't exist
+				if unpackingCond.Status != corev1.ConditionUnknown {
+					sub.Status.RemoveConditions(v1alpha1.SubscriptionBundleUnpacking)
+					key := sub.GetNamespace() + "/" + sub.GetName()
+					if _, ok := seenSubs[key]; ok {
+						continue
+					}
+					seenSubs[key] = struct{}{}
+					subscriptionsToUpdate = append(subscriptionsToUpdate, sub)
+				}
+			}
+			_, updateErr := o.updateSubscriptionStatuses(subscriptionsToUpdate)
+			if updateErr != nil {
+				logger.WithError(updateErr).Debug("failed to update subs conditions")
+				return updateErr
+			}
+
+			// Only schedule a delayed requeue on new failures to prevent queue churn
+			// from repeated AddAfter calls on every reconcile for persistent failures
+			if isNewFailure {
+				logger.Info("scheduling delayed requeue for bundle unpack retry after job cleanup (TTL)")
+				// Requeue after 5 minutes to retry after job cleanup (TTL).
+				// This helps automatically resolve some issues such as unreachable
+				// bundle images caused by bad catalog updates.
+				o.nsResolveQueue.AddAfter(types.NamespacedName{Name: namespace}, 5*time.Minute)
+			}
+			return nil
+		}
+
+		// This means that the unpack job is still running (most likely) or
+		// there was some issue which we did not handle above.
+		if !unpacked {
+			// Extract pending reason from bundleLookups to provide immediate,
+			// concise feedback about image pull failures or other unpacking issues
+			pendingMessage := ""
+			for _, lookup := range bundleLookups {
+				for _, cond := range lookup.Conditions {
+					if cond.Type == v1alpha1.BundleLookupPending &&
+						cond.Status == corev1.ConditionTrue &&
+						cond.Reason != "" {
+						// Check if this is an image pull error using exact reason comparison
+						// to avoid matching unintended substring values
+						if cond.Reason == bundle.JobIncompleteReason && cond.Message != "" {
+							// Extract just the error reason (ImagePullBackOff, ErrImagePull, etc.)
+							// from the verbose pod error message
+							if strings.Contains(cond.Message, "ImagePullBackOff") ||
+								strings.Contains(cond.Message, "ErrImagePull") {
+								// Create a concise, helpful message
+								pendingMessage = "Bundle image pull failed. " +
+									"Common causes: Missing ICSP (ppc64le/s390x/arm64), auth failure, invalid image. " +
+									"Job will retry until timeout (~10 min), then auto-cleanup and retry in ~5 min. " +
+									"Manual retry: in the CatalogSource namespace, run `kubectl get jobs -l operatorframework.io/bundle-unpack-ref` and delete the specific failing job."
+								break
+							}
+						}
+					}
+				}
+				if pendingMessage != "" {
+					break
+				}
+			}
+
+			_, updateErr := o.updateSubscriptionStatuses(
+				o.setSubsCond(subs, v1alpha1.SubscriptionCondition{
+					Type:    v1alpha1.SubscriptionBundleUnpacking,
+					Reason:  "UnpackingInProgress",
+					Status:  corev1.ConditionTrue,
+					Message: pendingMessage,
+				}))
+			if updateErr != nil {
+				logger.WithError(updateErr).Debug("failed to update subs conditions")
+				return updateErr
+			}
+
+			logger.Info("unpacking is not complete yet, requeueing")
+			o.nsResolveQueue.AddAfter(types.NamespacedName{Name: namespace}, 5*time.Second)
+			return nil
+		}
+	}
 
 	// create installplan if anything updated
 	if len(updatedSubs) > 0 {
-		logger.Debug("resolution caused subscription changes, creating installplan")
+		logger.Info("resolution caused subscription changes, creating installplan")
 		// Finish calculating max generation by checking the existing installplans
 		installPlans, err := o.listInstallPlans(namespace)
 		if err != nil {
@@ -1013,19 +1561,58 @@ func (o *Operator) syncResolvingNamespace(obj interface{}) error {
 
 		installPlanReference, err := o.ensureInstallPlan(logger, namespace, maxGeneration+1, subs, installPlanApproval, steps, bundleLookups)
 		if err != nil {
-			logger.WithError(err).Debug("error ensuring installplan")
+			err := fmt.Errorf("error ensuring InstallPlan: %s", err)
+			logger.Infof("%v", err)
+
+			_, updateErr := o.updateSubscriptionStatuses(
+				o.setSubsCond(subs, v1alpha1.SubscriptionCondition{
+					Type:    v1alpha1.SubscriptionBundleUnpackFailed,
+					Reason:  "EnsureInstallPlanFailed",
+					Message: err.Error(),
+					Status:  corev1.ConditionTrue,
+				}))
+			if updateErr != nil {
+				logger.WithError(updateErr).Debug("failed to update subs conditions")
+				return updateErr
+			}
 			return err
 		}
 		updatedSubs = o.setIPReference(updatedSubs, maxGeneration+1, installPlanReference)
-		for _, updatedSub := range updatedSubs {
-			for i, sub := range subs {
-				if sub.Name == updatedSub.Name && sub.Namespace == updatedSub.Namespace {
-					subs[i] = updatedSub
-				}
+	} else {
+		logger.Infof("no subscriptions were updated")
+	}
+
+	// Make sure that we no longer indicate unpacking progress
+	o.removeSubsCond(subs, v1alpha1.SubscriptionBundleUnpacking)
+
+	// Remove BundleUnpackFailed condition from subscriptions
+	o.removeSubsCond(subs, v1alpha1.SubscriptionBundleUnpackFailed)
+
+	// Remove resolutionfailed condition from subscriptions
+	o.removeSubsCond(subs, v1alpha1.SubscriptionResolutionFailed)
+
+	newSub := true
+	for _, updatedSub := range updatedSubs {
+		updatedSub.Status.RemoveConditions(v1alpha1.SubscriptionResolutionFailed)
+		for i, sub := range subs {
+			if sub.Name == updatedSub.Name && sub.Namespace == updatedSub.Namespace {
+				subs[i] = updatedSub
+				newSub = false
+				break
 			}
 		}
-	} else {
-		logger.Debugf("no subscriptions were updated")
+		if newSub {
+			subs = append(subs, updatedSub)
+			continue
+		}
+		newSub = true
+	}
+
+	// Update subscriptions with all changes so far
+	_, updateErr := o.updateSubscriptionStatuses(subs)
+	if updateErr != nil {
+		logger.WithError(updateErr).Warn("failed to update subscription conditions")
+		return updateErr
 	}
 
 	return nil
@@ -1034,29 +1621,43 @@ func (o *Operator) syncResolvingNamespace(obj interface{}) error {
 func (o *Operator) syncSubscriptions(obj interface{}) error {
 	sub, ok := obj.(*v1alpha1.Subscription)
 	if !ok {
-		o.logger.Debugf("wrong type: %#v", obj)
+		o.logger.Infof("wrong type: %#v", obj)
 		return fmt.Errorf("casting Subscription failed")
 	}
 
-	o.nsResolveQueue.Add(sub.GetNamespace())
+	o.nsResolveQueue.Add(types.NamespacedName{Name: sub.GetNamespace()})
+
+	return nil
+}
+
+// syncOperatorGroups requeues the namespace resolution queue on changes to an operatorgroup
+// This is because the operatorgroup is now an input to resolution via the global catalog exclusion annotation
+func (o *Operator) syncOperatorGroups(obj interface{}) error {
+	og, ok := obj.(*operatorsv1.OperatorGroup)
+	if !ok {
+		o.logger.Infof("wrong type: %#v", obj)
+		return fmt.Errorf("casting OperatorGroup failed")
+	}
+
+	o.nsResolveQueue.Add(types.NamespacedName{Name: og.GetNamespace()})
 
 	return nil
 }
 
 func (o *Operator) nothingToUpdate(logger *logrus.Entry, sub *v1alpha1.Subscription) bool {
 	if sub.Status.InstallPlanRef != nil && sub.Status.State == v1alpha1.SubscriptionStateUpgradePending {
-		logger.Debugf("skipping update: installplan already created")
+		logger.Infof("skipping update: installplan already created")
 		return true
 	}
 	return false
 }
 
-func (o *Operator) ensureSubscriptionInstallPlanState(logger *logrus.Entry, sub *v1alpha1.Subscription) (*v1alpha1.Subscription, bool, error) {
+func (o *Operator) ensureSubscriptionInstallPlanState(logger *logrus.Entry, sub *v1alpha1.Subscription, failForwardEnabled bool) (*v1alpha1.Subscription, bool, error) {
 	if sub.Status.InstallPlanRef != nil || sub.Status.Install != nil {
 		return sub, false, nil
 	}
 
-	logger.Debug("checking for existing installplan")
+	logger.Info("checking for existing installplan")
 
 	// check if there's an installplan that created this subscription (only if it doesn't have a reference yet)
 	// this indicates it was newly resolved by another operator, and we should reference that installplan in the status
@@ -1081,18 +1682,16 @@ func (o *Operator) ensureSubscriptionInstallPlanState(logger *logrus.Entry, sub 
 	out.Status.InstallPlanRef = ref
 	out.Status.Install = v1alpha1.NewInstallPlanReference(ref)
 	out.Status.State = v1alpha1.SubscriptionStateUpgradePending
+	if failForwardEnabled && ip.Status.Phase == v1alpha1.InstallPlanPhaseFailed {
+		out.Status.State = v1alpha1.SubscriptionStateFailed
+	}
 	out.Status.CurrentCSV = out.Spec.StartingCSV
 	out.Status.LastUpdated = o.now()
 
-	updated, err := o.client.OperatorsV1alpha1().Subscriptions(sub.GetNamespace()).UpdateStatus(context.TODO(), out, metav1.UpdateOptions{})
-	if err != nil {
-		return nil, false, err
-	}
-
-	return updated, true, nil
+	return out, true, nil
 }
 
-func (o *Operator) ensureSubscriptionCSVState(logger *logrus.Entry, sub *v1alpha1.Subscription, querier SourceQuerier) (*v1alpha1.Subscription, bool, error) {
+func (o *Operator) ensureSubscriptionCSVState(logger *logrus.Entry, sub *v1alpha1.Subscription, failForwardEnabled bool) (*v1alpha1.Subscription, bool, error) {
 	if sub.Status.CurrentCSV == "" {
 		return sub, false, nil
 	}
@@ -1102,11 +1701,15 @@ func (o *Operator) ensureSubscriptionCSVState(logger *logrus.Entry, sub *v1alpha
 	if err != nil {
 		logger.WithError(err).WithField("currentCSV", sub.Status.CurrentCSV).Debug("error fetching csv listed in subscription status")
 		out.Status.State = v1alpha1.SubscriptionStateUpgradePending
-	} else {
-		// Check if an update is available for the current csv
-		if err := querier.Queryable(); err != nil {
-			return nil, false, err
+		if failForwardEnabled && sub.Status.InstallPlanRef != nil {
+			ip, err := o.client.OperatorsV1alpha1().InstallPlans(sub.GetNamespace()).Get(context.TODO(), sub.Status.InstallPlanRef.Name, metav1.GetOptions{})
+			if err != nil {
+				logger.WithError(err).WithField("currentCSV", sub.Status.CurrentCSV).Debug("error fetching installplan listed in subscription status")
+			} else if ip.Status.Phase == v1alpha1.InstallPlanPhaseFailed {
+				out.Status.State = v1alpha1.SubscriptionStateFailed
+			}
 		}
+	} else {
 		out.Status.State = v1alpha1.SubscriptionStateAtLatest
 		out.Status.InstalledCSV = sub.Status.CurrentCSV
 	}
@@ -1121,7 +1724,7 @@ func (o *Operator) ensureSubscriptionCSVState(logger *logrus.Entry, sub *v1alpha
 	updatedSub, err := o.client.OperatorsV1alpha1().Subscriptions(out.GetNamespace()).UpdateStatus(context.TODO(), out, metav1.UpdateOptions{})
 	if err != nil {
 		logger.WithError(err).Info("error updating subscription status")
-		return nil, false, fmt.Errorf("error updating Subscription status: " + err.Error())
+		return nil, false, fmt.Errorf("error updating Subscription status: %s", err.Error())
 	}
 
 	// subscription status represents cluster state
@@ -1129,9 +1732,7 @@ func (o *Operator) ensureSubscriptionCSVState(logger *logrus.Entry, sub *v1alpha
 }
 
 func (o *Operator) setIPReference(subs []*v1alpha1.Subscription, gen int, installPlanRef *corev1.ObjectReference) []*v1alpha1.Subscription {
-	var (
-		lastUpdated = o.now()
-	)
+	lastUpdated := o.now()
 	for _, sub := range subs {
 		sub.Status.LastUpdated = lastUpdated
 		if installPlanRef != nil {
@@ -1149,7 +1750,28 @@ func (o *Operator) ensureInstallPlan(logger *logrus.Entry, namespace string, gen
 		return nil, nil
 	}
 
+	// There are multiple(2) worker threads process the namespaceQueue.
+	// Both worker can work at the same time when 2 separate updates are made for the namespace.
+	// The following sequence causes 2 installplans are created for a subscription
+	// 1. worker 1 doesn't find the installplan
+	// 2. worker 2 doesn't find the installplan
+	// 3. both worker 1 and 2 create the installplan
+	//
+	// This lock prevents the step 2 in the sequence so that only one installplan is created for a subscription.
+	// The sequence is like the following with this lock
+	// 1. worker 1 locks
+	// 2. worker 1 doesn't find the installplan
+	// 3. worker 2 wait for unlock       <--- difference
+	// 4. worker 1 creates the installplan
+	// 5. worker 1 unlocks
+	// 6. worker 2 locks
+	// 7. worker 2 finds the installplan <--- difference
+	// 8. worker 2 unlocks
+	o.muInstallPlan.Lock()
+	defer o.muInstallPlan.Unlock()
+
 	// Check if any existing installplans are creating the same resources
+	// This must be done inside the lock to prevent TOCTOU race condition
 	installPlans, err := o.listInstallPlans(namespace)
 	if err != nil {
 		return nil, err
@@ -1178,9 +1800,7 @@ func (o *Operator) createInstallPlan(namespace string, gen int, subs []*v1alpha1
 		}
 		catalogSourceMap[s.Resource.CatalogSource] = struct{}{}
 	}
-	for _, b := range bundleLookups {
-		csvNames = append(csvNames, b.Identifier)
-	}
+
 	catalogSources := []string{}
 	for s := range catalogSourceMap {
 		catalogSources = append(catalogSources, s)
@@ -1225,23 +1845,39 @@ func (o *Operator) createInstallPlan(namespace string, gen int, subs []*v1alpha1
 	return reference.GetReference(res)
 }
 
-func (o *Operator) setSubsCond(subs []*v1alpha1.Subscription, condType v1alpha1.SubscriptionConditionType, reason, message string, setTrue bool) []*v1alpha1.Subscription {
+// setSubsCond will set the condition to the subscription if it doesn't already
+// exist or if it is different
+// Only return the list of updated subscriptions
+func (o *Operator) setSubsCond(subs []*v1alpha1.Subscription, cond v1alpha1.SubscriptionCondition) []*v1alpha1.Subscription {
 	var (
 		lastUpdated = o.now()
+		subList     []*v1alpha1.Subscription
 	)
+
 	for _, sub := range subs {
-		sub.Status.LastUpdated = lastUpdated
-		cond := sub.Status.GetCondition(condType)
-		cond.Reason = reason
-		cond.Message = message
-		if setTrue {
-			cond.Status = corev1.ConditionTrue
-		} else {
-			cond.Status = corev1.ConditionFalse
+		subCond := sub.Status.GetCondition(cond.Type)
+		if subCond.Equals(cond) {
+			continue
 		}
+		sub.Status.LastUpdated = lastUpdated
 		sub.Status.SetCondition(cond)
+		subList = append(subList, sub)
 	}
-	return subs
+	return subList
+}
+
+// removeSubsCond removes the given condition from all of the subscriptions in the input
+func (o *Operator) removeSubsCond(subs []*v1alpha1.Subscription, condType v1alpha1.SubscriptionConditionType) {
+	lastUpdated := o.now()
+	for _, sub := range subs {
+		cond := sub.Status.GetCondition(condType)
+		// if status is ConditionUnknown, the condition doesn't exist. Just skip
+		if cond.Status == corev1.ConditionUnknown {
+			continue
+		}
+		sub.Status.LastUpdated = lastUpdated
+		sub.Status.RemoveConditions(condType)
+	}
 }
 
 func (o *Operator) updateSubscriptionStatuses(subs []*v1alpha1.Subscription) ([]*v1alpha1.Subscription, error) {
@@ -1290,36 +1926,30 @@ type UnpackedBundleReference struct {
 	Properties             string `json:"properties"`
 }
 
-// unpackBundles makes one walk through the bundlelookups and attempts to progress them
-func (o *Operator) unpackBundles(plan *v1alpha1.InstallPlan) (bool, *v1alpha1.InstallPlan, error) {
-	out := plan.DeepCopy()
+func (o *Operator) unpackBundles(namespace string, installPlanSteps []*v1alpha1.Step, bundleLookups []v1alpha1.BundleLookup, unpackTimeout, unpackRetryInterval time.Duration) (bool, []*v1alpha1.Step, []v1alpha1.BundleLookup, error) {
 	unpacked := true
 
-	// The bundle timeout annotation if specified overrides the --bundle-unpack-timeout flag value
-	// If the timeout cannot be parsed it's set to < 0 and subsequently ignored
-	unpackTimeout := -1 * time.Minute
-	timeoutStr, ok := plan.GetAnnotations()[bundle.BundleUnpackTimeoutAnnotationKey]
-	if ok {
-		d, err := time.ParseDuration(timeoutStr)
-		if err != nil {
-			o.logger.Errorf("failed to parse unpack timeout annotation(%s: %s): %v", bundle.BundleUnpackTimeoutAnnotationKey, timeoutStr, err)
-		} else {
-			unpackTimeout = d
-		}
+	outBundleLookups := make([]v1alpha1.BundleLookup, len(bundleLookups))
+	for i := range bundleLookups {
+		bundleLookups[i].DeepCopyInto(&outBundleLookups[i])
+	}
+	outInstallPlanSteps := make([]*v1alpha1.Step, len(installPlanSteps))
+	for i := range installPlanSteps {
+		outInstallPlanSteps[i] = installPlanSteps[i].DeepCopy()
 	}
 
 	var errs []error
-	for i := 0; i < len(out.Status.BundleLookups); i++ {
-		lookup := out.Status.BundleLookups[i]
-		res, err := o.bundleUnpacker.UnpackBundle(&lookup, unpackTimeout)
+	for i := 0; i < len(outBundleLookups); i++ {
+		lookup := outBundleLookups[i]
+		res, err := o.bundleUnpacker.UnpackBundle(&lookup, unpackTimeout, unpackRetryInterval)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		out.Status.BundleLookups[i] = *res.BundleLookup
+		outBundleLookups[i] = *res.BundleLookup
 
 		// if the failed condition is present it means the bundle unpacking has failed
-		failedCondition := res.GetCondition(bundle.BundleLookupFailed)
+		failedCondition := res.GetCondition(v1alpha1.BundleLookupFailed)
 		if failedCondition.Status == corev1.ConditionTrue {
 			unpacked = false
 			continue
@@ -1338,16 +1968,20 @@ func (o *Operator) unpackBundles(plan *v1alpha1.InstallPlan) (bool, *v1alpha1.In
 			continue
 		}
 
-		// Ensure that bundle can be applied by the current version of OLM by converting to steps
-		steps, err := resolver.NewStepsFromBundle(res.Bundle(), out.GetNamespace(), res.Replaces, res.CatalogSourceRef.Name, res.CatalogSourceRef.Namespace)
+		// Ensure that bundle can be applied by the current version of OLM by converting to bundleSteps
+		bundleSteps, err := resolver.NewStepsFromBundle(res.Bundle(), namespace, res.Replaces, res.CatalogSourceRef.Name, res.CatalogSourceRef.Namespace)
 		if err != nil {
+			if fatal := olmerrors.IsFatal(err); fatal {
+				return false, nil, nil, err
+			}
+
 			errs = append(errs, fmt.Errorf("failed to turn bundle into steps: %v", err))
 			unpacked = false
 			continue
 		}
 
 		// step manifests are replaced with references to the configmap containing them
-		for i, s := range steps {
+		for i, s := range bundleSteps {
 			ref := UnpackedBundleReference{
 				Kind:                   "ConfigMap",
 				Namespace:              res.CatalogSourceRef.Namespace,
@@ -1364,19 +1998,19 @@ func (o *Operator) unpackBundles(plan *v1alpha1.InstallPlan) (bool, *v1alpha1.In
 				continue
 			}
 			s.Resource.Manifest = string(r)
-			steps[i] = s
+			bundleSteps[i] = s
 		}
 		res.RemoveCondition(resolver.BundleLookupConditionPacked)
-		out.Status.BundleLookups[i] = *res.BundleLookup
-		out.Status.Plan = append(out.Status.Plan, steps...)
+		outBundleLookups[i] = *res.BundleLookup
+		outInstallPlanSteps = append(outInstallPlanSteps, bundleSteps...)
 	}
 
 	if err := utilerrors.NewAggregate(errs); err != nil {
-		o.logger.Debugf("failed to unpack bundles: %v", err)
-		return false, nil, err
+		o.logger.Infof("failed to unpack bundles: %v", err)
+		return false, nil, nil, err
 	}
 
-	return unpacked, out, nil
+	return unpacked, outInstallPlanSteps, outBundleLookups, nil
 }
 
 // gcInstallPlans garbage collects installplans that are too old
@@ -1453,7 +2087,7 @@ func (o *Operator) gcInstallPlans(log logrus.FieldLogger, namespace string) {
 func (o *Operator) syncInstallPlans(obj interface{}) (syncError error) {
 	plan, ok := obj.(*v1alpha1.InstallPlan)
 	if !ok {
-		o.logger.Debugf("wrong type: %#v", obj)
+		o.logger.Infof("wrong type: %#v", obj)
 		return fmt.Errorf("casting InstallPlan failed")
 	}
 
@@ -1478,12 +2112,11 @@ func (o *Operator) syncInstallPlans(obj interface{}) (syncError error) {
 
 	querier := o.serviceAccountQuerier.NamespaceQuerier(plan.GetNamespace())
 	ref, err := querier()
-
 	out := plan.DeepCopy()
 	if err != nil {
 		// Set status condition/message and retry sync if any error
 		ipFailError := fmt.Errorf("attenuated service account query failed - %v", err)
-		logger.Infof(ipFailError.Error())
+		logger.Info(ipFailError.Error())
 		_, err := o.setInstallPlanInstalledCond(out, v1alpha1.InstallPlanReasonInstallCheckFailed, err.Error(), logger)
 		if err != nil {
 			syncError = err
@@ -1491,22 +2124,21 @@ func (o *Operator) syncInstallPlans(obj interface{}) (syncError error) {
 		}
 		syncError = ipFailError
 		return
-	} else {
-		// reset condition/message if it had been set in previous sync. This condition is being reset since any delay in the next steps
-		// (bundle unpacking/plan step errors being retried for a duration) could lead to this condition sticking around, even after
-		// the serviceAccountQuerier returns no error since the error has been resolved (by creating the required resources), which would
-		// be confusing to the user
+	}
+	// reset condition/message if it had been set in previous sync. This condition is being reset since any delay in the next steps
+	// (bundle unpacking/plan step errors being retried for a duration) could lead to this condition sticking around, even after
+	// the serviceAccountQuerier returns no error since the error has been resolved (by creating the required resources), which would
+	// be confusing to the user
 
-		// NOTE: this makes the assumption that the InstallPlanInstalledCheckFailed reason is only set in the previous if clause, which is
-		// true in the current iteration of the catalog operator. Any future implementation change that aims at setting the reason as
-		// InstallPlanInstalledCheckFailed must make sure that either this assumption is not breached, or the condition being set elsewhere
-		// is not being unset here unintentionally.
-		if cond := out.Status.GetCondition(v1alpha1.InstallPlanInstalled); cond.Reason == v1alpha1.InstallPlanReasonInstallCheckFailed {
-			plan, err = o.setInstallPlanInstalledCond(out, v1alpha1.InstallPlanConditionReason(corev1.ConditionUnknown), "", logger)
-			if err != nil {
-				syncError = err
-				return
-			}
+	// NOTE: this makes the assumption that the InstallPlanInstalledCheckFailed reason is only set in the previous if clause, which is
+	// true in the current iteration of the catalog operator. Any future implementation change that aims at setting the reason as
+	// InstallPlanInstalledCheckFailed must make sure that either this assumption is not breached, or the condition being set elsewhere
+	// is not being unset here unintentionally.
+	if cond := out.Status.GetCondition(v1alpha1.InstallPlanInstalled); cond.Reason == v1alpha1.InstallPlanReasonInstallCheckFailed {
+		plan, err = o.setInstallPlanInstalledCond(out, v1alpha1.InstallPlanConditionReason(corev1.ConditionUnknown), "", logger)
+		if err != nil {
+			syncError = err
+			return
 		}
 	}
 
@@ -1521,57 +2153,6 @@ func (o *Operator) syncInstallPlans(obj interface{}) (syncError error) {
 			}
 
 			logger.WithField("attenuated-sa", ref.Name).Info("successfully attached attenuated ServiceAccount to status")
-			return
-		}
-	}
-
-	// Attempt to unpack bundles before installing
-	// Note: This should probably use the attenuated client to prevent users from resolving resources they otherwise don't have access to.
-	if len(plan.Status.BundleLookups) > 0 {
-		unpacked, out, err := o.unpackBundles(plan)
-		if err != nil {
-			// Retry sync if non-fatal error
-			syncError = fmt.Errorf("bundle unpacking failed: %v", err)
-			return
-		}
-
-		if !reflect.DeepEqual(plan.Status, out.Status) {
-			logger.Warnf("status not equal, updating...")
-			if _, err := o.client.OperatorsV1alpha1().InstallPlans(out.GetNamespace()).UpdateStatus(context.TODO(), out, metav1.UpdateOptions{}); err != nil {
-				syncError = fmt.Errorf("failed to update installplan bundle lookups: %v", err)
-			}
-
-			return
-		}
-
-		// Check BundleLookup status conditions to see if the BundleLookupPending condtion is false
-		// which means bundle lookup has failed and the InstallPlan should be failed as well
-		isFailed, cond := hasBundleLookupFailureCondition(plan)
-		if isFailed {
-			err := fmt.Errorf("Bundle unpacking failed. Reason: %v, and Message: %v", cond.Reason, cond.Message)
-			// Mark the InstallPlan as failed for a fatal bundle unpack error
-			logger.Infof("%v", err)
-
-			if err := o.transitionInstallPlanToFailed(plan, logger, v1alpha1.InstallPlanReasonInstallCheckFailed, err.Error()); err != nil {
-				// retry for failure to update status
-				syncError = err
-				return
-			}
-
-			// Requeue subscription to propagate SubscriptionInstallPlanFailed condtion to subscription
-			o.requeueSubscriptionForInstallPlan(plan, logger)
-			return
-		}
-
-		// TODO: Remove in favor of job and configmap informer requeuing
-		if !unpacked {
-			err := o.ipQueueSet.RequeueAfter(plan.GetNamespace(), plan.GetName(), 5*time.Second)
-			if err != nil {
-				syncError = err
-				return
-			}
-			logger.Debug("install plan not yet populated from bundle image, requeueing")
-
 			return
 		}
 	}
@@ -1603,36 +2184,15 @@ func (o *Operator) syncInstallPlans(obj interface{}) (syncError error) {
 	return
 }
 
-func hasBundleLookupFailureCondition(plan *v1alpha1.InstallPlan) (bool, *v1alpha1.BundleLookupCondition) {
-	for _, bundleLookup := range plan.Status.BundleLookups {
+func hasBundleLookupFailureCondition(bundleLookups []v1alpha1.BundleLookup) (bool, *v1alpha1.BundleLookupCondition) {
+	for _, bundleLookup := range bundleLookups {
 		for _, cond := range bundleLookup.Conditions {
-			if cond.Type == bundle.BundleLookupFailed && cond.Status == corev1.ConditionTrue {
+			if cond.Type == v1alpha1.BundleLookupFailed && cond.Status == corev1.ConditionTrue {
 				return true, &cond
 			}
 		}
 	}
 	return false, nil
-}
-
-func (o *Operator) transitionInstallPlanToFailed(plan *v1alpha1.InstallPlan, logger logrus.FieldLogger, reason v1alpha1.InstallPlanConditionReason, message string) error {
-	now := o.now()
-	out := plan.DeepCopy()
-	out.Status.SetCondition(v1alpha1.ConditionFailed(v1alpha1.InstallPlanInstalled,
-		reason, message, &now))
-	out.Status.Phase = v1alpha1.InstallPlanPhaseFailed
-
-	logger.Info("transitioning InstallPlan to failed")
-	_, err := o.client.OperatorsV1alpha1().InstallPlans(plan.GetNamespace()).UpdateStatus(context.TODO(), out, metav1.UpdateOptions{})
-	if err == nil {
-		return nil
-	}
-
-	updateErr := errors.New("error updating InstallPlan status: " + err.Error())
-	logger = logger.WithField("updateError", updateErr)
-	logger.Errorf("error transitioning InstallPlan to failed")
-
-	// retry sync with error to update InstallPlan status
-	return fmt.Errorf("InstallPlan failed: %s and error updating InstallPlan status as failed: %s", message, updateErr)
 }
 
 func (o *Operator) requeueSubscriptionForInstallPlan(plan *v1alpha1.InstallPlan, logger *logrus.Entry) {
@@ -1657,9 +2217,8 @@ func (o *Operator) setInstallPlanInstalledCond(ip *v1alpha1.InstallPlan, reason 
 	ip.Status.SetCondition(v1alpha1.ConditionFailed(v1alpha1.InstallPlanInstalled, reason, message, &now))
 	outIP, err := o.client.OperatorsV1alpha1().InstallPlans(ip.GetNamespace()).UpdateStatus(context.TODO(), ip, metav1.UpdateOptions{})
 	if err != nil {
-		logger = logger.WithField("updateError", err.Error())
-		logger.Errorf("error updating InstallPlan status")
-		return nil, nil
+		logger.WithError(err).Error("error updating InstallPlan status")
+		return nil, fmt.Errorf("error updating InstallPlan status: %w", err)
 	}
 	return outIP, nil
 }
@@ -1690,13 +2249,15 @@ func transitionInstallPlanState(log logrus.FieldLogger, transitioner installPlan
 		}
 		log.Debug("attempting to install")
 		if err := transitioner.ExecutePlan(out); err != nil {
-			if now.Sub(out.Status.StartTime.Time) >= timeout {
+			if apierrors.IsForbidden(err) || now.Sub(out.Status.StartTime.Time) < timeout {
+				// forbidden problems are never terminal since we don't know when a user might provide
+				// the service account they specified with more permissions
+				out.Status.Message = fmt.Sprintf("retrying execution due to error: %s", err.Error())
+			} else {
 				out.Status.SetCondition(v1alpha1.ConditionFailed(v1alpha1.InstallPlanInstalled,
 					v1alpha1.InstallPlanReasonComponentFailed, err.Error(), &now))
 				out.Status.Phase = v1alpha1.InstallPlanPhaseFailed
 				out.Status.Message = err.Error()
-			} else {
-				out.Status.Message = fmt.Sprintf("retrying execution due to error: %s", err.Error())
 			}
 			return out, err
 		} else if !out.Status.NeedsRequeue() {
@@ -1715,81 +2276,114 @@ func transitionInstallPlanState(log logrus.FieldLogger, transitioner installPlan
 func validateV1CRDCompatibility(dynamicClient dynamic.Interface, oldCRD *apiextensionsv1.CustomResourceDefinition, newCRD *apiextensionsv1.CustomResourceDefinition) error {
 	logrus.Debugf("Comparing %#v to %#v", oldCRD.Spec.Versions, newCRD.Spec.Versions)
 
-	// If validation schema is unchanged, return right away
-	newestSchema := newCRD.Spec.Versions[len(newCRD.Spec.Versions)-1].Schema
-	for i, oldVersion := range oldCRD.Spec.Versions {
-		if !reflect.DeepEqual(oldVersion.Schema, newestSchema) {
-			break
-		}
-		if i == len(oldCRD.Spec.Versions)-1 {
-			// we are on the last iteration
-			// schema has not changed between versions at this point.
-			return nil
+	oldVersionSet := sets.New[string]()
+	for _, oldVersion := range oldCRD.Spec.Versions {
+		if !oldVersionSet.Has(oldVersion.Name) && oldVersion.Served {
+			oldVersionSet.Insert(oldVersion.Name)
 		}
 	}
 
-	convertedCRD := &apiextensions.CustomResourceDefinition{}
-	if err := apiextensionsv1.Convert_v1_CustomResourceDefinition_To_apiextensions_CustomResourceDefinition(newCRD, convertedCRD, nil); err != nil {
-		return err
-	}
-	for _, version := range oldCRD.Spec.Versions {
-		if version.Served {
-			gvr := schema.GroupVersionResource{Group: oldCRD.Spec.Group, Version: version.Name, Resource: oldCRD.Spec.Names.Plural}
-			err := validateExistingCRs(dynamicClient, gvr, convertedCRD)
-			if err != nil {
+	validationsMap := make(map[string]*apiextensions.CustomResourceValidation, 0)
+	for _, newVersion := range newCRD.Spec.Versions {
+		if oldVersionSet.Has(newVersion.Name) && newVersion.Served {
+			// If the new CRD's version is present in the cluster and still
+			// served then fill the map entry with the new validation
+			convertedValidation := &apiextensions.CustomResourceValidation{}
+			if err := apiextensionsv1.Convert_v1_CustomResourceValidation_To_apiextensions_CustomResourceValidation(newVersion.Schema, convertedValidation, nil); err != nil {
 				return err
 			}
+			validationsMap[newVersion.Name] = convertedValidation
 		}
 	}
-
-	logrus.Debugf("Successfully validated CRD %s\n", newCRD.Name)
-	return nil
+	return validateExistingCRs(dynamicClient, schema.GroupResource{Group: newCRD.Spec.Group, Resource: newCRD.Spec.Names.Plural}, validationsMap)
 }
 
 // Validate all existing served versions against new CRD's validation (if changed)
 func validateV1Beta1CRDCompatibility(dynamicClient dynamic.Interface, oldCRD *apiextensionsv1beta1.CustomResourceDefinition, newCRD *apiextensionsv1beta1.CustomResourceDefinition) error {
 	logrus.Debugf("Comparing %#v to %#v", oldCRD.Spec.Validation, newCRD.Spec.Validation)
-
-	// TODO return early of all versions are equal
-	convertedCRD := &apiextensions.CustomResourceDefinition{}
-	if err := apiextensionsv1beta1.Convert_v1beta1_CustomResourceDefinition_To_apiextensions_CustomResourceDefinition(newCRD, convertedCRD, nil); err != nil {
-		return err
+	oldVersionSet := sets.New[string]()
+	if len(oldCRD.Spec.Versions) == 0 {
+		// apiextensionsv1beta1 special case: if spec.Versions is empty, use the global version and validation
+		oldVersionSet.Insert(oldCRD.Spec.Version)
 	}
-	for _, version := range oldCRD.Spec.Versions {
-		if version.Served {
-			gvr := schema.GroupVersionResource{Group: oldCRD.Spec.Group, Version: version.Name, Resource: oldCRD.Spec.Names.Plural}
-			err := validateExistingCRs(dynamicClient, gvr, convertedCRD)
-			if err != nil {
+	for _, oldVersion := range oldCRD.Spec.Versions {
+		// collect served versions from spec.Versions if the list is present
+		if !oldVersionSet.Has(oldVersion.Name) && oldVersion.Served {
+			oldVersionSet.Insert(oldVersion.Name)
+		}
+	}
+
+	validationsMap := make(map[string]*apiextensions.CustomResourceValidation, 0)
+	gr := schema.GroupResource{Group: newCRD.Spec.Group, Resource: newCRD.Spec.Names.Plural}
+	if len(newCRD.Spec.Versions) == 0 {
+		// apiextensionsv1beta1 special case: if spec.Versions of newCRD is empty, use the global version and validation
+		if oldVersionSet.Has(newCRD.Spec.Version) {
+			convertedValidation := &apiextensions.CustomResourceValidation{}
+			if err := apiextensionsv1beta1.Convert_v1beta1_CustomResourceValidation_To_apiextensions_CustomResourceValidation(newCRD.Spec.Validation, convertedValidation, nil); err != nil {
 				return err
 			}
+			validationsMap[newCRD.Spec.Version] = convertedValidation
 		}
 	}
-
-	if oldCRD.Spec.Version != "" {
-		gvr := schema.GroupVersionResource{Group: oldCRD.Spec.Group, Version: oldCRD.Spec.Version, Resource: oldCRD.Spec.Names.Plural}
-		err := validateExistingCRs(dynamicClient, gvr, convertedCRD)
-		if err != nil {
-			return err
+	for _, newVersion := range newCRD.Spec.Versions {
+		if oldVersionSet.Has(newVersion.Name) && newVersion.Served {
+			// If the new CRD's version is present in the cluster and still
+			// served then fill the map entry with the new validation
+			if newCRD.Spec.Validation != nil {
+				// apiextensionsv1beta1 special case: spec.Validation and spec.Versions[].Schema are mutually exclusive;
+				// if spec.Versions is non-empty and spec.Validation is set then we can validate once against any
+				// single existing version.
+				convertedValidation := &apiextensions.CustomResourceValidation{}
+				if err := apiextensionsv1beta1.Convert_v1beta1_CustomResourceValidation_To_apiextensions_CustomResourceValidation(newCRD.Spec.Validation, convertedValidation, nil); err != nil {
+					return err
+				}
+				return validateExistingCRs(dynamicClient, gr, map[string]*apiextensions.CustomResourceValidation{newVersion.Name: convertedValidation})
+			}
+			convertedValidation := &apiextensions.CustomResourceValidation{}
+			if err := apiextensionsv1beta1.Convert_v1beta1_CustomResourceValidation_To_apiextensions_CustomResourceValidation(newVersion.Schema, convertedValidation, nil); err != nil {
+				return err
+			}
+			validationsMap[newVersion.Name] = convertedValidation
 		}
 	}
-	logrus.Debugf("Successfully validated CRD %s\n", newCRD.Name)
-	return nil
+	return validateExistingCRs(dynamicClient, gr, validationsMap)
 }
 
-func validateExistingCRs(dynamicClient dynamic.Interface, gvr schema.GroupVersionResource, newCRD *apiextensions.CustomResourceDefinition) error {
-	// make dynamic client
-	crList, err := dynamicClient.Resource(gvr).List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error listing resources in GroupVersionResource %#v: %s", gvr, err)
-	}
-	for _, cr := range crList.Items {
-		validator, _, err := validation.NewSchemaValidator(newCRD.Spec.Validation)
+type validationError struct {
+	error
+}
+
+// validateExistingCRs lists all CRs for each version entry in validationsMap, then validates each using the paired validation.
+func validateExistingCRs(dynamicClient dynamic.Interface, gr schema.GroupResource, validationsMap map[string]*apiextensions.CustomResourceValidation) error {
+	for version, schemaValidation := range validationsMap {
+		// create validator from given crdValidation
+		validator, _, err := validation.NewSchemaValidator(schemaValidation.OpenAPIV3Schema)
 		if err != nil {
-			return fmt.Errorf("error creating validator for schema %#v: %s", newCRD.Spec.Validation, err)
+			return fmt.Errorf("error creating validator for schema version %s: %s", version, err)
 		}
-		err = validation.ValidateCustomResource(field.NewPath(""), cr.UnstructuredContent(), validator).ToAggregate()
+		gvr := schema.GroupVersionResource{Group: gr.Group, Version: version, Resource: gr.Resource}
+		pager := pager.New(pager.SimplePageFunc(func(opts metav1.ListOptions) (runtime.Object, error) {
+			return dynamicClient.Resource(gvr).List(context.TODO(), opts)
+		}))
+		validationFn := func(obj runtime.Object) error {
+			// lister will only provide unstructured objects as runtime.Object, so this should never fail to convert
+			// if it does, it's a programming error
+			cr := obj.(*unstructured.Unstructured)
+			err = validation.ValidateCustomResource(field.NewPath(""), cr.UnstructuredContent(), validator).ToAggregate()
+			if err != nil {
+				var namespacedName string
+				if cr.GetNamespace() == "" {
+					namespacedName = cr.GetName()
+				} else {
+					namespacedName = fmt.Sprintf("%s/%s", cr.GetNamespace(), cr.GetName())
+				}
+				return validationError{fmt.Errorf("error validating %s %q: updated validation is too restrictive: %v", cr.GroupVersionKind(), namespacedName, err)}
+			}
+			return nil
+		}
+		err = pager.EachListItem(context.Background(), metav1.ListOptions{}, validationFn)
 		if err != nil {
-			return fmt.Errorf("error validating custom resource against new schema for %s %s/%s: %v", newCRD.Spec.Names.Kind, cr.GetNamespace(), cr.GetName(), err)
+			return err
 		}
 	}
 	return nil
@@ -1829,7 +2423,7 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 	// Get the set of initial installplan csv names
 	initialCSVNames := getCSVNameSet(plan)
 	// Get pre-existing CRD owners to make decisions about applying resolved CSVs
-	existingCRDOwners, err := o.getExistingApiOwners(plan.GetNamespace())
+	existingCRDOwners, err := o.getExistingAPIOwners(plan.GetNamespace())
 	if err != nil {
 		return err
 	}
@@ -1880,7 +2474,7 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 		o.logger.Errorf("failed to get a client for plan execution- %v", err)
 		return err
 	}
-	b := newBuilder(plan, o.lister.OperatorsV1alpha1().ClusterServiceVersionLister(), builderKubeClient, builderDynamicClient, r, o.logger)
+	b := newBuilder(plan, o.lister.OperatorsV1alpha1().ClusterServiceVersionLister(), builderKubeClient, builderDynamicClient, r, o.logger, o.recorder)
 
 	for i, step := range plan.Status.Plan {
 		if err := func(i int, step *v1alpha1.Step) error {
@@ -1961,6 +2555,10 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 
 					// Attempt to create the CSV.
 					csv.SetNamespace(namespace)
+					if csv.Labels == nil {
+						csv.Labels = map[string]string{}
+					}
+					csv.Labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
 
 					status, err := ensurer.EnsureClusterServiceVersion(&csv)
 					if err != nil {
@@ -1986,6 +2584,10 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 
 					// Attempt to create the Subscription
 					sub.SetNamespace(namespace)
+					if sub.Labels == nil {
+						sub.Labels = map[string]string{}
+					}
+					sub.Labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
 
 					status, err := ensurer.EnsureSubscription(&sub)
 					if err != nil {
@@ -2016,6 +2618,10 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 					}
 					s.SetOwnerReferences(updated)
 					s.SetNamespace(namespace)
+					if s.Labels == nil {
+						s.Labels = map[string]string{}
+					}
+					s.Labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
 
 					status, err := ensurer.EnsureBundleSecret(plan.Namespace, &s)
 					if err != nil {
@@ -2040,6 +2646,11 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 						return errorwrap.Wrapf(err, "error parsing step manifest: %s", step.Resource.Name)
 					}
 
+					if cr.Labels == nil {
+						cr.Labels = map[string]string{}
+					}
+					cr.Labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
+
 					status, err := ensurer.EnsureClusterRole(&cr, step)
 					if err != nil {
 						return err
@@ -2054,6 +2665,10 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 					if err != nil {
 						return errorwrap.Wrapf(err, "error parsing step manifest: %s", step.Resource.Name)
 					}
+					if rb.Labels == nil {
+						rb.Labels = map[string]string{}
+					}
+					rb.Labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
 
 					status, err := ensurer.EnsureClusterRoleBinding(&rb, step)
 					if err != nil {
@@ -2077,6 +2692,10 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 					}
 					r.SetOwnerReferences(updated)
 					r.SetNamespace(namespace)
+					if r.Labels == nil {
+						r.Labels = map[string]string{}
+					}
+					r.Labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
 
 					status, err := ensurer.EnsureRole(plan.Namespace, &r)
 					if err != nil {
@@ -2100,6 +2719,10 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 					}
 					rb.SetOwnerReferences(updated)
 					rb.SetNamespace(namespace)
+					if rb.Labels == nil {
+						rb.Labels = map[string]string{}
+					}
+					rb.Labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
 
 					status, err := ensurer.EnsureRoleBinding(plan.Namespace, &rb)
 					if err != nil {
@@ -2123,6 +2746,10 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 					}
 					sa.SetOwnerReferences(updated)
 					sa.SetNamespace(namespace)
+					if sa.Labels == nil {
+						sa.Labels = map[string]string{}
+					}
+					sa.Labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
 
 					status, err := ensurer.EnsureServiceAccount(namespace, &sa)
 					if err != nil {
@@ -2154,6 +2781,10 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 					}
 					s.SetOwnerReferences(updated)
 					s.SetNamespace(namespace)
+					if s.Labels == nil {
+						s.Labels = map[string]string{}
+					}
+					s.Labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
 
 					status, err := ensurer.EnsureService(namespace, &s)
 					if err != nil {
@@ -2184,6 +2815,10 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 					}
 					cfg.SetOwnerReferences(updated)
 					cfg.SetNamespace(namespace)
+					if cfg.Labels == nil {
+						cfg.Labels = map[string]string{}
+					}
+					cfg.Labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
 
 					status, err := ensurer.EnsureConfigMap(plan.Namespace, &cfg)
 					if err != nil {
@@ -2243,6 +2878,12 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 							}
 						}
 					}
+					l := unstructuredObject.GetLabels()
+					if l == nil {
+						l = map[string]string{}
+					}
+					l[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
+					unstructuredObject.SetLabels(l)
 
 					// Set up the dynamic client ResourceInterface and set ownerrefs
 					var resourceInterface dynamic.ResourceInterface
@@ -2266,7 +2907,7 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 			}
 			return nil
 		}(i, step); err != nil {
-			if k8serrors.IsNotFound(err) {
+			if apierrors.IsNotFound(err) {
 				// Check for APIVersions present in the installplan steps that are not available on the server.
 				// The check is made via discovery per step in the plan. Transient communication failures to the api-server are handled by the plan retry logic.
 				notFoundErr := discoveryQuerier.WithStepResource(step.Resource).QueryForGVK()
@@ -2290,11 +2931,10 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 	return nil
 }
 
-// getExistingApiOwners creates a map of CRD names to existing owner CSVs in the given namespace
-func (o *Operator) getExistingApiOwners(namespace string) (map[string][]string, error) {
+// getExistingAPIOwners creates a map of CRD names to existing owner CSVs in the given namespace
+func (o *Operator) getExistingAPIOwners(namespace string) (map[string][]string, error) {
 	// Get a list of CSVs in the namespace
 	csvList, err := o.client.OperatorsV1alpha1().ClusterServiceVersions(namespace).List(context.TODO(), metav1.ListOptions{})
-
 	if err != nil {
 		return nil, err
 	}
@@ -2405,35 +3045,9 @@ func (o *Operator) apiresourceFromGVK(gvk schema.GroupVersionKind) (metav1.APIRe
 		}
 	}
 	logger.Info("couldn't find GVK in api discovery")
-	return metav1.APIResource{}, olmerrors.GroupVersionKindNotFoundError{gvk.Group, gvk.Version, gvk.Kind}
+	return metav1.APIResource{}, olmerrors.GroupVersionKindNotFoundError{Group: gvk.Group, Version: gvk.Version, Kind: gvk.Kind}
 }
 
-const (
-	PrometheusRuleKind        = "PrometheusRule"
-	ServiceMonitorKind        = "ServiceMonitor"
-	PodDisruptionBudgetKind   = "PodDisruptionBudget"
-	PriorityClassKind         = "PriorityClass"
-	VerticalPodAutoscalerKind = "VerticalPodAutoscaler"
-	ConsoleYAMLSampleKind     = "ConsoleYAMLSample"
-	ConsoleQuickStartKind     = "ConsoleQuickStart"
-	ConsoleCLIDownloadKind    = "ConsoleCLIDownload"
-	ConsoleLinkKind           = "ConsoleLink"
-)
-
-var supportedKinds = map[string]struct{}{
-	PrometheusRuleKind:        {},
-	ServiceMonitorKind:        {},
-	PodDisruptionBudgetKind:   {},
-	PriorityClassKind:         {},
-	VerticalPodAutoscalerKind: {},
-	ConsoleYAMLSampleKind:     {},
-	ConsoleQuickStartKind:     {},
-	ConsoleCLIDownloadKind:    {},
-	ConsoleLinkKind:           {},
-}
-
-// isSupported returns true if OLM supports this type of CustomResource.
-func isSupported(kind string) bool {
-	_, ok := supportedKinds[kind]
-	return ok
+func deduplicateOwnerReferences(refs []metav1.OwnerReference) []metav1.OwnerReference {
+	return sets.New(refs...).UnsortedList()
 }

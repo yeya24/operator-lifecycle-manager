@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,30 +19,37 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8slabels "k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/client-go/kubernetes"
 	listersbatchv1 "k8s.io/client-go/listers/batch/v1"
 	listerscorev1 "k8s.io/client-go/listers/core/v1"
 	listersrbacv1 "k8s.io/client-go/listers/rbac/v1"
+	"k8s.io/utils/ptr"
 
 	"github.com/operator-framework/api/pkg/operators/reference"
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+	v1listers "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1"
 	listersoperatorsv1alpha1 "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/resolver/projection"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/image"
 )
 
 const (
-	// TODO: Move to operator-framework/api/pkg/operators/v1alpha1
-	// BundleLookupFailed describes conditions types for when BundleLookups fail
-	BundleLookupFailed operatorsv1alpha1.BundleLookupConditionType = "BundleLookupFailed"
-
 	// TODO: This can be a spec field
-	// BundleUnpackTimeoutAnnotationKey allows setting a bundle unpack timeout per InstallPlan
+	// BundleUnpackTimeoutAnnotationKey allows setting a bundle unpack timeout per OperatorGroup
 	// and overrides the default specified by the --bundle-unpack-timeout flag
 	// The time duration should be in the same format as accepted by time.ParseDuration()
 	// e.g 1m30s
 	BundleUnpackTimeoutAnnotationKey = "operatorframework.io/bundle-unpack-timeout"
 	BundleUnpackPodLabel             = "job-name"
+
+	// BundleUnpackRetryMinimumIntervalAnnotationKey sets a minimum interval to wait before
+	// attempting to recreate a failed unpack job for a bundle.
+	BundleUnpackRetryMinimumIntervalAnnotationKey = "operatorframework.io/bundle-unpack-min-retry-interval"
+
+	// BundleUnpackRefLabel is used to filter for all unpack jobs or pods for a specific bundle.
+	BundleUnpackRefLabel = "operatorframework.io/bundle-unpack-ref"
 )
 
 type BundleUnpackResult struct {
@@ -87,20 +95,39 @@ func newBundleUnpackResult(lookup *operatorsv1alpha1.BundleLookup) *BundleUnpack
 
 func (c *ConfigMapUnpacker) job(cmRef *corev1.ObjectReference, bundlePath string, secrets []corev1.LocalObjectReference, annotationUnpackTimeout time.Duration) *batchv1.Job {
 	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				install.OLMManagedLabelKey: install.OLMManagedLabelValue,
+				BundleUnpackRefLabel:       cmRef.Name,
+			},
+		},
 		Spec: batchv1.JobSpec{
-			//ttlSecondsAfterFinished: 0 // can use in the future to not have to clean up job
+			// Auto-cleanup failed/completed jobs after 5 minutes to allow automatic retry when root cause is fixed
+			// 5 minutes provides balance between fast recovery and preventing job churn on permanent failures
+			// See: https://kubernetes.io/docs/concepts/workloads/controllers/job/#ttl-mechanism-for-finished-jobs
+			TTLSecondsAfterFinished: ptr.To[int32](300),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: cmRef.Name,
+					Labels: map[string]string{
+						install.OLMManagedLabelKey: install.OLMManagedLabelValue,
+						BundleUnpackRefLabel:       cmRef.Name,
+					},
 				},
 				Spec: corev1.PodSpec{
 					// With restartPolicy = "OnFailure" when the spec.backoffLimit is reached, the job controller will delete all
 					// the job's pods to stop them from crashlooping forever.
-					// By setting restartPolicy = "Never" the pods don't get cleaned up since they're not running after a failure.
-					// Keeping the pods around after failures helps in inspecting the logs of a failed bundle unpack job.
+					// By setting restartPolicy = "Never" the pods are kept after a failure for log inspection.
+					// Note: Pods and logs are only available until TTL cleanup (5 minutes after job completion/failure).
 					// See: https://kubernetes.io/docs/concepts/workloads/controllers/job/#pod-backoff-failure-policy
-					RestartPolicy:    corev1.RestartPolicyNever,
-					ImagePullSecrets: secrets,
+					RestartPolicy:      corev1.RestartPolicyNever,
+					ServiceAccountName: cmRef.Name,
+					ImagePullSecrets:   secrets,
+					SecurityContext: &corev1.PodSecurityContext{
+						SeccompProfile: &corev1.SeccompProfile{
+							Type: corev1.SeccompProfileTypeRuntimeDefault,
+						},
+					},
 					Containers: []corev1.Container{
 						{
 							Name:  "extract",
@@ -129,6 +156,14 @@ func (c *ConfigMapUnpacker) job(cmRef *corev1.ObjectReference, bundlePath string
 									corev1.ResourceMemory: resource.MustParse("50Mi"),
 								},
 							},
+							SecurityContext: &corev1.SecurityContext{
+								AllowPrivilegeEscalation: ptr.To(bool(false)),
+								ReadOnlyRootFilesystem:   ptr.To(true),
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{"ALL"},
+								},
+							},
+							TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 						},
 					},
 					InitContainers: []corev1.Container{
@@ -148,11 +183,19 @@ func (c *ConfigMapUnpacker) job(cmRef *corev1.ObjectReference, bundlePath string
 									corev1.ResourceMemory: resource.MustParse("50Mi"),
 								},
 							},
+							SecurityContext: &corev1.SecurityContext{
+								AllowPrivilegeEscalation: ptr.To(bool(false)),
+								ReadOnlyRootFilesystem:   ptr.To(true),
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{"ALL"},
+								},
+							},
+							TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 						},
 						{
 							Name:            "pull",
 							Image:           bundlePath,
-							ImagePullPolicy: "Always",
+							ImagePullPolicy: image.InferImagePullPolicy(bundlePath),
 							Command:         []string{"/util/cpb", "/bundle"}, // Copy bundle content to its mount
 							VolumeMounts: []corev1.VolumeMount{
 								{
@@ -170,6 +213,14 @@ func (c *ConfigMapUnpacker) job(cmRef *corev1.ObjectReference, bundlePath string
 									corev1.ResourceMemory: resource.MustParse("50Mi"),
 								},
 							},
+							SecurityContext: &corev1.SecurityContext{
+								AllowPrivilegeEscalation: ptr.To(bool(false)),
+								ReadOnlyRootFilesystem:   ptr.To(true),
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{"ALL"},
+								},
+							},
+							TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 						},
 					},
 					Volumes: []corev1.Volume{
@@ -186,6 +237,50 @@ func (c *ConfigMapUnpacker) job(cmRef *corev1.ObjectReference, bundlePath string
 							},
 						},
 					},
+					NodeSelector: map[string]string{
+						"kubernetes.io/os": "linux",
+					},
+					Tolerations: []corev1.Toleration{
+						// arch-specific tolerations
+						{
+							Key:      "kubernetes.io/arch",
+							Value:    "amd64",
+							Operator: "Equal",
+						},
+						{
+							Key:      "kubernetes.io/arch",
+							Value:    "arm64",
+							Operator: "Equal",
+						},
+						{
+							Key:      "kubernetes.io/arch",
+							Value:    "ppc64le",
+							Operator: "Equal",
+						},
+						{
+							Key:      "kubernetes.io/arch",
+							Value:    "s390x",
+							Operator: "Equal",
+						},
+						// control-plane-specific tolerations
+						{
+							Key:      "node-role.kubernetes.io/master",
+							Operator: "Exists",
+							Effect:   "NoSchedule",
+						},
+						{
+							Key:               "node.kubernetes.io/unreachable",
+							Operator:          "Exists",
+							Effect:            "NoExecute",
+							TolerationSeconds: ptr.To[int64](120),
+						},
+						{
+							Key:               "node.kubernetes.io/not-ready",
+							Operator:          "Exists",
+							Effect:            "NoExecute",
+							TolerationSeconds: ptr.To[int64](120),
+						},
+					},
 				},
 			},
 		},
@@ -193,7 +288,10 @@ func (c *ConfigMapUnpacker) job(cmRef *corev1.ObjectReference, bundlePath string
 	job.SetNamespace(cmRef.Namespace)
 	job.SetName(cmRef.Name)
 	job.SetOwnerReferences([]metav1.OwnerReference{ownerRef(cmRef)})
-
+	if c.runAsUser > 0 {
+		job.Spec.Template.Spec.SecurityContext.RunAsUser = &c.runAsUser
+		job.Spec.Template.Spec.SecurityContext.RunAsNonRoot = ptr.To(bool(true))
+	}
 	// By default the BackoffLimit is set to 6 which with exponential backoff 10s + 20s + 40s ...
 	// translates to ~10m of waiting time.
 	// We want to fail faster than that when we have repeated failures from the bundle unpack pod
@@ -229,7 +327,7 @@ func (c *ConfigMapUnpacker) job(cmRef *corev1.ObjectReference, bundlePath string
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 . Unpacker
 
 type Unpacker interface {
-	UnpackBundle(lookup *operatorsv1alpha1.BundleLookup, timeout time.Duration) (result *BundleUnpackResult, err error)
+	UnpackBundle(lookup *operatorsv1alpha1.BundleLookup, timeout, retryInterval time.Duration) (result *BundleUnpackResult, err error)
 }
 
 type ConfigMapUnpacker struct {
@@ -243,9 +341,11 @@ type ConfigMapUnpacker struct {
 	podLister     listerscorev1.PodLister
 	roleLister    listersrbacv1.RoleLister
 	rbLister      listersrbacv1.RoleBindingLister
+	saLister      listerscorev1.ServiceAccountLister
 	loader        *configmap.BundleLoader
 	now           func() metav1.Time
 	unpackTimeout time.Duration
+	runAsUser     int64
 }
 
 type ConfigMapUnpackerOption func(*ConfigMapUnpacker)
@@ -329,9 +429,21 @@ func WithRoleBindingLister(rbLister listersrbacv1.RoleBindingLister) ConfigMapUn
 	}
 }
 
+func WithServiceAccountLister(saLister listerscorev1.ServiceAccountLister) ConfigMapUnpackerOption {
+	return func(unpacker *ConfigMapUnpacker) {
+		unpacker.saLister = saLister
+	}
+}
+
 func WithNow(now func() metav1.Time) ConfigMapUnpackerOption {
 	return func(unpacker *ConfigMapUnpacker) {
 		unpacker.now = now
+	}
+}
+
+func WithUserID(id int64) ConfigMapUnpackerOption {
+	return func(unpacker *ConfigMapUnpacker) {
+		unpacker.runAsUser = id
 	}
 }
 
@@ -383,12 +495,11 @@ const (
 	NotUnpackedMessage          = "bundle contents have not yet been persisted to installplan status"
 )
 
-func (c *ConfigMapUnpacker) UnpackBundle(lookup *operatorsv1alpha1.BundleLookup, timeout time.Duration) (result *BundleUnpackResult, err error) {
-
+func (c *ConfigMapUnpacker) UnpackBundle(lookup *operatorsv1alpha1.BundleLookup, timeout, retryInterval time.Duration) (result *BundleUnpackResult, err error) {
 	result = newBundleUnpackResult(lookup)
 
 	// if bundle lookup failed condition already present, then there is nothing more to do
-	failedCond := result.GetCondition(BundleLookupFailed)
+	failedCond := result.GetCondition(operatorsv1alpha1.BundleLookupFailed)
 	if failedCond.Status == corev1.ConditionTrue {
 		return result, nil
 	}
@@ -436,6 +547,11 @@ func (c *ConfigMapUnpacker) UnpackBundle(lookup *operatorsv1alpha1.BundleLookup,
 		return
 	}
 
+	_, err = c.ensureServiceAccount(cmRef)
+	if err != nil {
+		return
+	}
+
 	_, err = c.ensureRoleBinding(cmRef)
 	if err != nil {
 		return
@@ -446,7 +562,7 @@ func (c *ConfigMapUnpacker) UnpackBundle(lookup *operatorsv1alpha1.BundleLookup,
 		secrets = append(secrets, corev1.LocalObjectReference{Name: secretName})
 	}
 	var job *batchv1.Job
-	job, err = c.ensureJob(cmRef, result.Path, secrets, timeout)
+	job, err = c.ensureJob(cmRef, result.Path, secrets, timeout, retryInterval)
 	if err != nil || job == nil {
 		// ensureJob can return nil if the job present does not match the expected job (spec and ownerefs)
 		// The current job is deleted in that case so UnpackBundle needs to be retried
@@ -480,6 +596,16 @@ func (c *ConfigMapUnpacker) UnpackBundle(lookup *operatorsv1alpha1.BundleLookup,
 
 		if pendingContainerStatusMsgs != "" {
 			pendingMessage = pendingMessage + ": " + pendingContainerStatusMsgs
+
+			// Add helpful troubleshooting guidance for common error patterns
+			if strings.Contains(pendingContainerStatusMsgs, "ImagePullBackOff") ||
+				strings.Contains(pendingContainerStatusMsgs, "ErrImagePull") ||
+				strings.Contains(pendingContainerStatusMsgs, "manifest unknown") ||
+				strings.Contains(pendingContainerStatusMsgs, "unauthorized") {
+				pendingMessage += ". Common causes: Missing ICSP (ppc64le/s390x/arm64), auth failure, invalid image. " +
+					"Job will retry until timeout (~10 min), then auto-cleanup and retry in ~5 min. " +
+					"Manual retry: in the CatalogSource namespace, run `kubectl get jobs -l operatorframework.io/bundle-unpack-ref` and delete the specific failing job."
+			}
 		}
 
 		// Update BundleLookupPending condition if there are any changes
@@ -523,8 +649,8 @@ func (c *ConfigMapUnpacker) pendingContainerStatusMessages(job *batchv1.Job) (st
 	podLabel := map[string]string{BundleUnpackPodLabel: job.GetName()}
 	pods, listErr := c.podLister.Pods(job.GetNamespace()).List(k8slabels.SelectorFromValidatedSet(podLabel))
 	if listErr != nil {
-		c.logger.Errorf("Failed to list pods for job(%s): %v", job.GetName(), listErr)
-		return "", fmt.Errorf("Failed to list pods for job(%s): %v", job.GetName(), listErr)
+		c.logger.Errorf("failed to list pods for job(%s): %v", job.GetName(), listErr)
+		return "", fmt.Errorf("failed to list pods for job(%s): %v", job.GetName(), listErr)
 	}
 
 	// Ideally there should be just 1 pod running but inspect all pods in the pending phase
@@ -570,14 +696,14 @@ func (c *ConfigMapUnpacker) ensureConfigmap(csRef *corev1.ObjectReference, name 
 		if err != nil && apierrors.IsAlreadyExists(err) {
 			cm, err = c.client.CoreV1().ConfigMaps(fresh.GetNamespace()).Get(context.TODO(), fresh.GetName(), metav1.GetOptions{})
 			if err != nil {
-				return nil, fmt.Errorf("Failed to retrieve configmap %s: %v", fresh.GetName(), err)
+				return nil, fmt.Errorf("failed to retrieve configmap %s: %v", fresh.GetName(), err)
 			}
 			cm.SetLabels(map[string]string{
 				install.OLMManagedLabelKey: install.OLMManagedLabelValue,
 			})
 			cm, err = c.client.CoreV1().ConfigMaps(cm.GetNamespace()).Update(context.TODO(), cm, metav1.UpdateOptions{})
 			if err != nil {
-				return nil, fmt.Errorf("Failed to update configmap %s: %v", cm.GetName(), err)
+				return nil, fmt.Errorf("failed to update configmap %s: %v", cm.GetName(), err)
 			}
 		}
 	}
@@ -585,25 +711,57 @@ func (c *ConfigMapUnpacker) ensureConfigmap(csRef *corev1.ObjectReference, name 
 	return
 }
 
-func (c *ConfigMapUnpacker) ensureJob(cmRef *corev1.ObjectReference, bundlePath string, secrets []corev1.LocalObjectReference, timeout time.Duration) (job *batchv1.Job, err error) {
+func (c *ConfigMapUnpacker) ensureJob(cmRef *corev1.ObjectReference, bundlePath string, secrets []corev1.LocalObjectReference, timeout time.Duration, unpackRetryInterval time.Duration) (*batchv1.Job, error) {
 	fresh := c.job(cmRef, bundlePath, secrets, timeout)
-	job, err = c.jobLister.Jobs(fresh.GetNamespace()).Get(fresh.GetName())
+	var jobs, toDelete []*batchv1.Job
+	jobs, err := c.jobLister.Jobs(fresh.GetNamespace()).List(k8slabels.ValidatedSetSelector{BundleUnpackRefLabel: cmRef.Name})
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			job, err = c.client.BatchV1().Jobs(fresh.GetNamespace()).Create(context.TODO(), fresh, metav1.CreateOptions{})
-		}
+		return nil, err
+	}
 
-		return
+	// This is to ensure that we account for any existing unpack jobs that may be missing the label
+	jobWithoutLabel, err := c.jobLister.Jobs(fresh.GetNamespace()).Get(cmRef.Name)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return nil, err
+	}
+	if jobWithoutLabel != nil {
+		_, labelExists := jobWithoutLabel.Labels[BundleUnpackRefLabel]
+		if !labelExists {
+			jobs = append(jobs, jobWithoutLabel)
+		}
+	}
+
+	if len(jobs) == 0 {
+		return c.client.BatchV1().Jobs(fresh.GetNamespace()).Create(context.TODO(), fresh, metav1.CreateOptions{})
+	}
+
+	maxRetainedJobs := 5                                   // TODO: make this configurable
+	job, toDelete := sortUnpackJobs(jobs, maxRetainedJobs) // choose latest or on-failed job attempt
+
+	// only check for retries if an unpackRetryInterval is specified
+	if unpackRetryInterval > 0 {
+		if _, isFailed := getCondition(job, batchv1.JobFailed); isFailed {
+			// Look for other unpack jobs for the same bundle
+			if cond, failed := getCondition(job, batchv1.JobFailed); failed {
+				if time.Now().After(cond.LastTransitionTime.Time.Add(unpackRetryInterval)) {
+					fresh.SetName(names.SimpleNameGenerator.GenerateName(fresh.GetName()))
+					return c.client.BatchV1().Jobs(fresh.GetNamespace()).Create(context.TODO(), fresh, metav1.CreateOptions{})
+				}
+			}
+
+			// cleanup old failed jobs, but don't clean up successful jobs to avoid repeat unpacking
+			for _, j := range toDelete {
+				_ = c.client.BatchV1().Jobs(j.GetNamespace()).Delete(context.TODO(), j.GetName(), metav1.DeleteOptions{})
+			}
+		}
 	}
 
 	if equality.Semantic.DeepDerivative(fresh.GetOwnerReferences(), job.GetOwnerReferences()) && equality.Semantic.DeepDerivative(fresh.Spec, job.Spec) {
-		return
+		return job, nil
 	}
 
 	// TODO: Decide when to fail-out instead of deleting the job
-	err = c.client.BatchV1().Jobs(job.GetNamespace()).Delete(context.TODO(), job.GetName(), metav1.DeleteOptions{})
-	job = nil
-	return
+	return nil, c.client.BatchV1().Jobs(job.GetNamespace()).Delete(context.TODO(), job.GetName(), metav1.DeleteOptions{})
 }
 
 func (c *ConfigMapUnpacker) ensureRole(cmRef *corev1.ObjectReference) (role *rbacv1.Role, err error) {
@@ -631,11 +789,15 @@ func (c *ConfigMapUnpacker) ensureRole(cmRef *corev1.ObjectReference) (role *rba
 	fresh.SetNamespace(cmRef.Namespace)
 	fresh.SetName(cmRef.Name)
 	fresh.SetOwnerReferences([]metav1.OwnerReference{ownerRef(cmRef)})
+	fresh.SetLabels(map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue})
 
 	role, err = c.roleLister.Roles(fresh.GetNamespace()).Get(fresh.GetName())
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			role, err = c.client.RbacV1().Roles(fresh.GetNamespace()).Create(context.TODO(), fresh, metav1.CreateOptions{})
+			if apierrors.IsAlreadyExists(err) {
+				role, err = c.client.RbacV1().Roles(fresh.GetNamespace()).Update(context.TODO(), fresh, metav1.UpdateOptions{})
+			}
 		}
 
 		return
@@ -647,9 +809,33 @@ func (c *ConfigMapUnpacker) ensureRole(cmRef *corev1.ObjectReference) (role *rba
 			return
 		}
 	}
+	role = role.DeepCopy()
 	role.Rules = append(role.Rules, rule)
 
 	role, err = c.client.RbacV1().Roles(role.GetNamespace()).Update(context.TODO(), role, metav1.UpdateOptions{})
+
+	return
+}
+
+func (c *ConfigMapUnpacker) ensureServiceAccount(cmRef *corev1.ObjectReference) (serviceAccount *corev1.ServiceAccount, err error) {
+	fresh := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cmRef.Name,
+			Namespace: cmRef.Namespace,
+		},
+	}
+
+	fresh.SetOwnerReferences([]metav1.OwnerReference{ownerRef(cmRef)})
+	fresh.SetLabels(map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue})
+
+	serviceAccount, err = c.saLister.ServiceAccounts(fresh.GetNamespace()).Get(fresh.GetName())
+
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			serviceAccount, err = c.client.CoreV1().ServiceAccounts(fresh.GetNamespace()).Create(context.TODO(), fresh, metav1.CreateOptions{})
+		}
+		return
+	}
 
 	return
 }
@@ -660,7 +846,7 @@ func (c *ConfigMapUnpacker) ensureRoleBinding(cmRef *corev1.ObjectReference) (ro
 			{
 				Kind:      "ServiceAccount",
 				APIGroup:  "",
-				Name:      "default",
+				Name:      cmRef.Name,
 				Namespace: cmRef.Namespace,
 			},
 		},
@@ -673,11 +859,15 @@ func (c *ConfigMapUnpacker) ensureRoleBinding(cmRef *corev1.ObjectReference) (ro
 	fresh.SetNamespace(cmRef.Namespace)
 	fresh.SetName(cmRef.Name)
 	fresh.SetOwnerReferences([]metav1.OwnerReference{ownerRef(cmRef)})
+	fresh.SetLabels(map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue})
 
 	roleBinding, err = c.rbLister.RoleBindings(fresh.GetNamespace()).Get(fresh.GetName())
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			roleBinding, err = c.client.RbacV1().RoleBindings(fresh.GetNamespace()).Create(context.TODO(), fresh, metav1.CreateOptions{})
+			if apierrors.IsAlreadyExists(err) {
+				roleBinding, err = c.client.RbacV1().RoleBindings(fresh.GetNamespace()).Update(context.TODO(), fresh, metav1.UpdateOptions{})
+			}
 		}
 
 		return
@@ -700,7 +890,7 @@ func hash(data string) string {
 	h := fmt.Sprintf("%x", sha256.Sum256([]byte(data)))
 
 	// Make the hash 63 characters instead to comply with the 63 character limit for labels
-	return fmt.Sprintf(h[:len(h)-1])
+	return h[:len(h)-1]
 }
 
 var blockOwnerDeletion = false
@@ -732,4 +922,104 @@ func getCondition(job *batchv1.Job, conditionType batchv1.JobConditionType) (con
 		}
 	}
 	return
+}
+
+func sortUnpackJobs(jobs []*batchv1.Job, maxRetainedJobs int) (latest *batchv1.Job, toDelete []*batchv1.Job) {
+	if len(jobs) == 0 {
+		return
+	}
+	// sort jobs so that latest job is first
+	// with preference for non-failed jobs
+	sort.Slice(jobs, func(i, j int) bool {
+		if jobs[i] == nil || jobs[j] == nil {
+			return jobs[i] != nil
+		}
+		condI, failedI := getCondition(jobs[i], batchv1.JobFailed)
+		condJ, failedJ := getCondition(jobs[j], batchv1.JobFailed)
+		if failedI != failedJ {
+			return !failedI // non-failed job goes first
+		}
+		// If both jobs have no failed condition, condI and condJ will be nil
+		// fallback to sorting by CreationTimestamp
+		if condI == nil || condJ == nil {
+			return jobs[i].CreationTimestamp.After(jobs[j].CreationTimestamp.Time)
+		}
+		return condI.LastTransitionTime.After(condJ.LastTransitionTime.Time)
+	})
+	if jobs[0] == nil {
+		// all nil jobs
+		return
+	}
+	latest = jobs[0]
+	nilJobsIndex := len(jobs) - 1
+	for ; nilJobsIndex >= 0 && jobs[nilJobsIndex] == nil; nilJobsIndex-- {
+	}
+
+	jobs = jobs[:nilJobsIndex+1] // exclude nil jobs from list of jobs to delete
+	if len(jobs) <= maxRetainedJobs {
+		return
+	}
+	if maxRetainedJobs == 0 {
+		toDelete = jobs[1:]
+		return
+	}
+
+	// cleanup old failed jobs, n-1 recent jobs and the oldest job
+	for i := 0; i < maxRetainedJobs && i+maxRetainedJobs < len(jobs)-1; i++ {
+		toDelete = append(toDelete, jobs[maxRetainedJobs+i])
+	}
+
+	return
+}
+
+// OperatorGroupBundleUnpackTimeout returns bundle timeout from annotation if specified.
+// If the timeout annotation is not set, return timeout < 0 which is subsequently ignored.
+// This is to overrides the --bundle-unpack-timeout flag value on per-OperatorGroup basis.
+func OperatorGroupBundleUnpackTimeout(ogLister v1listers.OperatorGroupNamespaceLister) (time.Duration, error) {
+	ignoreTimeout := -1 * time.Minute
+
+	ogs, err := ogLister.List(k8slabels.Everything())
+	if err != nil {
+		return ignoreTimeout, err
+	}
+	if len(ogs) != 1 {
+		return ignoreTimeout, fmt.Errorf("found %d operatorGroups, expected 1", len(ogs))
+	}
+
+	timeoutStr, ok := ogs[0].GetAnnotations()[BundleUnpackTimeoutAnnotationKey]
+	if !ok {
+		return ignoreTimeout, nil
+	}
+
+	d, err := time.ParseDuration(timeoutStr)
+	if err != nil {
+		return ignoreTimeout, fmt.Errorf("failed to parse unpack timeout annotation(%s: %s): %w", BundleUnpackTimeoutAnnotationKey, timeoutStr, err)
+	}
+
+	return d, nil
+}
+
+// OperatorGroupBundleUnpackRetryInterval returns bundle unpack retry interval from annotation if specified.
+// If the retry annotation is not set, return retry = 0 which is subsequently ignored. This interval, if > 0,
+// determines the minimum interval between recreating a failed unpack job.
+func OperatorGroupBundleUnpackRetryInterval(ogLister v1listers.OperatorGroupNamespaceLister) (time.Duration, error) {
+	ogs, err := ogLister.List(k8slabels.Everything())
+	if err != nil {
+		return 0, err
+	}
+	if len(ogs) != 1 {
+		return 0, fmt.Errorf("found %d operatorGroups, expected 1", len(ogs))
+	}
+
+	timeoutStr, ok := ogs[0].GetAnnotations()[BundleUnpackRetryMinimumIntervalAnnotationKey]
+	if !ok {
+		return 0, nil
+	}
+
+	d, err := time.ParseDuration(timeoutStr)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse unpack retry annotation(%s: %s): %w", BundleUnpackRetryMinimumIntervalAnnotationKey, timeoutStr, err)
+	}
+
+	return d, nil
 }

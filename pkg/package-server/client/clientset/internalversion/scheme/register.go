@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -19,7 +17,7 @@ limitations under the License.
 package scheme
 
 import (
-	operators "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/apis/operators/install"
+	packages "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/apis/operators/install"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
@@ -37,5 +35,5 @@ func init() {
 
 // Install registers the API group and adds types to a scheme
 func Install(scheme *runtime.Scheme) {
-	operators.Install(scheme)
+	packages.Install(scheme)
 }

@@ -6,12 +6,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	utilclock "k8s.io/apimachinery/pkg/util/clock"
+	utilclock "k8s.io/utils/clock/testing"
 
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	versionedfake "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned/fake"
@@ -1676,7 +1677,7 @@ func fakeRegistryReconcilerFactory(healthy bool, err error) *olmfakes.FakeRegist
 	return &olmfakes.FakeRegistryReconcilerFactory{
 		ReconcilerForSourceStub: func(*v1alpha1.CatalogSource) registryreconciler.RegistryReconciler {
 			return &olmfakes.FakeRegistryReconciler{
-				CheckRegistryServerStub: func(*v1alpha1.CatalogSource) (bool, error) {
+				CheckRegistryServerStub: func(*logrus.Entry, *v1alpha1.CatalogSource) (bool, error) {
 					return healthy, err
 				},
 			}
@@ -1696,7 +1697,6 @@ type fakeReconcilerConfig struct {
 	now                       func() *metav1.Time
 	registryReconcilerFactory registryreconciler.RegistryReconcilerFactory
 	globalCatalogNamespace    string
-	subscriptionNamespace     string
 	existingObjs              existingObjs
 }
 

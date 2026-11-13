@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -19,7 +17,7 @@ limitations under the License.
 package externalversions
 
 import (
-	"fmt"
+	fmt "fmt"
 
 	v1 "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/apis/operators/v1"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
@@ -52,9 +50,9 @@ func (f *genericInformer) Lister() cache.GenericLister {
 // TODO extend this to unknown resources with a client pool
 func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource) (GenericInformer, error) {
 	switch resource {
-	// Group=operators.coreos.com, Version=v1
+	// Group=packages.operators.coreos.com, Version=v1
 	case v1.SchemeGroupVersion.WithResource("packagemanifests"):
-		return &genericInformer{resource: resource.GroupResource(), informer: f.Operators().V1().PackageManifests().Informer()}, nil
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Packages().V1().PackageManifests().Informer()}, nil
 
 	}
 

@@ -9,6 +9,8 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
+
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -20,10 +22,9 @@ import (
 )
 
 const (
-	OwnerKey           = "olm.owner"
-	OwnerNamespaceKey  = "olm.owner.namespace"
-	OwnerKind          = "olm.owner.kind"
-	OwnerPackageServer = "packageserver"
+	OwnerKey          = "olm.owner"
+	OwnerNamespaceKey = "olm.owner.namespace"
+	OwnerKind         = "olm.owner.kind"
 )
 
 var (
@@ -168,20 +169,13 @@ func AddNonBlockingOwner(object metav1.Object, owner Owner) {
 		ownerRefs = []metav1.OwnerReference{}
 	}
 
-	// Infer TypeMeta for the target
-	if err := InferGroupVersionKind(owner); err != nil {
-		log.Warn(err.Error())
-	}
-	gvk := owner.GetObjectKind().GroupVersionKind()
-
+	nonBlockingOwner := NonBlockingOwner(owner)
 	for _, item := range ownerRefs {
-		if item.Kind == gvk.Kind {
-			if item.Name == owner.GetName() && item.UID == owner.GetUID() {
-				return
-			}
+		if item.Kind == nonBlockingOwner.Kind && item.Name == nonBlockingOwner.Name && item.UID == nonBlockingOwner.UID {
+			return
 		}
 	}
-	ownerRefs = append(ownerRefs, NonBlockingOwner(owner))
+	ownerRefs = append(ownerRefs, nonBlockingOwner)
 	object.SetOwnerReferences(ownerRefs)
 }
 
@@ -203,6 +197,21 @@ func NonBlockingOwner(owner Owner) metav1.OwnerReference {
 		BlockOwnerDeletion: &DontBlockOwnerDeletion,
 		Controller:         &NotController,
 	}
+}
+
+// NonBlockingOwnerApplyConfiguration returns an ownerrefence to be added to an ownerref list used in an SSA Configuration
+func NonBlockingOwnerApplyConfiguration(owner Owner) *metav1ac.OwnerReferenceApplyConfiguration {
+	ownerRef := NonBlockingOwner(owner)
+
+	ownerRefAC := metav1ac.OwnerReference().
+		WithAPIVersion(ownerRef.APIVersion).
+		WithKind(ownerRef.Kind).
+		WithUID(ownerRef.UID).
+		WithName(ownerRef.Name).
+		WithBlockOwnerDeletion(*ownerRef.BlockOwnerDeletion).
+		WithController(*ownerRef.Controller)
+
+	return ownerRefAC
 }
 
 // OwnerLabel returns a label added to generated objects for later querying
@@ -285,14 +294,20 @@ func AddOwner(object metav1.Object, owner Owner, blockOwnerDeletion, isControlle
 	}
 	gvk := owner.GetObjectKind().GroupVersionKind()
 	apiVersion, kind := gvk.ToAPIVersionAndKind()
-	ownerRefs = append(ownerRefs, metav1.OwnerReference{
+	ownerRef := metav1.OwnerReference{
 		APIVersion:         apiVersion,
 		Kind:               kind,
 		Name:               owner.GetName(),
 		UID:                owner.GetUID(),
 		BlockOwnerDeletion: &blockOwnerDeletion,
 		Controller:         &isController,
-	})
+	}
+	for _, ref := range ownerRefs {
+		if ref.Kind == ownerRef.Kind && ref.Name == ownerRef.Name && ref.UID == ownerRef.UID {
+			return
+		}
+	}
+	ownerRefs = append(ownerRefs, ownerRef)
 	object.SetOwnerReferences(ownerRefs)
 }
 

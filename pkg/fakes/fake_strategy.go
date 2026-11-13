@@ -10,32 +10,32 @@ import (
 type FakeStrategy struct {
 	GetStrategyNameStub        func() string
 	getStrategyNameMutex       sync.RWMutex
-	getStrategyNameArgsForCall []struct {
-	}
-	getStrategyNameReturns struct {
+	getStrategyNameArgsForCall []struct{}
+	getStrategyNameReturns     struct {
 		result1 string
 	}
 	getStrategyNameReturnsOnCall map[int]struct {
 		result1 string
 	}
 	invocations      map[string][][]interface{}
+	callOrder        []string
 	invocationsMutex sync.RWMutex
 }
 
 func (fake *FakeStrategy) GetStrategyName() string {
 	fake.getStrategyNameMutex.Lock()
 	ret, specificReturn := fake.getStrategyNameReturnsOnCall[len(fake.getStrategyNameArgsForCall)]
-	fake.getStrategyNameArgsForCall = append(fake.getStrategyNameArgsForCall, struct {
-	}{})
+	fake.getStrategyNameArgsForCall = append(fake.getStrategyNameArgsForCall, struct{}{})
+	stub := fake.GetStrategyNameStub
+	fakeReturns := fake.getStrategyNameReturns
 	fake.recordInvocation("GetStrategyName", []interface{}{})
 	fake.getStrategyNameMutex.Unlock()
-	if fake.GetStrategyNameStub != nil {
-		return fake.GetStrategyNameStub()
+	if stub != nil {
+		return stub()
 	}
 	if specificReturn {
 		return ret.result1
 	}
-	fakeReturns := fake.getStrategyNameReturns
 	return fakeReturns.result1
 }
 
@@ -77,8 +77,6 @@ func (fake *FakeStrategy) GetStrategyNameReturnsOnCall(i int, result1 string) {
 func (fake *FakeStrategy) Invocations() map[string][][]interface{} {
 	fake.invocationsMutex.RLock()
 	defer fake.invocationsMutex.RUnlock()
-	fake.getStrategyNameMutex.RLock()
-	defer fake.getStrategyNameMutex.RUnlock()
 	copiedInvocations := map[string][][]interface{}{}
 	for key, value := range fake.invocations {
 		copiedInvocations[key] = value
@@ -86,9 +84,18 @@ func (fake *FakeStrategy) Invocations() map[string][][]interface{} {
 	return copiedInvocations
 }
 
+func (fake *FakeStrategy) CallOrder() []string {
+	fake.invocationsMutex.RLock()
+	defer fake.invocationsMutex.RUnlock()
+	order := make([]string, len(fake.callOrder))
+	copy(order, fake.callOrder)
+	return order
+}
+
 func (fake *FakeStrategy) recordInvocation(key string, args []interface{}) {
 	fake.invocationsMutex.Lock()
 	defer fake.invocationsMutex.Unlock()
+	fake.callOrder = append(fake.callOrder, key)
 	if fake.invocations == nil {
 		fake.invocations = map[string][][]interface{}{}
 	}

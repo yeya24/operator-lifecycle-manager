@@ -7,7 +7,7 @@ metadata:
     app: olm-operator
 spec:
   strategy:
-    type: RollingUpdate
+    type: Recreate
   replicas: {{ .Values.olm.replicaCount }}
   selector:
     matchLabels:
@@ -17,35 +17,47 @@ spec:
       labels:
         app: olm-operator
     spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       serviceAccountName: olm-operator-serviceaccount
-      {{- if or .Values.olm.tlsSecret .Values.olm.clientCASecret }}
-      volumes: 
-      {{- end }}
-      {{- if .Values.olm.tlsSecret }}
+      volumes:
+      {{- if .Values.certManager.enabled }}
       - name: srv-cert
         secret:
-          secretName: {{ .Values.olm.tlsSecret }}
-      {{- end }}
-      {{- if .Values.olm.clientCASecret }}
+          secretName: {{ .Values.certManager.certificate.secretName }}
       - name: profile-collector-cert
         secret:
-          secretName: {{ .Values.olm.clientCASecret }}
+          secretName: {{ .Values.certManager.certificate.secretName }}
+      {{- else if .Values.serviceCa.enabled }}
+      - name: srv-cert
+        secret:
+          secretName: {{ .Values.serviceCa.olmOperator.secretName }}
+      - name: profile-collector-cert
+        secret:
+          secretName: {{ .Values.serviceCa.olmOperator.secretName }}
       {{- end }}
+      - name: tmpfs
+        emptyDir: {}
       containers:
         - name: olm-operator
-          {{- if or .Values.olm.tlsSecret .Values.olm.clientCASecret }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ "ALL" ]
           volumeMounts:
-          {{- end }}
-          {{- if .Values.olm.tlsSecret }}
+          {{- if or .Values.certManager.enabled .Values.serviceCa.enabled }}
           - name: srv-cert
             mountPath: "/srv-cert"
             readOnly: true
-          {{- end }}
-          {{- if .Values.olm.clientCASecret }}
           - name: profile-collector-cert
             mountPath: "/profile-collector-cert"
             readOnly: true
           {{- end }}
+          - name: tmpfs
+            mountPath: /tmp
           command:
           - /bin/olm
           args:
@@ -69,31 +81,29 @@ spec:
           - --writePackageServerStatusName
           - {{ .Values.writePackageServerStatusName }}
           {{- end }}
-         {{- if .Values.olm.tlsSecret }}
+         {{- if or .Values.certManager.enabled .Values.serviceCa.enabled }}
           - --tls-cert
           - /srv-cert/tls.crt
           - --tls-key
           - /srv-cert/tls.key
-          {{- end }}
-          {{- if .Values.olm.clientCASecret }}
           - --client-ca
           - /profile-collector-cert/tls.crt
           {{- end }}
           image: {{ .Values.olm.image.ref }}
           imagePullPolicy: {{ .Values.olm.image.pullPolicy }}
           ports:
-            - containerPort: {{ .Values.olm.service.internalPort }}
+            - containerPort: {{ if or .Values.certManager.enabled .Values.serviceCa.enabled }}{{ .Values.olm.service.internalPortHttps }}{{ else }}{{ .Values.olm.service.internalPort }}{{ end }}
               name: metrics
           livenessProbe:
             httpGet:
               path: /healthz
-              port: {{ .Values.olm.service.internalPort }}
-              scheme: {{ if .Values.olm.tlsSecret }}HTTPS{{ else }}HTTP{{end}}
+              port: {{ if or .Values.certManager.enabled .Values.serviceCa.enabled }}{{ .Values.olm.service.internalPortHttps }}{{ else }}{{ .Values.olm.service.internalPort }}{{ end }}
+              scheme: {{ if or .Values.certManager.enabled .Values.serviceCa.enabled }}HTTPS{{ else }}HTTP{{ end }}
           readinessProbe:
             httpGet:
               path: /healthz
-              port: {{ .Values.olm.service.internalPort }}
-              scheme: {{ if .Values.olm.tlsSecret }}HTTPS{{ else }}HTTP{{end}}
+              port: {{ if or .Values.certManager.enabled .Values.serviceCa.enabled }}{{ .Values.olm.service.internalPortHttps }}{{ else }}{{ .Values.olm.service.internalPort }}{{ end }}
+              scheme: {{ if or .Values.certManager.enabled .Values.serviceCa.enabled }}HTTPS{{ else }}HTTP{{ end }}
           terminationMessagePolicy: FallbackToLogsOnError
           env:
           - name: OPERATOR_NAMESPACE
@@ -102,6 +112,10 @@ spec:
                 fieldPath: metadata.namespace
           - name: OPERATOR_NAME
             value: olm-operator
+          {{- if .Values.debug }}
+          - name: CI
+            value: "true"
+          {{- end }}
           {{- if .Values.olm.resources }}
           resources:
 {{ toYaml .Values.olm.resources | indent 12 }}

@@ -3,9 +3,10 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/blang/semver/v4"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	v1 "github.com/operator-framework/api/pkg/operators/v1"
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
@@ -13,115 +14,127 @@ import (
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/kubernetes/pkg/apis/rbac"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorclient"
+	"github.com/operator-framework/operator-lifecycle-manager/test/e2e/ctx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-var _ = Describe("User defined service account", func() {
+var _ = Describe("User defined service account", Label("UserDefinedServiceAccount"), func() {
+	var (
+		generatedNamespace corev1.Namespace
+		c                  operatorclient.ClientInterface
+		crc                versioned.Interface
+	)
+
+	BeforeEach(func() {
+		generatedNamespace = corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: genName("user-defined-sa-e2e-"),
+			},
+		}
+		Eventually(func() error {
+			return ctx.Ctx().Client().Create(context.Background(), &generatedNamespace)
+		}).Should(Succeed())
+
+		c = ctx.Ctx().KubeClient()
+		crc = ctx.Ctx().OperatorClient()
+	})
+
 	AfterEach(func() {
-		TearDown(testNamespace)
+		TeardownNamespace(generatedNamespace.GetName())
 	})
 
 	It("with no permission", func() {
 
-		kubeclient := newKubeClient()
-		crclient := newCRClient()
-
-		namespace := genName("scoped-ns-")
-		_, cleanupNS := newNamespace(kubeclient, namespace)
-		defer cleanupNS()
-
-		// Create a service account, but add no permission to it.
+		By("Create a service account, but add no permission to it.")
 		saName := genName("scoped-sa-")
-		_, cleanupSA := newServiceAccount(kubeclient, namespace, saName)
+		_, cleanupSA := newServiceAccount(c, generatedNamespace.GetName(), saName)
 		defer cleanupSA()
+		By("Create token secret for the serviceaccount")
+		_, cleanupSE := newTokenSecret(c, generatedNamespace.GetName(), saName)
+		defer cleanupSE()
 
-		// Add an OperatorGroup and specify the service account.
+		By("Add an OperatorGroup and specify the service account.")
 		ogName := genName("scoped-og-")
-		_, cleanupOG := newOperatorGroupWithServiceAccount(crclient, namespace, ogName, saName)
+		_, cleanupOG := newOperatorGroupWithServiceAccount(crc, generatedNamespace.GetName(), ogName, saName)
 		defer cleanupOG()
 
 		permissions := deploymentPermissions()
-		catsrc, subSpec, catsrcCleanup := newCatalogSource(GinkgoT(), kubeclient, crclient, "scoped", namespace, permissions)
+		catsrc, subSpec, catsrcCleanup := newCatalogSource(GinkgoT(), c, crc, "scoped", generatedNamespace.GetName(), permissions)
 		defer catsrcCleanup()
 
-		// Ensure that the catalog source is resolved before we create a subscription.
-		_, err := fetchCatalogSourceOnStatus(crclient, catsrc.GetName(), namespace, catalogSourceRegistryPodSynced)
+		By("Ensure that the catalog source is resolved before we create a subscription.")
+		_, err := fetchCatalogSourceOnStatus(crc, catsrc.GetName(), generatedNamespace.GetName(), catalogSourceRegistryPodSynced())
 		require.NoError(GinkgoT(), err)
 
 		subscriptionName := genName("scoped-sub-")
-		cleanupSubscription := createSubscriptionForCatalog(crclient, namespace, subscriptionName, catsrc.GetName(), subSpec.Package, subSpec.Channel, subSpec.StartingCSV, subSpec.InstallPlanApproval)
+		cleanupSubscription := createSubscriptionForCatalog(crc, generatedNamespace.GetName(), subscriptionName, catsrc.GetName(), subSpec.Package, subSpec.Channel, subSpec.StartingCSV, subSpec.InstallPlanApproval)
 		defer cleanupSubscription()
 
-		// Wait until an install plan is created.
-		subscription, err := fetchSubscription(crclient, namespace, subscriptionName, subscriptionHasInstallPlanChecker)
+		By("Wait until an install plan is created.")
+		subscription, err := fetchSubscription(crc, generatedNamespace.GetName(), subscriptionName, subscriptionHasInstallPlanChecker())
 		require.NoError(GinkgoT(), err)
 		require.NotNil(GinkgoT(), subscription)
 
-		// We expect the InstallPlan to be in status: Failed.
+		By("We expect the InstallPlan to be in status: Installing.")
 		ipName := subscription.Status.Install.Name
-		ipPhaseCheckerFunc := buildInstallPlanPhaseCheckFunc(v1alpha1.InstallPlanPhaseFailed)
-		ipGot, err := fetchInstallPlanWithNamespace(GinkgoT(), crclient, ipName, namespace, ipPhaseCheckerFunc)
+		ipPhaseCheckerFunc := buildInstallPlanMessageCheckFunc(`cannot create resource`)
+		ipGot, err := fetchInstallPlanWithNamespace(GinkgoT(), crc, ipName, generatedNamespace.GetName(), ipPhaseCheckerFunc)
 		require.NoError(GinkgoT(), err)
 
-		conditionGot := mustHaveCondition(GinkgoT(), ipGot, v1alpha1.InstallPlanInstalled)
-		assert.Equal(GinkgoT(), corev1.ConditionFalse, conditionGot.Status)
-		assert.Equal(GinkgoT(), v1alpha1.InstallPlanReasonComponentFailed, conditionGot.Reason)
-		assert.Contains(GinkgoT(), conditionGot.Message, fmt.Sprintf("is forbidden: User \"system:serviceaccount:%s:%s\" cannot create resource", namespace, saName))
-
-		// Verify that all step resources are in Unknown state.
+		By("Verify that all step resources are in Unknown state.")
 		for _, step := range ipGot.Status.Plan {
 			assert.Equal(GinkgoT(), v1alpha1.StepStatusUnknown, step.Status)
 		}
 	})
 	It("with permission", func() {
 
-		// Create the CatalogSource
-		kubeclient := newKubeClient()
-		crclient := newCRClient()
-
+		By("Create the CatalogSource")
 		namespace := genName("scoped-ns-")
-		_, cleanupNS := newNamespace(kubeclient, namespace)
+		_, cleanupNS := newNamespace(c, namespace)
 		defer cleanupNS()
 
-		// Create a service account, add enough permission to it so that operator install is successful.
+		By("Create a service account, add enough permission to it so that operator install is successful.")
 		saName := genName("scoped-sa")
-		_, cleanupSA := newServiceAccount(kubeclient, namespace, saName)
+		_, cleanupSA := newServiceAccount(c, generatedNamespace.GetName(), saName)
 		defer cleanupSA()
-		cleanupPerm := grantPermission(GinkgoT(), kubeclient, namespace, saName)
+		By("Create token secret for the serviceaccount")
+		_, cleanupSE := newTokenSecret(c, generatedNamespace.GetName(), saName)
+		defer cleanupSE()
+		cleanupPerm := grantPermission(GinkgoT(), c, generatedNamespace.GetName(), saName)
 		defer cleanupPerm()
 
-		// Add an OperatorGroup and specify the service account.
+		By("Add an OperatorGroup and specify the service account.")
 		ogName := genName("scoped-og-")
-		_, cleanupOG := newOperatorGroupWithServiceAccount(crclient, namespace, ogName, saName)
+		_, cleanupOG := newOperatorGroupWithServiceAccount(crc, generatedNamespace.GetName(), ogName, saName)
 		defer cleanupOG()
 
 		permissions := deploymentPermissions()
-		catsrc, subSpec, catsrcCleanup := newCatalogSource(GinkgoT(), kubeclient, crclient, "scoped", namespace, permissions)
+		catsrc, subSpec, catsrcCleanup := newCatalogSource(GinkgoT(), c, crc, "scoped", generatedNamespace.GetName(), permissions)
 		defer catsrcCleanup()
 
-		// Ensure that the catalog source is resolved before we create a subscription.
-		_, err := fetchCatalogSourceOnStatus(crclient, catsrc.GetName(), namespace, catalogSourceRegistryPodSynced)
+		By("Ensure that the catalog source is resolved before we create a subscription.")
+		_, err := fetchCatalogSourceOnStatus(crc, catsrc.GetName(), generatedNamespace.GetName(), catalogSourceRegistryPodSynced())
 		require.NoError(GinkgoT(), err)
 
 		subscriptionName := genName("scoped-sub-")
-		cleanupSubscription := createSubscriptionForCatalog(crclient, namespace, subscriptionName, catsrc.GetName(), subSpec.Package, subSpec.Channel, subSpec.StartingCSV, subSpec.InstallPlanApproval)
+		cleanupSubscription := createSubscriptionForCatalog(crc, generatedNamespace.GetName(), subscriptionName, catsrc.GetName(), subSpec.Package, subSpec.Channel, subSpec.StartingCSV, subSpec.InstallPlanApproval)
 		defer cleanupSubscription()
 
-		// Wait until an install plan is created.
-		subscription, err := fetchSubscription(crclient, namespace, subscriptionName, subscriptionHasInstallPlanChecker)
+		By("Wait until an install plan is created.")
+		subscription, err := fetchSubscription(crc, generatedNamespace.GetName(), subscriptionName, subscriptionHasInstallPlanChecker())
 		require.NoError(GinkgoT(), err)
 		require.NotNil(GinkgoT(), subscription)
 
-		// We expect the InstallPlan to be in status: Complete.
+		By("We expect the InstallPlan to be in status: Complete.")
 		ipName := subscription.Status.Install.Name
 		ipPhaseCheckerFunc := buildInstallPlanPhaseCheckFunc(v1alpha1.InstallPlanPhaseComplete)
-		ipGot, err := fetchInstallPlanWithNamespace(GinkgoT(), crclient, ipName, namespace, ipPhaseCheckerFunc)
+		ipGot, err := fetchInstallPlanWithNamespace(GinkgoT(), crc, ipName, generatedNamespace.GetName(), ipPhaseCheckerFunc)
 		require.NoError(GinkgoT(), err)
 
 		conditionGot := mustHaveCondition(GinkgoT(), ipGot, v1alpha1.InstallPlanInstalled)
@@ -129,7 +142,7 @@ var _ = Describe("User defined service account", func() {
 		assert.Equal(GinkgoT(), corev1.ConditionTrue, conditionGot.Status)
 		assert.Equal(GinkgoT(), "", conditionGot.Message)
 
-		// Verify that all step resources are in Created state.
+		By("Verify that all step resources are in Created state.")
 		for _, step := range ipGot.Status.Plan {
 			// TODO: switch back to commented assertion once InstallPlan status is being patched instead of updated
 			// assert.Equal(GinkgoT(), v1alpha1.StepStatusCreated, step.Status)
@@ -138,53 +151,48 @@ var _ = Describe("User defined service account", func() {
 	})
 	It("with retry", func() {
 
-		kubeclient := newKubeClient()
-		crclient := newCRClient()
-
-		namespace := genName("scoped-ns-")
-		_, cleanupNS := newNamespace(kubeclient, namespace)
-		defer cleanupNS()
-
-		// Create a service account, but add no permission to it.
+		By("Create a service account, but add no permission to it.")
 		saName := genName("scoped-sa-")
-		_, cleanupSA := newServiceAccount(kubeclient, namespace, saName)
+		_, cleanupSA := newServiceAccount(c, generatedNamespace.GetName(), saName)
 		defer cleanupSA()
+		By("Create token secret for the serviceaccount")
+		_, cleanupSE := newTokenSecret(c, generatedNamespace.GetName(), saName)
+		defer cleanupSE()
 
-		// Add an OperatorGroup and specify the service account.
+		By("Add an OperatorGroup and specify the service account.")
 		ogName := genName("scoped-og-")
-		_, cleanupOG := newOperatorGroupWithServiceAccount(crclient, namespace, ogName, saName)
+		_, cleanupOG := newOperatorGroupWithServiceAccount(crc, generatedNamespace.GetName(), ogName, saName)
 		defer cleanupOG()
 
 		permissions := deploymentPermissions()
-		catsrc, subSpec, catsrcCleanup := newCatalogSource(GinkgoT(), kubeclient, crclient, "scoped", namespace, permissions)
+		catsrc, subSpec, catsrcCleanup := newCatalogSource(GinkgoT(), c, crc, "scoped", generatedNamespace.GetName(), permissions)
 		defer catsrcCleanup()
 
-		// Ensure that the catalog source is resolved before we create a subscription.
-		_, err := fetchCatalogSourceOnStatus(crclient, catsrc.GetName(), namespace, catalogSourceRegistryPodSynced)
+		By("Ensure that the catalog source is resolved before we create a subscription.")
+		_, err := fetchCatalogSourceOnStatus(crc, catsrc.GetName(), generatedNamespace.GetName(), catalogSourceRegistryPodSynced())
 		require.NoError(GinkgoT(), err)
 
 		subscriptionName := genName("scoped-sub-")
-		cleanupSubscription := createSubscriptionForCatalog(crclient, namespace, subscriptionName, catsrc.GetName(), subSpec.Package, subSpec.Channel, subSpec.StartingCSV, subSpec.InstallPlanApproval)
+		cleanupSubscription := createSubscriptionForCatalog(crc, generatedNamespace.GetName(), subscriptionName, catsrc.GetName(), subSpec.Package, subSpec.Channel, subSpec.StartingCSV, subSpec.InstallPlanApproval)
 		defer cleanupSubscription()
 
-		// Wait until an install plan is created.
-		subscription, err := fetchSubscription(crclient, namespace, subscriptionName, subscriptionHasInstallPlanChecker)
+		By("Wait until an install plan is created.")
+		subscription, err := fetchSubscription(crc, generatedNamespace.GetName(), subscriptionName, subscriptionHasInstallPlanChecker())
 		require.NoError(GinkgoT(), err)
 		require.NotNil(GinkgoT(), subscription)
 
-		// We expect the InstallPlan to be in status: Failed.
+		By("We expect the InstallPlan to expose the permissions error.")
 		ipNameOld := subscription.Status.InstallPlanRef.Name
-		ipPhaseCheckerFunc := buildInstallPlanPhaseCheckFunc(v1alpha1.InstallPlanPhaseFailed)
-		ipGotOld, err := fetchInstallPlanWithNamespace(GinkgoT(), crclient, ipNameOld, namespace, ipPhaseCheckerFunc)
+		ipPhaseCheckerFunc := buildInstallPlanMessageCheckFunc(`cannot create resource "clusterserviceversions" in API group "operators.coreos.com" in the namespace`)
+		_, err = fetchInstallPlanWithNamespace(GinkgoT(), crc, ipNameOld, generatedNamespace.GetName(), ipPhaseCheckerFunc)
 		require.NoError(GinkgoT(), err)
-		require.Equal(GinkgoT(), v1alpha1.InstallPlanPhaseFailed, ipGotOld.Status.Phase)
 
-		// Grant permission now and this should trigger an retry of InstallPlan.
-		cleanupPerm := grantPermission(GinkgoT(), kubeclient, namespace, saName)
+		By("Grant permission now and this should trigger an retry of InstallPlan.")
+		cleanupPerm := grantPermission(GinkgoT(), c, generatedNamespace.GetName(), saName)
 		defer cleanupPerm()
 
 		ipPhaseCheckerFunc = buildInstallPlanPhaseCheckFunc(v1alpha1.InstallPlanPhaseComplete)
-		ipGotNew, err := fetchInstallPlanWithNamespace(GinkgoT(), crclient, ipNameOld, namespace, ipPhaseCheckerFunc)
+		ipGotNew, err := fetchInstallPlanWithNamespace(GinkgoT(), crc, ipNameOld, generatedNamespace.GetName(), ipPhaseCheckerFunc)
 		require.NoError(GinkgoT(), err)
 		require.Equal(GinkgoT(), v1alpha1.InstallPlanPhaseComplete, ipGotNew.Status.Phase)
 	})
@@ -229,6 +237,10 @@ func newServiceAccount(client operatorclient.ClientInterface, namespace, name st
 	Expect(sa).ToNot(BeNil())
 
 	cleanup = func() {
+		if env := os.Getenv("SKIP_CLEANUP"); env != "" {
+			fmt.Printf("Skipping cleanup of service account %s/%s...\n", sa.GetNamespace(), sa.GetName())
+			return
+		}
 		err := client.KubernetesInterface().CoreV1().ServiceAccounts(sa.GetNamespace()).Delete(context.TODO(), sa.GetName(), metav1.DeleteOptions{})
 		Expect(err).ToNot(HaveOccurred())
 	}
@@ -255,6 +267,10 @@ func newOperatorGroupWithServiceAccount(client versioned.Interface, namespace, n
 	Expect(og).ToNot(BeNil())
 
 	cleanup = func() {
+		if env := os.Getenv("SKIP_CLEANUP"); env != "" {
+			fmt.Printf("Skipping cleanup of operator group %s/%s...\n", og.GetNamespace(), og.GetName())
+			return
+		}
 		err := client.OperatorsV1().OperatorGroups(og.GetNamespace()).Delete(context.TODO(), og.GetName(), metav1.DeleteOptions{})
 		Expect(err).ToNot(HaveOccurred())
 	}
@@ -266,32 +282,32 @@ func newCatalogSource(t GinkgoTInterface, kubeclient operatorclient.ClientInterf
 	crdPlural := genName("ins")
 	crdName := crdPlural + ".cluster.com"
 
-	crd := apiextensions.CustomResourceDefinition{
+	crd := apiextensionsv1.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: crdName,
 		},
-		Spec: apiextensions.CustomResourceDefinitionSpec{
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
 			Group: "cluster.com",
-			Versions: []apiextensions.CustomResourceDefinitionVersion{
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
 				{
 					Name:    "v1alpha1",
 					Served:  true,
 					Storage: true,
-					Schema: &apiextensions.CustomResourceValidation{
-						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+					Schema: &apiextensionsv1.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
 							Type:        "object",
 							Description: "my crd schema",
 						},
 					},
 				},
 			},
-			Names: apiextensions.CustomResourceDefinitionNames{
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
 				Plural:   crdPlural,
 				Singular: crdPlural,
 				Kind:     crdPlural,
 				ListKind: "list" + crdPlural,
 			},
-			Scope: apiextensions.NamespaceScoped,
+			Scope: apiextensionsv1.NamespaceScoped,
 		},
 	}
 
@@ -304,8 +320,8 @@ func newCatalogSource(t GinkgoTInterface, kubeclient operatorclient.ClientInterf
 	stableChannel := "stable"
 
 	namedStrategy := newNginxInstallStrategy(genName(prefixFunc("dep")), permissions, nil)
-	csvA := newCSV("nginx-a", namespace, "", semver.MustParse("0.1.0"), []apiextensions.CustomResourceDefinition{crd}, nil, &namedStrategy)
-	csvB := newCSV("nginx-b", namespace, "nginx-a", semver.MustParse("0.2.0"), []apiextensions.CustomResourceDefinition{crd}, nil, &namedStrategy)
+	csvA := newCSV("nginx-a", namespace, "", semver.MustParse("0.1.0"), []apiextensionsv1.CustomResourceDefinition{crd}, nil, &namedStrategy)
+	csvB := newCSV("nginx-b", namespace, "nginx-a", semver.MustParse("0.2.0"), []apiextensionsv1.CustomResourceDefinition{crd}, nil, &namedStrategy)
 
 	// Create PackageManifests
 	manifests := []registry.PackageManifest{
@@ -319,7 +335,7 @@ func newCatalogSource(t GinkgoTInterface, kubeclient operatorclient.ClientInterf
 	}
 
 	catalogSourceName := genName(prefixFunc("catsrc"))
-	catsrc, cleanup = createInternalCatalogSource(kubeclient, crclient, catalogSourceName, namespace, manifests, []apiextensions.CustomResourceDefinition{crd}, []v1alpha1.ClusterServiceVersion{csvA, csvB})
+	catsrc, cleanup = createInternalCatalogSource(kubeclient, crclient, catalogSourceName, namespace, manifests, []apiextensionsv1.CustomResourceDefinition{crd}, []v1alpha1.ClusterServiceVersion{csvA, csvB})
 	require.NotNil(t, catsrc)
 	require.NotNil(t, cleanup)
 
@@ -338,32 +354,32 @@ func newCatalogSourceWithDependencies(t GinkgoTInterface, kubeclient operatorcli
 	crdPlural := genName("ins")
 	crdName := crdPlural + ".cluster.com"
 
-	crd := apiextensions.CustomResourceDefinition{
+	crd := apiextensionsv1.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: crdName,
 		},
-		Spec: apiextensions.CustomResourceDefinitionSpec{
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
 			Group: "cluster.com",
-			Versions: []apiextensions.CustomResourceDefinitionVersion{
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
 				{
 					Name:    "v1alpha1",
 					Served:  true,
 					Storage: true,
-					Schema: &apiextensions.CustomResourceValidation{
-						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+					Schema: &apiextensionsv1.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
 							Type:        "object",
 							Description: "my crd schema",
 						},
 					},
 				},
 			},
-			Names: apiextensions.CustomResourceDefinitionNames{
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
 				Plural:   crdPlural,
 				Singular: crdPlural,
 				Kind:     crdPlural,
 				ListKind: "list" + crdPlural,
 			},
-			Scope: apiextensions.NamespaceScoped,
+			Scope: apiextensionsv1.NamespaceScoped,
 		},
 	}
 
@@ -377,8 +393,8 @@ func newCatalogSourceWithDependencies(t GinkgoTInterface, kubeclient operatorcli
 	stableChannel := "stable"
 
 	namedStrategy := newNginxInstallStrategy(genName(prefixFunc("dep")), permissions, nil)
-	csvA := newCSV("nginx-req-dep", namespace, "", semver.MustParse("0.1.0"), nil, []apiextensions.CustomResourceDefinition{crd}, &namedStrategy)
-	csvB := newCSV("nginx-dependency", namespace, "", semver.MustParse("0.1.0"), []apiextensions.CustomResourceDefinition{crd}, nil, &namedStrategy)
+	csvA := newCSV("nginx-req-dep", namespace, "", semver.MustParse("0.1.0"), nil, []apiextensionsv1.CustomResourceDefinition{crd}, &namedStrategy)
+	csvB := newCSV("nginx-dependency", namespace, "", semver.MustParse("0.1.0"), []apiextensionsv1.CustomResourceDefinition{crd}, nil, &namedStrategy)
 
 	// Create PackageManifests
 	manifests := []registry.PackageManifest{
@@ -399,7 +415,7 @@ func newCatalogSourceWithDependencies(t GinkgoTInterface, kubeclient operatorcli
 	}
 
 	catalogSourceName := genName(prefixFunc("catsrc"))
-	catsrc, cleanup = createInternalCatalogSource(kubeclient, crclient, catalogSourceName, namespace, manifests, []apiextensions.CustomResourceDefinition{crd}, []v1alpha1.ClusterServiceVersion{csvA, csvB})
+	catsrc, cleanup = createInternalCatalogSource(kubeclient, crclient, catalogSourceName, namespace, manifests, []apiextensionsv1.CustomResourceDefinition{crd}, []v1alpha1.ClusterServiceVersion{csvA, csvB})
 	require.NotNil(t, catsrc)
 	require.NotNil(t, cleanup)
 
@@ -525,6 +541,14 @@ func grantPermission(t GinkgoTInterface, client operatorclient.ClientInterface, 
 	require.NoError(t, err)
 
 	cleanup = func() {
+		if env := os.Getenv("SKIP_CLEANUP"); env != "" {
+			fmt.Printf("Skipping cleanup of role %s/%s...\n", role.GetNamespace(), role.GetName())
+			fmt.Printf("Skipping cleanup of role binding %s/%s...\n", binding.GetNamespace(), binding.GetName())
+			fmt.Printf("Skipping cleanup of cluster role %s...\n", clusterrole.GetName())
+			fmt.Printf("Skipping cleanup of cluster role binding %s...\n", clusterbinding.GetName())
+			return
+		}
+
 		err := client.KubernetesInterface().RbacV1().Roles(role.GetNamespace()).Delete(context.TODO(), role.GetName(), metav1.DeleteOptions{})
 		require.NoError(t, err)
 

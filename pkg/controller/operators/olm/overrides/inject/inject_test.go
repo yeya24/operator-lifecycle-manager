@@ -1,47 +1,71 @@
 package inject_test
 
 import (
+	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/operators/olm/overrides/inject"
 )
 
 var (
 	defaultEnvVars = []corev1.EnvVar{
-		corev1.EnvVar{
+		{
 			Name:  "HTTP_PROXY",
 			Value: "http://foo.com:8080",
 		},
-		corev1.EnvVar{
+		{
 			Name:  "HTTPS_PROXY",
 			Value: "https://foo.com:443",
 		},
-		corev1.EnvVar{
+		{
 			Name:  "NO_PROXY",
 			Value: "a.com,b.com",
 		},
 	}
 
+	defaultEnvFromVars = []corev1.EnvFromSource{
+		{
+			Prefix: "test",
+		},
+		{
+			ConfigMapRef: &corev1.ConfigMapEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: "configmapForTest",
+				},
+			},
+		},
+		{
+			SecretRef: &corev1.SecretEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: "secretForTest",
+				},
+			},
+		},
+	}
+
 	defaultVolumeMounts = []corev1.VolumeMount{
-		corev1.VolumeMount{
+		{
 			Name:      "foo",
 			MountPath: "/bar",
 		},
 	}
 
 	defaultVolumes = []corev1.Volume{
-		corev1.Volume{
+		{
 			Name:         "foo",
 			VolumeSource: corev1.VolumeSource{},
 		},
 	}
 
 	defaultTolerations = []corev1.Toleration{
-		corev1.Toleration{
+		{
 			Key:      "my-toleration-key",
 			Effect:   corev1.TaintEffectNoSchedule,
 			Value:    "my-toleration-value",
@@ -79,15 +103,11 @@ func TestInjectVolumeMountIntoDeployment(t *testing.T) {
 			// Expected: The container's VolumeMount list remains empty.
 			name: "EmptyVolumeMounts",
 			podSpec: &corev1.PodSpec{
-				Containers: []corev1.Container{
-					corev1.Container{},
-				},
+				Containers: []corev1.Container{},
 			},
 			volumeMounts: []corev1.VolumeMount{},
 			expected: &corev1.PodSpec{
-				Containers: []corev1.Container{
-					corev1.Container{},
-				},
+				Containers: []corev1.Container{},
 			},
 		},
 		{
@@ -95,14 +115,12 @@ func TestInjectVolumeMountIntoDeployment(t *testing.T) {
 			// Expected: The container contains the injected VolumeMount.
 			name: "WithContainerHasNoVolumeMounts",
 			podSpec: &corev1.PodSpec{
-				Containers: []corev1.Container{
-					corev1.Container{},
-				},
+				Containers: []corev1.Container{{}},
 			},
 			volumeMounts: defaultVolumeMounts,
 			expected: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						VolumeMounts: defaultVolumeMounts,
 					},
 				},
@@ -114,7 +132,7 @@ func TestInjectVolumeMountIntoDeployment(t *testing.T) {
 			name: "WithContainerHasVolumeMountsEmptyDefaults",
 			podSpec: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						VolumeMounts: defaultVolumeMounts,
 					},
 				},
@@ -122,7 +140,7 @@ func TestInjectVolumeMountIntoDeployment(t *testing.T) {
 			volumeMounts: []corev1.VolumeMount{},
 			expected: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						VolumeMounts: defaultVolumeMounts,
 					},
 				},
@@ -134,9 +152,9 @@ func TestInjectVolumeMountIntoDeployment(t *testing.T) {
 			name: "WithContainerHasNonOverlappingEnvVar",
 			podSpec: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						VolumeMounts: []corev1.VolumeMount{
-							corev1.VolumeMount{
+							{
 								Name:      "bar",
 								MountPath: "/foo",
 							},
@@ -147,13 +165,13 @@ func TestInjectVolumeMountIntoDeployment(t *testing.T) {
 			volumeMounts: defaultVolumeMounts,
 			expected: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						VolumeMounts: []corev1.VolumeMount{
-							corev1.VolumeMount{
+							{
 								Name:      "bar",
 								MountPath: "/foo",
 							},
-							corev1.VolumeMount{
+							{
 								Name:      "foo",
 								MountPath: "/bar",
 							},
@@ -169,9 +187,9 @@ func TestInjectVolumeMountIntoDeployment(t *testing.T) {
 			name: "WithContainerHasOverlappingVolumeMounts",
 			podSpec: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						VolumeMounts: []corev1.VolumeMount{
-							corev1.VolumeMount{
+							{
 								Name:      "foo",
 								MountPath: "/barbar",
 							},
@@ -182,9 +200,9 @@ func TestInjectVolumeMountIntoDeployment(t *testing.T) {
 			volumeMounts: defaultVolumeMounts,
 			expected: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						VolumeMounts: []corev1.VolumeMount{
-							corev1.VolumeMount{
+							{
 								Name:      "foo",
 								MountPath: "/bar",
 							},
@@ -254,7 +272,7 @@ func TestInjectVolumeIntoDeployment(t *testing.T) {
 			name: "WithContainerHasNonOverlappingEnvVar",
 			podSpec: &corev1.PodSpec{
 				Volumes: []corev1.Volume{
-					corev1.Volume{
+					{
 						Name:         "bar",
 						VolumeSource: corev1.VolumeSource{},
 					},
@@ -263,11 +281,11 @@ func TestInjectVolumeIntoDeployment(t *testing.T) {
 			volumes: defaultVolumes,
 			expected: &corev1.PodSpec{
 				Volumes: []corev1.Volume{
-					corev1.Volume{
+					{
 						Name:         "bar",
 						VolumeSource: corev1.VolumeSource{},
 					},
-					corev1.Volume{
+					{
 						Name:         "foo",
 						VolumeSource: corev1.VolumeSource{},
 					},
@@ -280,7 +298,7 @@ func TestInjectVolumeIntoDeployment(t *testing.T) {
 			name: "WithContainerHasOverlappingVolumeMounts",
 			podSpec: &corev1.PodSpec{
 				Volumes: []corev1.Volume{
-					corev1.Volume{
+					{
 						Name: "foo",
 					},
 				},
@@ -288,7 +306,7 @@ func TestInjectVolumeIntoDeployment(t *testing.T) {
 			volumes: defaultVolumes,
 			expected: &corev1.PodSpec{
 				Volumes: []corev1.Volume{
-					corev1.Volume{
+					{
 						Name:         "foo",
 						VolumeSource: corev1.VolumeSource{},
 					},
@@ -321,14 +339,12 @@ func TestInjectEnvIntoDeployment(t *testing.T) {
 			// Expected: All env variable(s) specified are injected.
 			name: "WithContainerHasNoEnvVar",
 			podSpec: &corev1.PodSpec{
-				Containers: []corev1.Container{
-					corev1.Container{},
-				},
+				Containers: []corev1.Container{{}},
 			},
 			envVar: defaultEnvVars,
 			expected: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Env: defaultEnvVars,
 					},
 				},
@@ -341,9 +357,9 @@ func TestInjectEnvIntoDeployment(t *testing.T) {
 			name: "WithContainerHasNonOverlappingEnvVar",
 			podSpec: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Env: []corev1.EnvVar{
-							corev1.EnvVar{
+							{
 								Name:  "foo",
 								Value: "foo_value",
 							},
@@ -354,9 +370,9 @@ func TestInjectEnvIntoDeployment(t *testing.T) {
 			envVar: defaultEnvVars,
 			expected: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Env: append([]corev1.EnvVar{
-							corev1.EnvVar{
+							{
 								Name:  "foo",
 								Value: "foo_value",
 							},
@@ -372,13 +388,13 @@ func TestInjectEnvIntoDeployment(t *testing.T) {
 			name: "WithContainerHasOverlappingEnvVar",
 			podSpec: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Env: []corev1.EnvVar{
-							corev1.EnvVar{
+							{
 								Name:  "foo",
 								Value: "foo_value",
 							},
-							corev1.EnvVar{
+							{
 								Name:  "bar",
 								Value: "bar_value",
 							},
@@ -387,32 +403,32 @@ func TestInjectEnvIntoDeployment(t *testing.T) {
 				},
 			},
 			envVar: []corev1.EnvVar{
-				corev1.EnvVar{
+				{
 					Name:  "extra",
 					Value: "extra_value",
 				},
-				corev1.EnvVar{
+				{
 					Name:  "foo",
 					Value: "new_foo_value",
 				},
-				corev1.EnvVar{
+				{
 					Name:  "bar",
 					Value: "new_bar_value",
 				},
 			},
 			expected: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Env: []corev1.EnvVar{
-							corev1.EnvVar{
+							{
 								Name:  "foo",
 								Value: "new_foo_value",
 							},
-							corev1.EnvVar{
+							{
 								Name:  "bar",
 								Value: "new_bar_value",
 							},
-							corev1.EnvVar{
+							{
 								Name:  "extra",
 								Value: "extra_value",
 							},
@@ -428,13 +444,13 @@ func TestInjectEnvIntoDeployment(t *testing.T) {
 			name: "WithContainerEnvVarBeingUnset",
 			podSpec: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Env: []corev1.EnvVar{
-							corev1.EnvVar{
+							{
 								Name:  "foo",
 								Value: "foo_value",
 							},
-							corev1.EnvVar{
+							{
 								Name:  "bar",
 								Value: "bar_value",
 							},
@@ -443,20 +459,20 @@ func TestInjectEnvIntoDeployment(t *testing.T) {
 				},
 			},
 			envVar: []corev1.EnvVar{
-				corev1.EnvVar{
+				{
 					Name:  "bar",
 					Value: "",
 				},
 			},
 			expected: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Env: []corev1.EnvVar{
-							corev1.EnvVar{
+							{
 								Name:  "foo",
 								Value: "foo_value",
 							},
-							corev1.EnvVar{
+							{
 								Name:  "bar",
 								Value: "",
 							},
@@ -472,18 +488,18 @@ func TestInjectEnvIntoDeployment(t *testing.T) {
 			name: "WithMultipleContainers",
 			podSpec: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{},
-					corev1.Container{
+					{},
+					{
 						Env: []corev1.EnvVar{
-							corev1.EnvVar{
+							{
 								Name:  "foo",
 								Value: "foo_value",
 							},
 						},
 					},
-					corev1.Container{
+					{
 						Env: []corev1.EnvVar{
-							corev1.EnvVar{
+							{
 								Name:  "bar",
 								Value: "bar_value",
 							},
@@ -494,20 +510,20 @@ func TestInjectEnvIntoDeployment(t *testing.T) {
 			envVar: defaultEnvVars,
 			expected: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Env: defaultEnvVars,
 					},
-					corev1.Container{
+					{
 						Env: append([]corev1.EnvVar{
-							corev1.EnvVar{
+							{
 								Name:  "foo",
 								Value: "foo_value",
 							},
 						}, defaultEnvVars...),
 					},
-					corev1.Container{
+					{
 						Env: append([]corev1.EnvVar{
-							corev1.EnvVar{
+							{
 								Name:  "bar",
 								Value: "bar_value",
 							},
@@ -526,6 +542,171 @@ func TestInjectEnvIntoDeployment(t *testing.T) {
 			podSpecGot := tt.podSpec
 
 			assert.Equal(t, podSpecWant, podSpecGot)
+		})
+	}
+}
+
+func TestInjectEnvFromIntoDeployment(t *testing.T) {
+	tests := []struct {
+		name       string
+		podSpec    *corev1.PodSpec
+		envFromVar []corev1.EnvFromSource
+		expected   *corev1.PodSpec
+	}{
+		{
+			// PodSpec has one container and `EnvFrom` is empty.
+			// Expected: All env variable(s) specified are injected.
+			name: "WithContainerHasNoEnvFromVar",
+			podSpec: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{},
+				},
+			},
+			envFromVar: defaultEnvFromVars,
+			expected: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						EnvFrom: defaultEnvFromVars,
+					},
+				},
+			},
+		},
+		{
+			// PodSpec has one container and it has overlapping envFrom var(s).
+			// Expected: existing duplicate env vars won't be appended in the envFrom.
+			name: "WithContainerHasOverlappingEnvFromVar",
+			podSpec: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						EnvFrom: []corev1.EnvFromSource{
+							{
+								Prefix: "test",
+							},
+							{
+								ConfigMapRef: &corev1.ConfigMapEnvSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: "configmapForTest",
+									},
+								},
+							},
+							{
+								SecretRef: &corev1.SecretEnvSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: "secretForTest",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			envFromVar: defaultEnvFromVars,
+			expected: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						EnvFrom: []corev1.EnvFromSource{
+							{
+								Prefix: "test",
+							},
+							{
+								ConfigMapRef: &corev1.ConfigMapEnvSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: "configmapForTest",
+									},
+								},
+							},
+							{
+								SecretRef: &corev1.SecretEnvSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: "secretForTest",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// PodSpec has one container and it has non overlapping envFrom var(s).
+			// Expected: existing non overlapping env vars are intact.
+			name: "WithContainerHasNonOverlappingEnvFromVar",
+			podSpec: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						EnvFrom: []corev1.EnvFromSource{
+							{
+								Prefix: "foo",
+							},
+						},
+					},
+				},
+			},
+			envFromVar: defaultEnvFromVars,
+			expected: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						EnvFrom: append([]corev1.EnvFromSource{
+							{
+								Prefix: "foo",
+							},
+						}, defaultEnvFromVars...),
+					},
+				},
+			},
+		},
+		{
+			// PodSpec has more than one container(s)
+			// Expected: All container(s) should be updated as expected.
+			name: "WithMultipleContainers",
+			podSpec: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{},
+					{
+						EnvFrom: []corev1.EnvFromSource{
+							{
+								Prefix: "foo",
+							},
+						},
+					},
+					{
+						EnvFrom: []corev1.EnvFromSource{
+							{
+								Prefix: "bar",
+							},
+						},
+					},
+				},
+			},
+			envFromVar: defaultEnvFromVars,
+			expected: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						EnvFrom: defaultEnvFromVars,
+					},
+					{
+						EnvFrom: append([]corev1.EnvFromSource{
+							{
+								Prefix: "foo",
+							},
+						}, defaultEnvFromVars...),
+					},
+					{
+						EnvFrom: append([]corev1.EnvFromSource{
+							{
+								Prefix: "bar",
+							},
+						}, defaultEnvFromVars...),
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inject.InjectEnvFromIntoDeployment(tt.podSpec, tt.envFromVar)
+			assert.Equal(t, tt.expected, tt.podSpec)
 		})
 	}
 }
@@ -567,7 +748,7 @@ func TestInjectTolerationsIntoDeployment(t *testing.T) {
 			name: "WithDeploymentHasOneNonOverlappingToleration",
 			podSpec: &corev1.PodSpec{
 				Tolerations: []corev1.Toleration{
-					corev1.Toleration{
+					{
 						Key:      "my-different-toleration-key",
 						Operator: corev1.TolerationOpExists,
 					},
@@ -576,7 +757,7 @@ func TestInjectTolerationsIntoDeployment(t *testing.T) {
 			tolerations: defaultTolerations,
 			expected: &corev1.PodSpec{
 				Tolerations: append([]corev1.Toleration{
-					corev1.Toleration{
+					{
 						Key:      "my-different-toleration-key",
 						Operator: corev1.TolerationOpExists,
 					},
@@ -601,21 +782,21 @@ func TestInjectTolerationsIntoDeployment(t *testing.T) {
 			name: "WithDeploymentHasOverlappingAndNonOverlappingTolerations",
 			podSpec: &corev1.PodSpec{
 				Tolerations: []corev1.Toleration{
-					corev1.Toleration{
+					{
 						Key:      "my-different-toleration-key",
 						Operator: corev1.TolerationOpExists,
 					},
 				},
 			},
 			tolerations: append([]corev1.Toleration{
-				corev1.Toleration{
+				{
 					Key:      "my-different-toleration-key",
 					Operator: corev1.TolerationOpExists,
 				},
 			}, defaultTolerations...),
 			expected: &corev1.PodSpec{
 				Tolerations: append([]corev1.Toleration{
-					corev1.Toleration{
+					{
 						Key:      "my-different-toleration-key",
 						Operator: corev1.TolerationOpExists,
 					},
@@ -649,7 +830,7 @@ func TestInjectResourcesIntoDeployment(t *testing.T) {
 			name: "WithNilResources",
 			podSpec: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Resources: defaultResources,
 					},
 				},
@@ -657,7 +838,7 @@ func TestInjectResourcesIntoDeployment(t *testing.T) {
 			resources: nil,
 			expected: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Resources: defaultResources,
 					},
 				},
@@ -669,7 +850,7 @@ func TestInjectResourcesIntoDeployment(t *testing.T) {
 			name: "WithDeploymentHasNoResources",
 			podSpec: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Resources: corev1.ResourceRequirements{},
 					},
 				},
@@ -677,7 +858,7 @@ func TestInjectResourcesIntoDeployment(t *testing.T) {
 			resources: &defaultResources,
 			expected: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Resources: defaultResources,
 					},
 				},
@@ -690,7 +871,7 @@ func TestInjectResourcesIntoDeployment(t *testing.T) {
 			name: "WithDeploymentHasResources",
 			podSpec: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Resources: defaultResources,
 					},
 				},
@@ -698,7 +879,7 @@ func TestInjectResourcesIntoDeployment(t *testing.T) {
 			resources: &corev1.ResourceRequirements{},
 			expected: &corev1.PodSpec{
 				Containers: []corev1.Container{
-					corev1.Container{
+					{
 						Resources: corev1.ResourceRequirements{},
 					},
 				},
@@ -787,6 +968,689 @@ func TestInjectNodeSelectorIntoDeployment(t *testing.T) {
 
 			podSpecWant := tt.expected
 			podSpecGot := tt.podSpec
+
+			assert.Equal(t, podSpecWant, podSpecGot)
+		})
+	}
+}
+
+func TestOverrideDeploymentAffinity(t *testing.T) {
+	tests := []struct {
+		name        string
+		podSpec     *corev1.PodSpec
+		affinity    *corev1.Affinity
+		expected    *corev1.PodSpec
+		expectedErr error
+	}{
+		{
+			// Nil PodSpec is injected with an Affinity
+			// Expected: PodSpec is nil
+			// ExpectedErr: "no pod spec provided"
+			name:        "WithNilPodSpec",
+			podSpec:     nil,
+			affinity:    &corev1.Affinity{},
+			expected:    nil,
+			expectedErr: fmt.Errorf("no pod spec provided"),
+		},
+		{
+			// Affinity is overrides PodSpec with no Affinity
+			// Expected: Affinity is defined in the PodSpec
+			// ExpectedErr: nil
+			name:    "WithPodSpecWithNoAffinity",
+			podSpec: &corev1.PodSpec{},
+			affinity: &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{
+							{
+								MatchFields: []corev1.NodeSelectorRequirement{
+									{
+										Key:      "key",
+										Operator: corev1.NodeSelectorOpIn,
+										Values:   []string{"val1", "val2"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{
+									MatchFields: []corev1.NodeSelectorRequirement{
+										{
+											Key:      "key",
+											Operator: corev1.NodeSelectorOpIn,
+											Values:   []string{"val1", "val2"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// Affinity with NodeAffinity overrides PodSpec with NodeAffinity, PodAffinity, PodAntiAffinity
+			// Expected: PodSpec Affinity has overridden NodeAffinity, but not PodAffinity, PodAntiAffinity
+			// ExpectedErr: nil
+			name: "OnlyOverrideNodeAffinity",
+			podSpec: &corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{
+									MatchFields: []corev1.NodeSelectorRequirement{
+										{
+											Key:      "key",
+											Operator: corev1.NodeSelectorOpIn,
+											Values:   []string{"val1", "val2"},
+										},
+									},
+								},
+							},
+						},
+					},
+					PodAffinity: &corev1.PodAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey",
+								Namespaces:  []string{"ns1", "ns2"},
+							},
+						},
+					},
+					PodAntiAffinity: &corev1.PodAntiAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey2",
+								Namespaces:  []string{"n3", "ns4"},
+							},
+						},
+					},
+				},
+			},
+			affinity: &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{
+							{
+								MatchFields: []corev1.NodeSelectorRequirement{
+									{
+										Key:      "anotherKey",
+										Operator: corev1.NodeSelectorOpExists,
+										Values:   []string{"val3"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{
+									MatchFields: []corev1.NodeSelectorRequirement{
+										{
+											Key:      "anotherKey",
+											Operator: corev1.NodeSelectorOpExists,
+											Values:   []string{"val3"},
+										},
+									},
+								},
+							},
+						},
+					},
+					PodAffinity: &corev1.PodAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey",
+								Namespaces:  []string{"ns1", "ns2"},
+							},
+						},
+					},
+					PodAntiAffinity: &corev1.PodAntiAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey2",
+								Namespaces:  []string{"n3", "ns4"},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// Affinity with NodeAffinity, empty PodAffinity overrides PodSpec with NodeAffinity, PodAffinity, PodAntiAffinity
+			// Expected: PodSpec Affinity has overridden NodeAffinity, PodAffinity, but not PodAntiAffinity
+			// ExpectedErr: nil
+			name: "OverrideNodeAffinityEmptyPodAffinity",
+			podSpec: &corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{
+									MatchFields: []corev1.NodeSelectorRequirement{
+										{
+											Key:      "key",
+											Operator: corev1.NodeSelectorOpIn,
+											Values:   []string{"val1", "val2"},
+										},
+									},
+								},
+							},
+						},
+					},
+					PodAffinity: &corev1.PodAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey",
+								Namespaces:  []string{"ns1", "ns2"},
+							},
+						},
+					},
+					PodAntiAffinity: &corev1.PodAntiAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey2",
+								Namespaces:  []string{"n3", "ns4"},
+							},
+						},
+					},
+				},
+			},
+			affinity: &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{
+							{
+								MatchFields: []corev1.NodeSelectorRequirement{
+									{
+										Key:      "anotherKey",
+										Operator: corev1.NodeSelectorOpExists,
+										Values:   []string{"val3"},
+									},
+								},
+							},
+						},
+					},
+				},
+				PodAffinity: &corev1.PodAffinity{},
+			},
+			expected: &corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{
+									MatchFields: []corev1.NodeSelectorRequirement{
+										{
+											Key:      "anotherKey",
+											Operator: corev1.NodeSelectorOpExists,
+											Values:   []string{"val3"},
+										},
+									},
+								},
+							},
+						},
+					},
+					PodAffinity: nil,
+					PodAntiAffinity: &corev1.PodAntiAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey2",
+								Namespaces:  []string{"n3", "ns4"},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// Affinity with NodeAffinity, PodAffinity overrides PodSpec with nil NodeAffinity, nil PodAffinity, PodAntiAffinity
+			// Expected: PodSpec Affinity has overridden NodeAffinity, PodAffinity, but not PodAntiAffinity
+			// ExpectedErr: nil
+			name: "OverridesNilPodSpecAttributes",
+			podSpec: &corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					PodAntiAffinity: &corev1.PodAntiAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey2",
+								Namespaces:  []string{"n3", "ns4"},
+							},
+						},
+					},
+				},
+			},
+			affinity: &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{
+							{
+								MatchFields: []corev1.NodeSelectorRequirement{
+									{
+										Key:      "anotherKey",
+										Operator: corev1.NodeSelectorOpExists,
+										Values:   []string{"val3"},
+									},
+								},
+							},
+						},
+					},
+				},
+				PodAffinity: &corev1.PodAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+						{
+							TopologyKey: "topKey",
+							Namespaces:  []string{"ns1", "ns2"},
+						},
+					},
+				},
+			},
+			expected: &corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{
+									MatchFields: []corev1.NodeSelectorRequirement{
+										{
+											Key:      "anotherKey",
+											Operator: corev1.NodeSelectorOpExists,
+											Values:   []string{"val3"},
+										},
+									},
+								},
+							},
+						},
+					},
+					PodAffinity: &corev1.PodAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey",
+								Namespaces:  []string{"ns1", "ns2"},
+							},
+						},
+					},
+					PodAntiAffinity: &corev1.PodAntiAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey2",
+								Namespaces:  []string{"n3", "ns4"},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// Empty Affinity overrides PodSpec with NodeAffinity, PodAffinity, PodAntiAffinity
+			// Expected: PodSpec Affinity is nil
+			// ExpectedErr: nil
+			name: "EmptyAffinity",
+			podSpec: &corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{
+									MatchFields: []corev1.NodeSelectorRequirement{
+										{
+											Key:      "key",
+											Operator: corev1.NodeSelectorOpIn,
+											Values:   []string{"val1", "val2"},
+										},
+									},
+								},
+							},
+						},
+					},
+					PodAffinity: &corev1.PodAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey",
+								Namespaces:  []string{"ns1", "ns2"},
+							},
+						},
+					},
+					PodAntiAffinity: &corev1.PodAntiAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey2",
+								Namespaces:  []string{"n3", "ns4"},
+							},
+						},
+					},
+				},
+			},
+			affinity: &corev1.Affinity{},
+			expected: &corev1.PodSpec{
+				Affinity: nil,
+			},
+		},
+		{
+			// Empty Affinity NodeAffinity, and PodAffinity
+			// overrides PodSpec with NodeAffinity, and PodAffinity
+			// Expected: PodSpec Affinity is nil
+			// ExpectedErr: nil
+			name: "Nil/EmptyAffinityAreEquivalent",
+			podSpec: &corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{
+									MatchFields: []corev1.NodeSelectorRequirement{
+										{
+											Key:      "key",
+											Operator: corev1.NodeSelectorOpIn,
+											Values:   []string{"val1", "val2"},
+										},
+									},
+								},
+							},
+						},
+					},
+					PodAffinity: &corev1.PodAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey",
+								Namespaces:  []string{"ns1", "ns2"},
+							},
+						},
+					},
+				},
+			},
+			affinity: &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{},
+				PodAffinity:  &corev1.PodAffinity{},
+			},
+			expected: &corev1.PodSpec{
+				Affinity: nil,
+			},
+		},
+		{
+			// Nil Affinity overrides nothing PodSpec
+			// Expected: PodSpec unaffected
+			// ExpectedErr: nil
+			name: "EmptyAffinity",
+			podSpec: &corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{
+									MatchFields: []corev1.NodeSelectorRequirement{
+										{
+											Key:      "key",
+											Operator: corev1.NodeSelectorOpIn,
+											Values:   []string{"val1", "val2"},
+										},
+									},
+								},
+							},
+						},
+					},
+					PodAffinity: &corev1.PodAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey",
+								Namespaces:  []string{"ns1", "ns2"},
+							},
+						},
+					},
+					PodAntiAffinity: &corev1.PodAntiAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey2",
+								Namespaces:  []string{"n3", "ns4"},
+							},
+						},
+					},
+				},
+			},
+			affinity: nil,
+			expected: &corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{
+									MatchFields: []corev1.NodeSelectorRequirement{
+										{
+											Key:      "key",
+											Operator: corev1.NodeSelectorOpIn,
+											Values:   []string{"val1", "val2"},
+										},
+									},
+								},
+							},
+						},
+					},
+					PodAffinity: &corev1.PodAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey",
+								Namespaces:  []string{"ns1", "ns2"},
+							},
+						},
+					},
+					PodAntiAffinity: &corev1.PodAntiAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+							{
+								TopologyKey: "topKey2",
+								Namespaces:  []string{"n3", "ns4"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := inject.OverrideDeploymentAffinity(tt.podSpec, tt.affinity)
+
+			podSpecWant := tt.expected
+			podSpecGot := tt.podSpec
+
+			assert.Equal(t, tt.expectedErr, err)
+			assert.Equal(t, podSpecWant, podSpecGot)
+		})
+	}
+}
+
+func TestAffinityAPIChanges(t *testing.T) {
+	value := reflect.ValueOf(corev1.Affinity{})
+	assert.Equal(t, 3, value.NumField(), "It seems the corev1.Affinity API has changed. Please revisit the inject.OverrideDeploymentAffinity implementation")
+}
+
+func TestInjectAnnotationsIntoDeployment(t *testing.T) {
+	tests := []struct {
+		name        string
+		deployment  *appsv1.Deployment
+		annotations map[string]string
+		expected    *appsv1.Deployment
+	}{
+		{
+			// Nil Deployment is injected with annotations
+			// Expected: Deployment is nil
+			name:        "WithNilDeployment",
+			deployment:  nil,
+			annotations: map[string]string{"foo": "bar"},
+			expected:    nil, // raises an error
+		},
+		{
+			// Deployment with no Annotations is injected with annotations
+			// Expected: Annotations is empty
+			name:        "WithEmptyAnnotations",
+			deployment:  &appsv1.Deployment{},
+			annotations: map[string]string{"foo": "bar"},
+			expected: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{"foo": "bar"},
+				},
+				Spec: appsv1.DeploymentSpec{
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Annotations: map[string]string{
+								"foo": "bar",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// Deployment with existing Annotations is injected with annotations
+			// Expected: Existing Annotations are not overwritten
+			name: "WithExistingAnnotations",
+			deployment: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"common": "default-deploy-annotation",
+						"deploy": "default-deploy-annotation",
+					},
+				},
+				Spec: appsv1.DeploymentSpec{
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Annotations: map[string]string{
+								"common": "default-pod-annotation",
+								"pod":    "default-pod-annotation",
+							},
+						},
+					},
+				},
+			},
+			annotations: map[string]string{
+				"common": "override-annotation",
+				"deploy": "override-annotation",
+				"pod":    "override-annotation",
+				"foo":    "bar",
+			},
+			expected: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						// no overrides
+						"common": "default-deploy-annotation",
+						"deploy": "default-deploy-annotation",
+						// there was no default for "pod" on the deployment
+						"pod": "override-annotation",
+						"foo": "bar",
+					},
+				},
+				Spec: appsv1.DeploymentSpec{
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Annotations: map[string]string{
+								// no overrides
+								"common": "default-pod-annotation",
+								"pod":    "default-pod-annotation",
+								// there was no default for "deploy" on the pod
+								"deploy": "override-annotation",
+								"foo":    "bar",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// Existing Deployment is left alone if annotations is nil
+			// Expected: Deployment is not changed
+			name: "WithNilAnnotations",
+			deployment: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"deploy": "default-annotation",
+					},
+				},
+				Spec: appsv1.DeploymentSpec{
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Annotations: map[string]string{
+								"pod": "default-annotation",
+							},
+						},
+					},
+				},
+			},
+			annotations: nil,
+			expected: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"deploy": "default-annotation",
+					},
+				},
+				Spec: appsv1.DeploymentSpec{
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Annotations: map[string]string{
+								"pod": "default-annotation",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// Existing Deployment retains its annotations if the annotations is an empty map
+			// Expected: Deployment annotations are not changed
+			name: "WithEmptyAnnotations",
+			deployment: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"deploy": "default-annotation",
+					},
+				},
+				Spec: appsv1.DeploymentSpec{
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Annotations: map[string]string{
+								"pod": "default-annotation",
+							},
+						},
+					},
+				},
+			},
+			annotations: map[string]string{},
+			expected: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"deploy": "default-annotation",
+					},
+				},
+				Spec: appsv1.DeploymentSpec{
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Annotations: map[string]string{
+								"pod": "default-annotation",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inject.InjectAnnotationsIntoDeployment(tt.deployment, tt.annotations)
+
+			podSpecWant := tt.expected
+			podSpecGot := tt.deployment
 
 			assert.Equal(t, podSpecWant, podSpecGot)
 		})

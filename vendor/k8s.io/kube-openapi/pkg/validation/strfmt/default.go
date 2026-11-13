@@ -17,12 +17,13 @@ package strfmt
 import (
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"net/mail"
 	"regexp"
 	"strings"
 
-	"github.com/asaskevich/govalidator"
+	netutils "k8s.io/utils/net"
+
+	"k8s.io/kube-openapi/pkg/internal/third_party/govalidator"
 )
 
 const (
@@ -154,13 +155,13 @@ func init() {
 	Default.Add("hostname", &hn, IsHostname)
 
 	ip4 := IPv4("")
-	Default.Add("ipv4", &ip4, govalidator.IsIPv4)
+	Default.Add("ipv4", &ip4, isIPv4)
 
 	ip6 := IPv6("")
 	Default.Add("ipv6", &ip6, govalidator.IsIPv6)
 
 	cidr := CIDR("")
-	Default.Add("cidr", &cidr, govalidator.IsCIDR)
+	Default.Add("cidr", &cidr, isCIDR)
 
 	mac := MAC("")
 	Default.Add("mac", &mac, govalidator.IsMAC)
@@ -205,6 +206,18 @@ func init() {
 	Default.Add("password", &pw, func(_ string) bool { return true })
 }
 
+// isIPv4 checks if the string is an IPv4 address, tolerating leading 0's for compatibility with go < 1.17.
+func isIPv4(s string) bool {
+	ip := netutils.ParseIPSloppy(s)
+	return ip != nil && strings.Contains(s, ".")
+}
+
+// isCIDR checks if the string is valid CIDR notation, tolerating leading 0's for compatibility with go < 1.17.
+func isCIDR(s string) bool {
+	_, _, err := netutils.ParseCIDRSloppy(s)
+	return err == nil
+}
+
 // Base64 represents a base64 encoded string, using URLEncoding alphabet
 //
 // swagger:strfmt byte
@@ -230,29 +243,6 @@ func (b *Base64) UnmarshalText(data []byte) error { // validation is performed l
 	}
 
 	*b = dbuf[:n]
-	return nil
-}
-
-// Scan read a value from a database driver
-func (b *Base64) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		dbuf := make([]byte, base64.StdEncoding.DecodedLen(len(v)))
-		n, err := base64.StdEncoding.Decode(dbuf, v)
-		if err != nil {
-			return err
-		}
-		*b = dbuf[:n]
-	case string:
-		vv, err := base64.StdEncoding.DecodeString(v)
-		if err != nil {
-			return err
-		}
-		*b = Base64(vv)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.Base64 from: %#v", v)
-	}
-
 	return nil
 }
 
@@ -310,20 +300,6 @@ func (u *URI) UnmarshalText(data []byte) error { // validation is performed late
 	return nil
 }
 
-// Scan read a value from a database driver
-func (u *URI) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = URI(string(v))
-	case string:
-		*u = URI(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.URI from: %#v", v)
-	}
-
-	return nil
-}
-
 func (u URI) String() string {
 	return string(u)
 }
@@ -371,20 +347,6 @@ func (e Email) MarshalText() ([]byte, error) {
 // UnmarshalText hydrates this instance from text
 func (e *Email) UnmarshalText(data []byte) error { // validation is performed later on
 	*e = Email(string(data))
-	return nil
-}
-
-// Scan read a value from a database driver
-func (e *Email) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*e = Email(string(v))
-	case string:
-		*e = Email(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.Email from: %#v", v)
-	}
-
 	return nil
 }
 
@@ -438,20 +400,6 @@ func (h *Hostname) UnmarshalText(data []byte) error { // validation is performed
 	return nil
 }
 
-// Scan read a value from a database driver
-func (h *Hostname) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*h = Hostname(string(v))
-	case string:
-		*h = Hostname(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.Hostname from: %#v", v)
-	}
-
-	return nil
-}
-
 func (h Hostname) String() string {
 	return string(h)
 }
@@ -499,20 +447,6 @@ func (u IPv4) MarshalText() ([]byte, error) {
 // UnmarshalText hydrates this instance from text
 func (u *IPv4) UnmarshalText(data []byte) error { // validation is performed later on
 	*u = IPv4(string(data))
-	return nil
-}
-
-// Scan read a value from a database driver
-func (u *IPv4) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = IPv4(string(v))
-	case string:
-		*u = IPv4(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.IPv4 from: %#v", v)
-	}
-
 	return nil
 }
 
@@ -566,20 +500,6 @@ func (u *IPv6) UnmarshalText(data []byte) error { // validation is performed lat
 	return nil
 }
 
-// Scan read a value from a database driver
-func (u *IPv6) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = IPv6(string(v))
-	case string:
-		*u = IPv6(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.IPv6 from: %#v", v)
-	}
-
-	return nil
-}
-
 func (u IPv6) String() string {
 	return string(u)
 }
@@ -627,20 +547,6 @@ func (u CIDR) MarshalText() ([]byte, error) {
 // UnmarshalText hydrates this instance from text
 func (u *CIDR) UnmarshalText(data []byte) error { // validation is performed later on
 	*u = CIDR(string(data))
-	return nil
-}
-
-// Scan read a value from a database driver
-func (u *CIDR) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = CIDR(string(v))
-	case string:
-		*u = CIDR(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.CIDR from: %#v", v)
-	}
-
 	return nil
 }
 
@@ -694,20 +600,6 @@ func (u *MAC) UnmarshalText(data []byte) error { // validation is performed late
 	return nil
 }
 
-// Scan read a value from a database driver
-func (u *MAC) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = MAC(string(v))
-	case string:
-		*u = MAC(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.IPv4 from: %#v", v)
-	}
-
-	return nil
-}
-
 func (u MAC) String() string {
 	return string(u)
 }
@@ -755,20 +647,6 @@ func (u UUID) MarshalText() ([]byte, error) {
 // UnmarshalText hydrates this instance from text
 func (u *UUID) UnmarshalText(data []byte) error { // validation is performed later on
 	*u = UUID(string(data))
-	return nil
-}
-
-// Scan read a value from a database driver
-func (u *UUID) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = UUID(string(v))
-	case string:
-		*u = UUID(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.UUID from: %#v", v)
-	}
-
 	return nil
 }
 
@@ -825,20 +703,6 @@ func (u *UUID3) UnmarshalText(data []byte) error { // validation is performed la
 	return nil
 }
 
-// Scan read a value from a database driver
-func (u *UUID3) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = UUID3(string(v))
-	case string:
-		*u = UUID3(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.UUID3 from: %#v", v)
-	}
-
-	return nil
-}
-
 func (u UUID3) String() string {
 	return string(u)
 }
@@ -889,20 +753,6 @@ func (u UUID4) MarshalText() ([]byte, error) {
 // UnmarshalText hydrates this instance from text
 func (u *UUID4) UnmarshalText(data []byte) error { // validation is performed later on
 	*u = UUID4(string(data))
-	return nil
-}
-
-// Scan read a value from a database driver
-func (u *UUID4) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = UUID4(string(v))
-	case string:
-		*u = UUID4(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.UUID4 from: %#v", v)
-	}
-
 	return nil
 }
 
@@ -959,20 +809,6 @@ func (u *UUID5) UnmarshalText(data []byte) error { // validation is performed la
 	return nil
 }
 
-// Scan read a value from a database driver
-func (u *UUID5) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = UUID5(string(v))
-	case string:
-		*u = UUID5(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.UUID5 from: %#v", v)
-	}
-
-	return nil
-}
-
 func (u UUID5) String() string {
 	return string(u)
 }
@@ -1023,20 +859,6 @@ func (u ISBN) MarshalText() ([]byte, error) {
 // UnmarshalText hydrates this instance from text
 func (u *ISBN) UnmarshalText(data []byte) error { // validation is performed later on
 	*u = ISBN(string(data))
-	return nil
-}
-
-// Scan read a value from a database driver
-func (u *ISBN) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = ISBN(string(v))
-	case string:
-		*u = ISBN(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.ISBN from: %#v", v)
-	}
-
 	return nil
 }
 
@@ -1093,20 +915,6 @@ func (u *ISBN10) UnmarshalText(data []byte) error { // validation is performed l
 	return nil
 }
 
-// Scan read a value from a database driver
-func (u *ISBN10) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = ISBN10(string(v))
-	case string:
-		*u = ISBN10(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.ISBN10 from: %#v", v)
-	}
-
-	return nil
-}
-
 func (u ISBN10) String() string {
 	return string(u)
 }
@@ -1157,20 +965,6 @@ func (u ISBN13) MarshalText() ([]byte, error) {
 // UnmarshalText hydrates this instance from text
 func (u *ISBN13) UnmarshalText(data []byte) error { // validation is performed later on
 	*u = ISBN13(string(data))
-	return nil
-}
-
-// Scan read a value from a database driver
-func (u *ISBN13) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = ISBN13(string(v))
-	case string:
-		*u = ISBN13(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.ISBN13 from: %#v", v)
-	}
-
 	return nil
 }
 
@@ -1227,20 +1021,6 @@ func (u *CreditCard) UnmarshalText(data []byte) error { // validation is perform
 	return nil
 }
 
-// Scan read a value from a database driver
-func (u *CreditCard) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = CreditCard(string(v))
-	case string:
-		*u = CreditCard(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.CreditCard from: %#v", v)
-	}
-
-	return nil
-}
-
 func (u CreditCard) String() string {
 	return string(u)
 }
@@ -1291,20 +1071,6 @@ func (u SSN) MarshalText() ([]byte, error) {
 // UnmarshalText hydrates this instance from text
 func (u *SSN) UnmarshalText(data []byte) error { // validation is performed later on
 	*u = SSN(string(data))
-	return nil
-}
-
-// Scan read a value from a database driver
-func (u *SSN) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*u = SSN(string(v))
-	case string:
-		*u = SSN(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.SSN from: %#v", v)
-	}
-
 	return nil
 }
 
@@ -1361,20 +1127,6 @@ func (h *HexColor) UnmarshalText(data []byte) error { // validation is performed
 	return nil
 }
 
-// Scan read a value from a database driver
-func (h *HexColor) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*h = HexColor(string(v))
-	case string:
-		*h = HexColor(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.HexColor from: %#v", v)
-	}
-
-	return nil
-}
-
 func (h HexColor) String() string {
 	return string(h)
 }
@@ -1425,20 +1177,6 @@ func (r RGBColor) MarshalText() ([]byte, error) {
 // UnmarshalText hydrates this instance from text
 func (r *RGBColor) UnmarshalText(data []byte) error { // validation is performed later on
 	*r = RGBColor(string(data))
-	return nil
-}
-
-// Scan read a value from a database driver
-func (r *RGBColor) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*r = RGBColor(string(v))
-	case string:
-		*r = RGBColor(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.RGBColor from: %#v", v)
-	}
-
 	return nil
 }
 
@@ -1493,20 +1231,6 @@ func (r Password) MarshalText() ([]byte, error) {
 // UnmarshalText hydrates this instance from text
 func (r *Password) UnmarshalText(data []byte) error { // validation is performed later on
 	*r = Password(string(data))
-	return nil
-}
-
-// Scan read a value from a database driver
-func (r *Password) Scan(raw interface{}) error {
-	switch v := raw.(type) {
-	case []byte:
-		*r = Password(string(v))
-	case string:
-		*r = Password(v)
-	default:
-		return fmt.Errorf("cannot sql.Scan() strfmt.Password from: %#v", v)
-	}
-
 	return nil
 }
 

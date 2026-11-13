@@ -10,21 +10,16 @@ import (
 )
 
 type FakeS struct {
-	AddStub        func(z.Lit)
-	addMutex       sync.RWMutex
-	addArgsForCall []struct {
-		arg1 z.Lit
-	}
-	AssumeStub        func(...z.Lit)
-	assumeMutex       sync.RWMutex
-	assumeArgsForCall []struct {
-		arg1 []z.Lit
-	}
+	AddStub            func(z.Lit)
+	addMutex           sync.RWMutex
+	addArgsForCall     []FakeSAddArgs
+	AssumeStub         func(...z.Lit)
+	assumeMutex        sync.RWMutex
+	assumeArgsForCall  []FakeSAssumeArgs
 	GoSolveStub        func() inter.Solve
 	goSolveMutex       sync.RWMutex
-	goSolveArgsForCall []struct {
-	}
-	goSolveReturns struct {
+	goSolveArgsForCall []struct{}
+	goSolveReturns     struct {
 		result1 inter.Solve
 	}
 	goSolveReturnsOnCall map[int]struct {
@@ -32,9 +27,8 @@ type FakeS struct {
 	}
 	LitStub        func() z.Lit
 	litMutex       sync.RWMutex
-	litArgsForCall []struct {
-	}
-	litReturns struct {
+	litArgsForCall []struct{}
+	litReturns     struct {
 		result1 z.Lit
 	}
 	litReturnsOnCall map[int]struct {
@@ -42,9 +36,8 @@ type FakeS struct {
 	}
 	MaxVarStub        func() z.Var
 	maxVarMutex       sync.RWMutex
-	maxVarArgsForCall []struct {
-	}
-	maxVarReturns struct {
+	maxVarArgsForCall []struct{}
+	maxVarReturns     struct {
 		result1 z.Var
 	}
 	maxVarReturnsOnCall map[int]struct {
@@ -52,11 +45,8 @@ type FakeS struct {
 	}
 	ReasonsStub        func([]z.Lit, z.Lit) []z.Lit
 	reasonsMutex       sync.RWMutex
-	reasonsArgsForCall []struct {
-		arg1 []z.Lit
-		arg2 z.Lit
-	}
-	reasonsReturns struct {
+	reasonsArgsForCall []FakeSReasonsArgs
+	reasonsReturns     struct {
 		result1 []z.Lit
 	}
 	reasonsReturnsOnCall map[int]struct {
@@ -64,9 +54,8 @@ type FakeS struct {
 	}
 	SCopyStub        func() inter.S
 	sCopyMutex       sync.RWMutex
-	sCopyArgsForCall []struct {
-	}
-	sCopyReturns struct {
+	sCopyArgsForCall []struct{}
+	sCopyReturns     struct {
 		result1 inter.S
 	}
 	sCopyReturnsOnCall map[int]struct {
@@ -74,9 +63,8 @@ type FakeS struct {
 	}
 	SolveStub        func() int
 	solveMutex       sync.RWMutex
-	solveArgsForCall []struct {
-	}
-	solveReturns struct {
+	solveArgsForCall []struct{}
+	solveReturns     struct {
 		result1 int
 	}
 	solveReturnsOnCall map[int]struct {
@@ -84,10 +72,8 @@ type FakeS struct {
 	}
 	TestStub        func([]z.Lit) (int, []z.Lit)
 	testMutex       sync.RWMutex
-	testArgsForCall []struct {
-		arg1 []z.Lit
-	}
-	testReturns struct {
+	testArgsForCall []FakeSTestArgs
+	testReturns     struct {
 		result1 int
 		result2 []z.Lit
 	}
@@ -97,10 +83,8 @@ type FakeS struct {
 	}
 	TryStub        func(time.Duration) int
 	tryMutex       sync.RWMutex
-	tryArgsForCall []struct {
-		arg1 time.Duration
-	}
-	tryReturns struct {
+	tryArgsForCall []FakeSTryArgs
+	tryReturns     struct {
 		result1 int
 	}
 	tryReturnsOnCall map[int]struct {
@@ -108,9 +92,8 @@ type FakeS struct {
 	}
 	UntestStub        func() int
 	untestMutex       sync.RWMutex
-	untestArgsForCall []struct {
-	}
-	untestReturns struct {
+	untestArgsForCall []struct{}
+	untestReturns     struct {
 		result1 int
 	}
 	untestReturnsOnCall map[int]struct {
@@ -118,10 +101,8 @@ type FakeS struct {
 	}
 	ValueStub        func(z.Lit) bool
 	valueMutex       sync.RWMutex
-	valueArgsForCall []struct {
-		arg1 z.Lit
-	}
-	valueReturns struct {
+	valueArgsForCall []FakeSValueArgs
+	valueReturns     struct {
 		result1 bool
 	}
 	valueReturnsOnCall map[int]struct {
@@ -129,28 +110,62 @@ type FakeS struct {
 	}
 	WhyStub        func([]z.Lit) []z.Lit
 	whyMutex       sync.RWMutex
-	whyArgsForCall []struct {
-		arg1 []z.Lit
-	}
-	whyReturns struct {
+	whyArgsForCall []FakeSWhyArgs
+	whyReturns     struct {
 		result1 []z.Lit
 	}
 	whyReturnsOnCall map[int]struct {
 		result1 []z.Lit
 	}
 	invocations      map[string][][]interface{}
+	callOrder        []string
 	invocationsMutex sync.RWMutex
+}
+
+// FakeSAddArgs holds the arguments of one call to Add.
+type FakeSAddArgs struct {
+	Arg1 z.Lit
+}
+
+// FakeSAssumeArgs holds the arguments of one call to Assume.
+type FakeSAssumeArgs struct {
+	Arg1 []z.Lit
+}
+
+// FakeSReasonsArgs holds the arguments of one call to Reasons.
+type FakeSReasonsArgs struct {
+	Arg1 []z.Lit
+	Arg2 z.Lit
+}
+
+// FakeSTestArgs holds the arguments of one call to Test.
+type FakeSTestArgs struct {
+	Arg1 []z.Lit
+}
+
+// FakeSTryArgs holds the arguments of one call to Try.
+type FakeSTryArgs struct {
+	Arg1 time.Duration
+}
+
+// FakeSValueArgs holds the arguments of one call to Value.
+type FakeSValueArgs struct {
+	Arg1 z.Lit
+}
+
+// FakeSWhyArgs holds the arguments of one call to Why.
+type FakeSWhyArgs struct {
+	Arg1 []z.Lit
 }
 
 func (fake *FakeS) Add(arg1 z.Lit) {
 	fake.addMutex.Lock()
-	fake.addArgsForCall = append(fake.addArgsForCall, struct {
-		arg1 z.Lit
-	}{arg1})
+	fake.addArgsForCall = append(fake.addArgsForCall, FakeSAddArgs{arg1})
+	stub := fake.AddStub
 	fake.recordInvocation("Add", []interface{}{arg1})
 	fake.addMutex.Unlock()
-	if fake.AddStub != nil {
-		fake.AddStub(arg1)
+	if stub != nil {
+		stub(arg1)
 	}
 }
 
@@ -170,18 +185,30 @@ func (fake *FakeS) AddArgsForCall(i int) z.Lit {
 	fake.addMutex.RLock()
 	defer fake.addMutex.RUnlock()
 	argsForCall := fake.addArgsForCall[i]
-	return argsForCall.arg1
+	return argsForCall.Arg1
+}
+
+func (fake *FakeS) AddArgs() []FakeSAddArgs {
+	fake.addMutex.RLock()
+	defer fake.addMutex.RUnlock()
+	args := make([]FakeSAddArgs, len(fake.addArgsForCall))
+	copy(args, fake.addArgsForCall)
+	return args
 }
 
 func (fake *FakeS) Assume(arg1 ...z.Lit) {
+	var arg1Copy []z.Lit
+	if arg1 != nil {
+		arg1Copy = make([]z.Lit, len(arg1))
+		copy(arg1Copy, arg1)
+	}
 	fake.assumeMutex.Lock()
-	fake.assumeArgsForCall = append(fake.assumeArgsForCall, struct {
-		arg1 []z.Lit
-	}{arg1})
-	fake.recordInvocation("Assume", []interface{}{arg1})
+	fake.assumeArgsForCall = append(fake.assumeArgsForCall, FakeSAssumeArgs{arg1Copy})
+	stub := fake.AssumeStub
+	fake.recordInvocation("Assume", []interface{}{arg1Copy})
 	fake.assumeMutex.Unlock()
-	if fake.AssumeStub != nil {
-		fake.AssumeStub(arg1...)
+	if stub != nil {
+		stub(arg1...)
 	}
 }
 
@@ -201,23 +228,31 @@ func (fake *FakeS) AssumeArgsForCall(i int) []z.Lit {
 	fake.assumeMutex.RLock()
 	defer fake.assumeMutex.RUnlock()
 	argsForCall := fake.assumeArgsForCall[i]
-	return argsForCall.arg1
+	return argsForCall.Arg1
+}
+
+func (fake *FakeS) AssumeArgs() []FakeSAssumeArgs {
+	fake.assumeMutex.RLock()
+	defer fake.assumeMutex.RUnlock()
+	args := make([]FakeSAssumeArgs, len(fake.assumeArgsForCall))
+	copy(args, fake.assumeArgsForCall)
+	return args
 }
 
 func (fake *FakeS) GoSolve() inter.Solve {
 	fake.goSolveMutex.Lock()
 	ret, specificReturn := fake.goSolveReturnsOnCall[len(fake.goSolveArgsForCall)]
-	fake.goSolveArgsForCall = append(fake.goSolveArgsForCall, struct {
-	}{})
+	fake.goSolveArgsForCall = append(fake.goSolveArgsForCall, struct{}{})
+	stub := fake.GoSolveStub
+	fakeReturns := fake.goSolveReturns
 	fake.recordInvocation("GoSolve", []interface{}{})
 	fake.goSolveMutex.Unlock()
-	if fake.GoSolveStub != nil {
-		return fake.GoSolveStub()
+	if stub != nil {
+		return stub()
 	}
 	if specificReturn {
 		return ret.result1
 	}
-	fakeReturns := fake.goSolveReturns
 	return fakeReturns.result1
 }
 
@@ -259,17 +294,17 @@ func (fake *FakeS) GoSolveReturnsOnCall(i int, result1 inter.Solve) {
 func (fake *FakeS) Lit() z.Lit {
 	fake.litMutex.Lock()
 	ret, specificReturn := fake.litReturnsOnCall[len(fake.litArgsForCall)]
-	fake.litArgsForCall = append(fake.litArgsForCall, struct {
-	}{})
+	fake.litArgsForCall = append(fake.litArgsForCall, struct{}{})
+	stub := fake.LitStub
+	fakeReturns := fake.litReturns
 	fake.recordInvocation("Lit", []interface{}{})
 	fake.litMutex.Unlock()
-	if fake.LitStub != nil {
-		return fake.LitStub()
+	if stub != nil {
+		return stub()
 	}
 	if specificReturn {
 		return ret.result1
 	}
-	fakeReturns := fake.litReturns
 	return fakeReturns.result1
 }
 
@@ -311,17 +346,17 @@ func (fake *FakeS) LitReturnsOnCall(i int, result1 z.Lit) {
 func (fake *FakeS) MaxVar() z.Var {
 	fake.maxVarMutex.Lock()
 	ret, specificReturn := fake.maxVarReturnsOnCall[len(fake.maxVarArgsForCall)]
-	fake.maxVarArgsForCall = append(fake.maxVarArgsForCall, struct {
-	}{})
+	fake.maxVarArgsForCall = append(fake.maxVarArgsForCall, struct{}{})
+	stub := fake.MaxVarStub
+	fakeReturns := fake.maxVarReturns
 	fake.recordInvocation("MaxVar", []interface{}{})
 	fake.maxVarMutex.Unlock()
-	if fake.MaxVarStub != nil {
-		return fake.MaxVarStub()
+	if stub != nil {
+		return stub()
 	}
 	if specificReturn {
 		return ret.result1
 	}
-	fakeReturns := fake.maxVarReturns
 	return fakeReturns.result1
 }
 
@@ -368,19 +403,17 @@ func (fake *FakeS) Reasons(arg1 []z.Lit, arg2 z.Lit) []z.Lit {
 	}
 	fake.reasonsMutex.Lock()
 	ret, specificReturn := fake.reasonsReturnsOnCall[len(fake.reasonsArgsForCall)]
-	fake.reasonsArgsForCall = append(fake.reasonsArgsForCall, struct {
-		arg1 []z.Lit
-		arg2 z.Lit
-	}{arg1Copy, arg2})
+	fake.reasonsArgsForCall = append(fake.reasonsArgsForCall, FakeSReasonsArgs{arg1Copy, arg2})
+	stub := fake.ReasonsStub
+	fakeReturns := fake.reasonsReturns
 	fake.recordInvocation("Reasons", []interface{}{arg1Copy, arg2})
 	fake.reasonsMutex.Unlock()
-	if fake.ReasonsStub != nil {
-		return fake.ReasonsStub(arg1, arg2)
+	if stub != nil {
+		return stub(arg1, arg2)
 	}
 	if specificReturn {
 		return ret.result1
 	}
-	fakeReturns := fake.reasonsReturns
 	return fakeReturns.result1
 }
 
@@ -400,7 +433,15 @@ func (fake *FakeS) ReasonsArgsForCall(i int) ([]z.Lit, z.Lit) {
 	fake.reasonsMutex.RLock()
 	defer fake.reasonsMutex.RUnlock()
 	argsForCall := fake.reasonsArgsForCall[i]
-	return argsForCall.arg1, argsForCall.arg2
+	return argsForCall.Arg1, argsForCall.Arg2
+}
+
+func (fake *FakeS) ReasonsArgs() []FakeSReasonsArgs {
+	fake.reasonsMutex.RLock()
+	defer fake.reasonsMutex.RUnlock()
+	args := make([]FakeSReasonsArgs, len(fake.reasonsArgsForCall))
+	copy(args, fake.reasonsArgsForCall)
+	return args
 }
 
 func (fake *FakeS) ReasonsReturns(result1 []z.Lit) {
@@ -429,17 +470,17 @@ func (fake *FakeS) ReasonsReturnsOnCall(i int, result1 []z.Lit) {
 func (fake *FakeS) SCopy() inter.S {
 	fake.sCopyMutex.Lock()
 	ret, specificReturn := fake.sCopyReturnsOnCall[len(fake.sCopyArgsForCall)]
-	fake.sCopyArgsForCall = append(fake.sCopyArgsForCall, struct {
-	}{})
+	fake.sCopyArgsForCall = append(fake.sCopyArgsForCall, struct{}{})
+	stub := fake.SCopyStub
+	fakeReturns := fake.sCopyReturns
 	fake.recordInvocation("SCopy", []interface{}{})
 	fake.sCopyMutex.Unlock()
-	if fake.SCopyStub != nil {
-		return fake.SCopyStub()
+	if stub != nil {
+		return stub()
 	}
 	if specificReturn {
 		return ret.result1
 	}
-	fakeReturns := fake.sCopyReturns
 	return fakeReturns.result1
 }
 
@@ -481,17 +522,17 @@ func (fake *FakeS) SCopyReturnsOnCall(i int, result1 inter.S) {
 func (fake *FakeS) Solve() int {
 	fake.solveMutex.Lock()
 	ret, specificReturn := fake.solveReturnsOnCall[len(fake.solveArgsForCall)]
-	fake.solveArgsForCall = append(fake.solveArgsForCall, struct {
-	}{})
+	fake.solveArgsForCall = append(fake.solveArgsForCall, struct{}{})
+	stub := fake.SolveStub
+	fakeReturns := fake.solveReturns
 	fake.recordInvocation("Solve", []interface{}{})
 	fake.solveMutex.Unlock()
-	if fake.SolveStub != nil {
-		return fake.SolveStub()
+	if stub != nil {
+		return stub()
 	}
 	if specificReturn {
 		return ret.result1
 	}
-	fakeReturns := fake.solveReturns
 	return fakeReturns.result1
 }
 
@@ -538,18 +579,17 @@ func (fake *FakeS) Test(arg1 []z.Lit) (int, []z.Lit) {
 	}
 	fake.testMutex.Lock()
 	ret, specificReturn := fake.testReturnsOnCall[len(fake.testArgsForCall)]
-	fake.testArgsForCall = append(fake.testArgsForCall, struct {
-		arg1 []z.Lit
-	}{arg1Copy})
+	fake.testArgsForCall = append(fake.testArgsForCall, FakeSTestArgs{arg1Copy})
+	stub := fake.TestStub
+	fakeReturns := fake.testReturns
 	fake.recordInvocation("Test", []interface{}{arg1Copy})
 	fake.testMutex.Unlock()
-	if fake.TestStub != nil {
-		return fake.TestStub(arg1)
+	if stub != nil {
+		return stub(arg1)
 	}
 	if specificReturn {
 		return ret.result1, ret.result2
 	}
-	fakeReturns := fake.testReturns
 	return fakeReturns.result1, fakeReturns.result2
 }
 
@@ -569,7 +609,15 @@ func (fake *FakeS) TestArgsForCall(i int) []z.Lit {
 	fake.testMutex.RLock()
 	defer fake.testMutex.RUnlock()
 	argsForCall := fake.testArgsForCall[i]
-	return argsForCall.arg1
+	return argsForCall.Arg1
+}
+
+func (fake *FakeS) TestArgs() []FakeSTestArgs {
+	fake.testMutex.RLock()
+	defer fake.testMutex.RUnlock()
+	args := make([]FakeSTestArgs, len(fake.testArgsForCall))
+	copy(args, fake.testArgsForCall)
+	return args
 }
 
 func (fake *FakeS) TestReturns(result1 int, result2 []z.Lit) {
@@ -601,18 +649,17 @@ func (fake *FakeS) TestReturnsOnCall(i int, result1 int, result2 []z.Lit) {
 func (fake *FakeS) Try(arg1 time.Duration) int {
 	fake.tryMutex.Lock()
 	ret, specificReturn := fake.tryReturnsOnCall[len(fake.tryArgsForCall)]
-	fake.tryArgsForCall = append(fake.tryArgsForCall, struct {
-		arg1 time.Duration
-	}{arg1})
+	fake.tryArgsForCall = append(fake.tryArgsForCall, FakeSTryArgs{arg1})
+	stub := fake.TryStub
+	fakeReturns := fake.tryReturns
 	fake.recordInvocation("Try", []interface{}{arg1})
 	fake.tryMutex.Unlock()
-	if fake.TryStub != nil {
-		return fake.TryStub(arg1)
+	if stub != nil {
+		return stub(arg1)
 	}
 	if specificReturn {
 		return ret.result1
 	}
-	fakeReturns := fake.tryReturns
 	return fakeReturns.result1
 }
 
@@ -632,7 +679,15 @@ func (fake *FakeS) TryArgsForCall(i int) time.Duration {
 	fake.tryMutex.RLock()
 	defer fake.tryMutex.RUnlock()
 	argsForCall := fake.tryArgsForCall[i]
-	return argsForCall.arg1
+	return argsForCall.Arg1
+}
+
+func (fake *FakeS) TryArgs() []FakeSTryArgs {
+	fake.tryMutex.RLock()
+	defer fake.tryMutex.RUnlock()
+	args := make([]FakeSTryArgs, len(fake.tryArgsForCall))
+	copy(args, fake.tryArgsForCall)
+	return args
 }
 
 func (fake *FakeS) TryReturns(result1 int) {
@@ -661,17 +716,17 @@ func (fake *FakeS) TryReturnsOnCall(i int, result1 int) {
 func (fake *FakeS) Untest() int {
 	fake.untestMutex.Lock()
 	ret, specificReturn := fake.untestReturnsOnCall[len(fake.untestArgsForCall)]
-	fake.untestArgsForCall = append(fake.untestArgsForCall, struct {
-	}{})
+	fake.untestArgsForCall = append(fake.untestArgsForCall, struct{}{})
+	stub := fake.UntestStub
+	fakeReturns := fake.untestReturns
 	fake.recordInvocation("Untest", []interface{}{})
 	fake.untestMutex.Unlock()
-	if fake.UntestStub != nil {
-		return fake.UntestStub()
+	if stub != nil {
+		return stub()
 	}
 	if specificReturn {
 		return ret.result1
 	}
-	fakeReturns := fake.untestReturns
 	return fakeReturns.result1
 }
 
@@ -713,18 +768,17 @@ func (fake *FakeS) UntestReturnsOnCall(i int, result1 int) {
 func (fake *FakeS) Value(arg1 z.Lit) bool {
 	fake.valueMutex.Lock()
 	ret, specificReturn := fake.valueReturnsOnCall[len(fake.valueArgsForCall)]
-	fake.valueArgsForCall = append(fake.valueArgsForCall, struct {
-		arg1 z.Lit
-	}{arg1})
+	fake.valueArgsForCall = append(fake.valueArgsForCall, FakeSValueArgs{arg1})
+	stub := fake.ValueStub
+	fakeReturns := fake.valueReturns
 	fake.recordInvocation("Value", []interface{}{arg1})
 	fake.valueMutex.Unlock()
-	if fake.ValueStub != nil {
-		return fake.ValueStub(arg1)
+	if stub != nil {
+		return stub(arg1)
 	}
 	if specificReturn {
 		return ret.result1
 	}
-	fakeReturns := fake.valueReturns
 	return fakeReturns.result1
 }
 
@@ -744,7 +798,15 @@ func (fake *FakeS) ValueArgsForCall(i int) z.Lit {
 	fake.valueMutex.RLock()
 	defer fake.valueMutex.RUnlock()
 	argsForCall := fake.valueArgsForCall[i]
-	return argsForCall.arg1
+	return argsForCall.Arg1
+}
+
+func (fake *FakeS) ValueArgs() []FakeSValueArgs {
+	fake.valueMutex.RLock()
+	defer fake.valueMutex.RUnlock()
+	args := make([]FakeSValueArgs, len(fake.valueArgsForCall))
+	copy(args, fake.valueArgsForCall)
+	return args
 }
 
 func (fake *FakeS) ValueReturns(result1 bool) {
@@ -778,18 +840,17 @@ func (fake *FakeS) Why(arg1 []z.Lit) []z.Lit {
 	}
 	fake.whyMutex.Lock()
 	ret, specificReturn := fake.whyReturnsOnCall[len(fake.whyArgsForCall)]
-	fake.whyArgsForCall = append(fake.whyArgsForCall, struct {
-		arg1 []z.Lit
-	}{arg1Copy})
+	fake.whyArgsForCall = append(fake.whyArgsForCall, FakeSWhyArgs{arg1Copy})
+	stub := fake.WhyStub
+	fakeReturns := fake.whyReturns
 	fake.recordInvocation("Why", []interface{}{arg1Copy})
 	fake.whyMutex.Unlock()
-	if fake.WhyStub != nil {
-		return fake.WhyStub(arg1)
+	if stub != nil {
+		return stub(arg1)
 	}
 	if specificReturn {
 		return ret.result1
 	}
-	fakeReturns := fake.whyReturns
 	return fakeReturns.result1
 }
 
@@ -809,7 +870,15 @@ func (fake *FakeS) WhyArgsForCall(i int) []z.Lit {
 	fake.whyMutex.RLock()
 	defer fake.whyMutex.RUnlock()
 	argsForCall := fake.whyArgsForCall[i]
-	return argsForCall.arg1
+	return argsForCall.Arg1
+}
+
+func (fake *FakeS) WhyArgs() []FakeSWhyArgs {
+	fake.whyMutex.RLock()
+	defer fake.whyMutex.RUnlock()
+	args := make([]FakeSWhyArgs, len(fake.whyArgsForCall))
+	copy(args, fake.whyArgsForCall)
+	return args
 }
 
 func (fake *FakeS) WhyReturns(result1 []z.Lit) {
@@ -838,32 +907,6 @@ func (fake *FakeS) WhyReturnsOnCall(i int, result1 []z.Lit) {
 func (fake *FakeS) Invocations() map[string][][]interface{} {
 	fake.invocationsMutex.RLock()
 	defer fake.invocationsMutex.RUnlock()
-	fake.addMutex.RLock()
-	defer fake.addMutex.RUnlock()
-	fake.assumeMutex.RLock()
-	defer fake.assumeMutex.RUnlock()
-	fake.goSolveMutex.RLock()
-	defer fake.goSolveMutex.RUnlock()
-	fake.litMutex.RLock()
-	defer fake.litMutex.RUnlock()
-	fake.maxVarMutex.RLock()
-	defer fake.maxVarMutex.RUnlock()
-	fake.reasonsMutex.RLock()
-	defer fake.reasonsMutex.RUnlock()
-	fake.sCopyMutex.RLock()
-	defer fake.sCopyMutex.RUnlock()
-	fake.solveMutex.RLock()
-	defer fake.solveMutex.RUnlock()
-	fake.testMutex.RLock()
-	defer fake.testMutex.RUnlock()
-	fake.tryMutex.RLock()
-	defer fake.tryMutex.RUnlock()
-	fake.untestMutex.RLock()
-	defer fake.untestMutex.RUnlock()
-	fake.valueMutex.RLock()
-	defer fake.valueMutex.RUnlock()
-	fake.whyMutex.RLock()
-	defer fake.whyMutex.RUnlock()
 	copiedInvocations := map[string][][]interface{}{}
 	for key, value := range fake.invocations {
 		copiedInvocations[key] = value
@@ -871,9 +914,18 @@ func (fake *FakeS) Invocations() map[string][][]interface{} {
 	return copiedInvocations
 }
 
+func (fake *FakeS) CallOrder() []string {
+	fake.invocationsMutex.RLock()
+	defer fake.invocationsMutex.RUnlock()
+	order := make([]string, len(fake.callOrder))
+	copy(order, fake.callOrder)
+	return order
+}
+
 func (fake *FakeS) recordInvocation(key string, args []interface{}) {
 	fake.invocationsMutex.Lock()
 	defer fake.invocationsMutex.Unlock()
+	fake.callOrder = append(fake.callOrder, key)
 	if fake.invocations == nil {
 		fake.invocations = map[string][][]interface{}{}
 	}

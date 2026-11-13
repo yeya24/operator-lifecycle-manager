@@ -4,7 +4,6 @@ This runs a series of tests against the Kubernetes API to verify that OLM is fun
 
 ## Requirements
 
-* Minikube > 0.25.0
 * Helm > 2.7.0
 
 ## How to use
@@ -43,7 +42,7 @@ Examples:
 make file and use `-dryRun` with `-focus` and see if the regex would trigger your specific test(s).
   
   ```bash
-  GO111MODULE=on GOFLAGS="-mod=vendor" go run github.com/onsi/ginkgo/ginkgo -dryRun -focus 'API service resource not migrated if not adoptable' bin/e2e-local.test
+  GO111MODULE=on go run github.com/onsi/ginkgo/v2/ginkgo -dryRun -focus 'API service resource not migrated if not adoptable' bin/e2e-local.test
   ```
 
 - It is also possible to specify the number of parallel test nodes (i.e. one or more instances of `go test`) to run using the `NODES` argument. Defaults to 1 if not specified

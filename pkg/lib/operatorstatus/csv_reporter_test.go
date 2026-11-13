@@ -12,11 +12,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/clock"
+	utilclock "k8s.io/utils/clock/testing"
 )
 
 func TestGetNewStatus(t *testing.T) {
-	fakeClock := clock.NewFakeClock(time.Now())
+	fakeClock := utilclock.NewFakeClock(time.Now())
 
 	tests := []struct {
 		name     string
@@ -37,7 +37,7 @@ func TestGetNewStatus(t *testing.T) {
 					},
 					Spec: v1alpha1.ClusterServiceVersionSpec{
 						Version: version.OperatorVersion{
-							semver.Version{
+							Version: semver.Version{
 								Major: 1, Minor: 0, Patch: 0,
 							},
 						},
@@ -100,7 +100,7 @@ func TestGetNewStatus(t *testing.T) {
 					},
 					Spec: v1alpha1.ClusterServiceVersionSpec{
 						Version: version.OperatorVersion{
-							semver.Version{
+							Version: semver.Version{
 								Major: 1, Minor: 0, Patch: 0,
 							},
 						},
@@ -180,7 +180,7 @@ func TestGetNewStatus(t *testing.T) {
 					},
 					Spec: v1alpha1.ClusterServiceVersionSpec{
 						Version: version.OperatorVersion{
-							semver.Version{
+							Version: semver.Version{
 								Major: 1, Minor: 0, Patch: 0,
 							},
 						},
@@ -260,7 +260,7 @@ func TestGetNewStatus(t *testing.T) {
 					},
 					Spec: v1alpha1.ClusterServiceVersionSpec{
 						Version: version.OperatorVersion{
-							semver.Version{
+							Version: semver.Version{
 								Major: 1, Minor: 0, Patch: 0,
 							},
 						},

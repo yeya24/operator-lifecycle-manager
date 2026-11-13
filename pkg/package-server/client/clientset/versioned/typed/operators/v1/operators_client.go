@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -19,41 +17,55 @@ limitations under the License.
 package v1
 
 import (
-	v1 "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/apis/operators/v1"
-	"github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/client/clientset/versioned/scheme"
+	http "net/http"
+
+	operatorsv1 "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/apis/operators/v1"
+	scheme "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/client/clientset/versioned/scheme"
 	rest "k8s.io/client-go/rest"
 )
 
-type OperatorsV1Interface interface {
+type PackagesV1Interface interface {
 	RESTClient() rest.Interface
 	PackageManifestsGetter
 }
 
-// OperatorsV1Client is used to interact with features provided by the operators.coreos.com group.
-type OperatorsV1Client struct {
+// PackagesV1Client is used to interact with features provided by the packages.operators.coreos.com group.
+type PackagesV1Client struct {
 	restClient rest.Interface
 }
 
-func (c *OperatorsV1Client) PackageManifests(namespace string) PackageManifestInterface {
+func (c *PackagesV1Client) PackageManifests(namespace string) PackageManifestInterface {
 	return newPackageManifests(c, namespace)
 }
 
-// NewForConfig creates a new OperatorsV1Client for the given config.
-func NewForConfig(c *rest.Config) (*OperatorsV1Client, error) {
+// NewForConfig creates a new PackagesV1Client for the given config.
+// NewForConfig is equivalent to NewForConfigAndClient(c, httpClient),
+// where httpClient was generated with rest.HTTPClientFor(c).
+func NewForConfig(c *rest.Config) (*PackagesV1Client, error) {
 	config := *c
-	if err := setConfigDefaults(&config); err != nil {
-		return nil, err
-	}
-	client, err := rest.RESTClientFor(&config)
+	setConfigDefaults(&config)
+	httpClient, err := rest.HTTPClientFor(&config)
 	if err != nil {
 		return nil, err
 	}
-	return &OperatorsV1Client{client}, nil
+	return NewForConfigAndClient(&config, httpClient)
 }
 
-// NewForConfigOrDie creates a new OperatorsV1Client for the given config and
+// NewForConfigAndClient creates a new PackagesV1Client for the given config and http client.
+// Note the http client provided takes precedence over the configured transport values.
+func NewForConfigAndClient(c *rest.Config, h *http.Client) (*PackagesV1Client, error) {
+	config := *c
+	setConfigDefaults(&config)
+	client, err := rest.RESTClientForConfigAndClient(&config, h)
+	if err != nil {
+		return nil, err
+	}
+	return &PackagesV1Client{client}, nil
+}
+
+// NewForConfigOrDie creates a new PackagesV1Client for the given config and
 // panics if there is an error in the config.
-func NewForConfigOrDie(c *rest.Config) *OperatorsV1Client {
+func NewForConfigOrDie(c *rest.Config) *PackagesV1Client {
 	client, err := NewForConfig(c)
 	if err != nil {
 		panic(err)
@@ -61,27 +73,25 @@ func NewForConfigOrDie(c *rest.Config) *OperatorsV1Client {
 	return client
 }
 
-// New creates a new OperatorsV1Client for the given RESTClient.
-func New(c rest.Interface) *OperatorsV1Client {
-	return &OperatorsV1Client{c}
+// New creates a new PackagesV1Client for the given RESTClient.
+func New(c rest.Interface) *PackagesV1Client {
+	return &PackagesV1Client{c}
 }
 
-func setConfigDefaults(config *rest.Config) error {
-	gv := v1.SchemeGroupVersion
+func setConfigDefaults(config *rest.Config) {
+	gv := operatorsv1.SchemeGroupVersion
 	config.GroupVersion = &gv
 	config.APIPath = "/apis"
-	config.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
+	config.NegotiatedSerializer = rest.CodecFactoryForGeneratedClient(scheme.Scheme, scheme.Codecs).WithoutConversion()
 
 	if config.UserAgent == "" {
 		config.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
-
-	return nil
 }
 
 // RESTClient returns a RESTClient that is used to communicate
 // with API server by this client implementation.
-func (c *OperatorsV1Client) RESTClient() rest.Interface {
+func (c *PackagesV1Client) RESTClient() rest.Interface {
 	if c == nil {
 		return nil
 	}

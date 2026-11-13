@@ -19,12 +19,11 @@ limitations under the License.
 package bundle
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
 	"github.com/pkg/errors"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v3"
 )
 
 // Maintainer describes a Chart maintainer.
@@ -125,7 +124,7 @@ func IsChartDir(dirName string) (bool, error) {
 		return false, errors.Errorf("no %s exists in directory %q", ChartfileName, dirName)
 	}
 
-	chartYamlContent, err := ioutil.ReadFile(chartYaml)
+	chartYamlContent, err := os.ReadFile(chartYaml)
 	if err != nil {
 		return false, errors.Errorf("cannot read %s in directory %q", ChartfileName, dirName)
 	}

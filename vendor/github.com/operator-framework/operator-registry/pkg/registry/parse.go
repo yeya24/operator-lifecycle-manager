@@ -74,7 +74,7 @@ func (b *bundleParser) addManifests(manifests fs.FS, bundle *Bundle) error {
 		}
 
 		obj := &unstructured.Unstructured{}
-		if err = decodeFileFS(manifests, name, obj); err != nil {
+		if err = decodeFileFS(manifests, name, obj, b.log); err != nil {
 			b.log.Warnf("failed to decode: %s", err)
 			continue
 		}
@@ -128,7 +128,7 @@ func (b *bundleParser) addMetadata(metadata fs.FS, bundle *Bundle) error {
 		name := f.Name()
 		if af == nil {
 			decoded := AnnotationsFile{}
-			if err = decodeFileFS(metadata, name, &decoded); err == nil {
+			if err = decodeFileFS(metadata, name, &decoded, b.log); err == nil {
 				if decoded != (AnnotationsFile{}) {
 					af = &decoded
 				}
@@ -136,7 +136,7 @@ func (b *bundleParser) addMetadata(metadata fs.FS, bundle *Bundle) error {
 		}
 		if df == nil {
 			decoded := DependenciesFile{}
-			if err = decodeFileFS(metadata, name, &decoded); err == nil {
+			if err = decodeFileFS(metadata, name, &decoded, b.log); err == nil {
 				if len(decoded.Dependencies) > 0 {
 					df = &decoded
 				}
@@ -144,7 +144,7 @@ func (b *bundleParser) addMetadata(metadata fs.FS, bundle *Bundle) error {
 		}
 		if pf == nil {
 			decoded := PropertiesFile{}
-			if err = decodeFileFS(metadata, name, &decoded); err == nil {
+			if err = decodeFileFS(metadata, name, &decoded, b.log); err == nil {
 				if len(decoded.Properties) > 0 {
 					pf = &decoded
 				}
@@ -157,6 +157,7 @@ func (b *bundleParser) addMetadata(metadata fs.FS, bundle *Bundle) error {
 		bundle.Package = af.Annotations.PackageName
 		bundle.Channels = af.GetChannels()
 	} else {
+		//nolint:staticcheck // ST1005: error message is intentionally capitalized
 		return fmt.Errorf("Could not find annotations file")
 	}
 
@@ -185,6 +186,7 @@ func (b *bundleParser) derivedProperties(bundle *Bundle) ([]Property, error) {
 		return nil, fmt.Errorf("bundle missing csv")
 	}
 
+	// nolint:prealloc
 	var derived []Property
 	if len(csv.GetAnnotations()) > 0 {
 		properties, ok := csv.GetAnnotations()[PropertyKey]
@@ -195,22 +197,28 @@ func (b *bundleParser) derivedProperties(bundle *Bundle) ([]Property, error) {
 		}
 	}
 
+	// nolint:nestif
+	// existing code triggering nested complexity, but at least will not make worse with release processing
 	if bundle.Annotations != nil && bundle.Annotations.PackageName != "" {
 		pkg := bundle.Annotations.PackageName
 		version, err := bundle.Version()
 		if err != nil {
 			return nil, err
 		}
-
+		release, err := bundle.Release()
+		if err != nil {
+			return nil, err
+		}
 		value, err := json.Marshal(PackageProperty{
 			PackageName: pkg,
 			Version:     version,
+			Release:     release,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal package property: %s", err)
 		}
 
-		// Annotations file takes precedent over CSV annotations
+		// Annotations file takes precedence over CSV annotations
 		derived = append([]Property{{Type: PackageType, Value: value}}, derived...)
 	}
 
@@ -236,6 +244,7 @@ func (b *bundleParser) derivedProperties(bundle *Bundle) ([]Property, error) {
 
 // propertySet returns the deduplicated set of a property list.
 func propertySet(properties []Property) []Property {
+	// nolint:prealloc
 	var (
 		set     []Property
 		visited = map[string]struct{}{}

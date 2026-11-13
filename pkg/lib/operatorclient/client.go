@@ -1,15 +1,18 @@
-//go:generate go run github.com/golang/mock/mockgen -source client.go -destination operatorclientmocks/mock_client.go -package operatorclientmocks
+//go:generate go run go.uber.org/mock/mockgen -source client.go -destination operatorclientmocks/mock_client.go -package operatorclientmocks
 package operatorclient
 
 import (
 	"github.com/sirupsen/logrus"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	rbacv1ac "k8s.io/client-go/applyconfigurations/rbac/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -32,6 +35,7 @@ type ClientInterface interface {
 	ClusterRoleClient
 	DeploymentClient
 	ConfigMapClient
+	NetworkPolicyClient
 }
 
 // CustomResourceClient contains methods for the Custom Resource.
@@ -67,6 +71,7 @@ type SecretClient interface {
 
 // ServiceClient contains methods for manipulating Services
 type ServiceClient interface {
+	ApplyService(*corev1ac.ServiceApplyConfiguration, metav1.ApplyOptions) (*v1.Service, error)
 	CreateService(*v1.Service) (*v1.Service, error)
 	GetService(namespace, name string) (*v1.Service, error)
 	UpdateService(modified *v1.Service) (*v1.Service, error)
@@ -91,6 +96,7 @@ type RoleClient interface {
 
 // RoleBindingClient contains methods for manipulating RoleBindings.
 type RoleBindingClient interface {
+	ApplyRoleBinding(applyConfig *rbacv1ac.RoleBindingApplyConfiguration, applyOptions metav1.ApplyOptions) (*rbacv1.RoleBinding, error)
 	CreateRoleBinding(*rbacv1.RoleBinding) (*rbacv1.RoleBinding, error)
 	GetRoleBinding(namespace, name string) (*rbacv1.RoleBinding, error)
 	UpdateRoleBinding(modified *rbacv1.RoleBinding) (*rbacv1.RoleBinding, error)
@@ -107,6 +113,7 @@ type ClusterRoleClient interface {
 
 // ClusterRoleBindingClient contains methods for manipulating ClusterRoleBindings.
 type ClusterRoleBindingClient interface {
+	ApplyClusterRoleBinding(applyConfig *rbacv1ac.ClusterRoleBindingApplyConfiguration, applyOptions metav1.ApplyOptions) (*rbacv1.ClusterRoleBinding, error)
 	CreateClusterRoleBinding(*rbacv1.ClusterRoleBinding) (*rbacv1.ClusterRoleBinding, error)
 	GetClusterRoleBinding(name string) (*rbacv1.ClusterRoleBinding, error)
 	UpdateClusterRoleBinding(modified *rbacv1.ClusterRoleBinding) (*rbacv1.ClusterRoleBinding, error)
@@ -134,6 +141,14 @@ type ConfigMapClient interface {
 	GetConfigMap(namespace, name string) (*v1.ConfigMap, error)
 	UpdateConfigMap(modified *v1.ConfigMap) (*v1.ConfigMap, error)
 	DeleteConfigMap(namespace, name string, options *metav1.DeleteOptions) error
+}
+
+// NetworkPolicyClient contains methods for the NetworkPolicy resource
+type NetworkPolicyClient interface {
+	CreateNetworkPolicy(*networkingv1.NetworkPolicy) (*networkingv1.NetworkPolicy, error)
+	GetNetworkPolicy(namespace, name string) (*networkingv1.NetworkPolicy, error)
+	UpdateNetworkPolicy(modified *networkingv1.NetworkPolicy) (*networkingv1.NetworkPolicy, error)
+	DeleteNetworkPolicy(namespace, name string, options *metav1.DeleteOptions) error
 }
 
 // Interface assertion.
@@ -167,25 +182,25 @@ func NewClientFromConfig(kubeconfig string, logger *logrus.Logger) ClientInterfa
 }
 
 func NewClientFromRestConfig(config *rest.Config) (client ClientInterface, err error) {
-	kubernetes, err := kubernetes.NewForConfig(config)
+	k8s, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return
 	}
 
-	apiextensions, err := apiextensions.NewForConfig(config)
+	apiext, err := apiextensions.NewForConfig(config)
 	if err != nil {
 		return
 	}
 
-	apiregistration, err := apiregistration.NewForConfig(config)
+	apireg, err := apiregistration.NewForConfig(config)
 	if err != nil {
 		return
 	}
 
 	client = &Client{
-		kubernetes,
-		apiextensions,
-		apiregistration,
+		k8s,
+		apiext,
+		apireg,
 	}
 
 	return

@@ -1,6 +1,4 @@
 /*
-Copyright Red Hat, Inc.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -19,25 +17,54 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"context"
+	context "context"
 	time "time"
 
-	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+	pkgoperatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	versioned "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
 	internalinterfaces "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/informers/externalversions/internalinterfaces"
-	v1alpha1 "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1alpha1"
+	operatorsv1alpha1 "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1alpha1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
 )
 
 // SubscriptionInformer provides access to a shared informer and lister for
-// Subscriptions.
+// Subscriptions. Prefer using the type-safe variant (see [TypedSubscriptionInformer]).
 type SubscriptionInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1alpha1.SubscriptionLister
+	Lister() operatorsv1alpha1.SubscriptionLister
 }
+
+// TypedSubscriptionInformer provides access to a shared informer and lister for
+// Subscriptions, including the type-safe TypedInformer variant.
+// It is a superset of SubscriptionInformer.
+type TypedSubscriptionInformer interface {
+	Informer() cache.SharedIndexInformer
+	TypedInformer() SubscriptionIndexInformer
+	Lister() operatorsv1alpha1.SubscriptionLister
+}
+
+// SubscriptionIndexInformer is a wrapper around the underlying [cache.SharedIndexInformer]
+// with type-safe variants of several methods.
+type SubscriptionIndexInformer cache.TypedSharedIndexInformer[*pkgoperatorsv1alpha1.Subscription]
+
+// SubscriptionHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerFuncs] for Subscription.
+type SubscriptionHandlerFuncs = cache.TypedResourceEventHandlerFuncs[*pkgoperatorsv1alpha1.Subscription]
+
+// SubscriptionDetailedHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerDetailedFuncs] for Subscription.
+type SubscriptionDetailedHandlerFuncs = cache.TypedResourceEventHandlerDetailedFuncs[*pkgoperatorsv1alpha1.Subscription]
+
+// SubscriptionFilteringHandler is a specialization of [cache.TypedFilteringResourceEventHandler] for Subscription.
+type SubscriptionFilteringHandler = cache.TypedFilteringResourceEventHandler[*pkgoperatorsv1alpha1.Subscription]
+
+// SubscriptionIndexers is a specialization of [cache.TypedIndexers] for Subscription.
+type SubscriptionIndexers = cache.TypedIndexers[*pkgoperatorsv1alpha1.Subscription]
+
+// DeletedSubscription is a specialization of [cache.DeletedObject] for Subscription.
+type DeletedSubscription = cache.DeletedObject[*pkgoperatorsv1alpha1.Subscription]
 
 type subscriptionInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
@@ -48,43 +75,132 @@ type subscriptionInformer struct {
 // NewSubscriptionInformer constructs a new informer for Subscription type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedSubscriptionInformer]).
 func NewSubscriptionInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredSubscriptionInformer(client, namespace, resyncPeriod, indexers, nil)
+	return NewSubscriptionInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers})
+}
+
+// NewTypedSubscriptionInformer constructs a new informer for Subscription type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedSubscriptionInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers SubscriptionIndexers) SubscriptionIndexInformer {
+	return NewTypedSubscriptionInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers)})
 }
 
 // NewFilteredSubscriptionInformer constructs a new informer for Subscription type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedFilteredSubscriptionInformer]).
 func NewFilteredSubscriptionInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
-	return cache.NewSharedIndexInformer(
-		&cache.ListWatch{
-			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
+	return NewTypedSubscriptionInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers, TweakListOptions: tweakListOptions})
+}
+
+// NewTypedFilteredSubscriptionInformer constructs a new informer for Subscription type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedFilteredSubscriptionInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers SubscriptionIndexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) SubscriptionIndexInformer {
+	return NewTypedSubscriptionInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers), TweakListOptions: tweakListOptions})
+}
+
+// NewSubscriptionInformerWithOptions constructs a new informer for Subscription type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedSubscriptionInformerWithOptions]).
+func NewSubscriptionInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) cache.SharedIndexInformer {
+	return NewTypedSubscriptionInformerWithOptions(client, namespace, options)
+}
+
+// NewTypedSubscriptionInformerWithOptions constructs a new informer for Subscription type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedSubscriptionInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) SubscriptionIndexInformer {
+	gvr := schema.GroupVersionResource{Group: "operators.coreos.com", Version: "v1alpha1", Resource: "subscriptions"}
+	identifier := options.InformerName.WithResource(gvr)
+	tweakListOptions := options.TweakListOptions
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1alpha1.Subscription](cache.NewSharedIndexInformerWithOptions(
+		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
+			ListFunc: func(opts v1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.OperatorsV1alpha1().Subscriptions(namespace).List(context.TODO(), options)
+				return client.OperatorsV1alpha1().Subscriptions(namespace).List(context.Background(), opts)
 			},
-			WatchFunc: func(options v1.ListOptions) (watch.Interface, error) {
+			WatchFunc: func(opts v1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.OperatorsV1alpha1().Subscriptions(namespace).Watch(context.TODO(), options)
+				return client.OperatorsV1alpha1().Subscriptions(namespace).Watch(context.Background(), opts)
 			},
+			ListWithContextFunc: func(ctx context.Context, opts v1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.OperatorsV1alpha1().Subscriptions(namespace).List(ctx, opts)
+			},
+			WatchFuncWithContext: func(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.OperatorsV1alpha1().Subscriptions(namespace).Watch(ctx, opts)
+			},
+		}, client),
+		&pkgoperatorsv1alpha1.Subscription{},
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: options.ResyncPeriod,
+			Indexers:     options.Indexers,
+			Identifier:   identifier,
 		},
-		&operatorsv1alpha1.Subscription{},
-		resyncPeriod,
-		indexers,
-	)
+	))
 }
 
 func (f *subscriptionInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredSubscriptionInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+	return NewTypedSubscriptionInformerWithOptions(client, f.namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, InformerName: f.factory.InformerName(), TweakListOptions: f.tweakListOptions})
 }
 
 func (f *subscriptionInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&operatorsv1alpha1.Subscription{}, f.defaultInformer)
+	return f.TypedInformer()
 }
 
-func (f *subscriptionInformer) Lister() v1alpha1.SubscriptionLister {
-	return v1alpha1.NewSubscriptionLister(f.Informer().GetIndexer())
+func (f *subscriptionInformer) TypedInformer() SubscriptionIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1alpha1.Subscription](f.factory.InformerFor(&pkgoperatorsv1alpha1.Subscription{}, f.defaultInformer))
+}
+
+func (f *subscriptionInformer) Lister() operatorsv1alpha1.SubscriptionLister {
+	return operatorsv1alpha1.NewSubscriptionLister(f.Informer().GetIndexer())
+}
+
+// ToTypedSubscriptionInformer converts an untyped informer into a TypedSubscriptionInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *Subscription. If that is not the case, calling type-safe methods of the returned
+// TypedSubscriptionInformer leads to runtime panics. A safer alternative is to pass
+// around a TypedSubscriptionInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToTypedSubscriptionInformer(informer SubscriptionInformer) TypedSubscriptionInformer {
+	if informer, ok := informer.(TypedSubscriptionInformer); ok {
+		return informer
+	}
+	return &subscriptionTypedInformerAdapter{informer}
+}
+
+type subscriptionTypedInformerAdapter struct {
+	SubscriptionInformer
+}
+
+func (a *subscriptionTypedInformerAdapter) TypedInformer() SubscriptionIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1alpha1.Subscription](a.Informer())
+}
+
+// ToSubscriptionIndexInformer converts an untyped informer into a SubscriptionIndexInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *Subscription. If that is not the case, calling type-safe methods of the returned
+// SubscriptionIndexInformer leads to runtime panics. A safer alternative is to pass
+// around a SubscriptionIndexInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToSubscriptionIndexInformer(informer cache.SharedIndexInformer) SubscriptionIndexInformer {
+	if informer, ok := informer.(SubscriptionIndexInformer); ok {
+		return informer
+	}
+	return cache.NewTypedSharedIndexInformer[*pkgoperatorsv1alpha1.Subscription](informer)
 }

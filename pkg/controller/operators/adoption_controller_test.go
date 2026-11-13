@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -80,10 +81,6 @@ var _ = Describe("Adoption Controller", func() {
 						Spec: &operatorsv1alpha1.SubscriptionSpec{
 							Package: "poultry",
 						},
-						Status: operatorsv1alpha1.SubscriptionStatus{
-							InstalledCSV: "turkey",
-							LastUpdated:  metav1.Now(),
-						},
 					}
 					sub.SetNamespace(ns.GetName())
 					sub.SetName(sub.Spec.Package)
@@ -94,13 +91,14 @@ var _ = Describe("Adoption Controller", func() {
 					created = append(created, sub)
 
 					// Set the Subscription's status separately
-					status := sub.DeepCopy().Status
 					Eventually(func() error {
 						if err := k8sClient.Get(ctx, testobj.NamespacedName(sub), sub); err != nil {
 							return err
 						}
-						sub.Status = status
-
+						sub.Status = operatorsv1alpha1.SubscriptionStatus{
+							InstalledCSV: "turkey",
+							LastUpdated:  metav1.Now(),
+						}
 						return k8sClient.Status().Update(ctx, sub)
 					}, timeout, interval).Should(Succeed())
 
@@ -183,7 +181,6 @@ var _ = Describe("Adoption Controller", func() {
 				})
 
 				Context("that has an existing installed csv", func() {
-
 					var (
 						providedCRD *apiextensionsv1.CustomResourceDefinition
 					)
@@ -230,6 +227,7 @@ var _ = Describe("Adoption Controller", func() {
 					})
 
 					Context("with an existing provided CRD", func() {
+
 						BeforeEach(func() {
 							Eventually(func() error {
 								return k8sClient.Create(ctx, providedCRD)
@@ -245,6 +243,7 @@ var _ = Describe("Adoption Controller", func() {
 						})
 
 						Context("when its component label is removed", func() {
+
 							BeforeEach(func() {
 								Eventually(func() error {
 									latest := &apiextensionsv1.CustomResourceDefinition{}
@@ -352,6 +351,12 @@ var _ = Describe("Adoption Controller", func() {
 								),
 							}
 							for _, component := range components {
+								labels := component.GetLabels()
+								if labels == nil {
+									labels = map[string]string{}
+								}
+								labels[install.OLMManagedLabelKey] = install.OLMManagedLabelValue
+								component.SetLabels(labels)
 								Eventually(func() error {
 									return k8sClient.Create(ctx, component)
 								}, timeout, interval).Should(Succeed())

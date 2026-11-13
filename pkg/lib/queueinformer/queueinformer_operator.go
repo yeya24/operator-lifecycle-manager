@@ -3,18 +3,35 @@ package queueinformer
 import (
 	"context"
 	"fmt"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sync"
+	"time"
 
-	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/kubestate"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/tools/cache"
 )
 
-// Operator describes a Reconciler that manages a set of QueueInformers.
-type Operator interface {
+const (
+	defaultServerVersionInterval = 1 * time.Minute
+)
+
+// ExtensibleOperator describes a Reconciler that can be extended with additional informers and queue informers
+type ExtensibleOperator interface {
+	// RegisterQueueInformer registers the given QueueInformer with the Operator.
+	// This method returns an error if the Operator has already been started.
+	RegisterQueueInformer(queueInformer *QueueInformer) error
+
+	// RegisterInformer registers an informer with the Operator.
+	// This method returns an error if the Operator has already been started.
+	RegisterInformer(cache.SharedIndexInformer) error
+}
+
+// ObservableOperator describes a Reconciler whose state can be queried
+type ObservableOperator interface {
 	// Ready returns a channel that is closed when the Operator is ready to run.
 	Ready() <-chan struct{}
 
@@ -29,15 +46,12 @@ type Operator interface {
 
 	// HasSynced returns true if the Operator's Informers have synced, false otherwise.
 	HasSynced() bool
+}
 
-	// RegisterQueueInformer registers the given QueueInformer with the Operator.
-	// This method returns an error if the Operator has already been started.
-	RegisterQueueInformer(queueInformer *QueueInformer) error
-
-	// RegisterInformer registers an informer with the Operator.
-	// This method returns an error if the Operator has already been started.
-	RegisterInformer(cache.SharedIndexInformer) error
-
+// Operator describes a Reconciler that manages a set of QueueInformers.
+type Operator interface {
+	ObservableOperator
+	ExtensibleOperator
 	// RunInformers starts the Operator's underlying Informers.
 	RunInformers(ctx context.Context)
 
@@ -128,6 +142,12 @@ func (o *operator) RegisterInformer(informer cache.SharedIndexInformer) error {
 }
 
 func (o *operator) registerInformer(informer cache.SharedIndexInformer) {
+	// never double-register an informer
+	for i := range o.informers {
+		if o.informers[i] == informer {
+			return
+		}
+	}
 	o.informers = append(o.informers, informer)
 	o.addHasSynced(informer.HasSynced)
 }
@@ -186,6 +206,16 @@ func (o *operator) start(ctx context.Context) error {
 	go func() {
 		defer close(errs)
 		v, err := o.serverVersion.ServerVersion()
+		if err == nil {
+			o.logger.Infof("connection established. cluster-version: %v", v)
+			return
+		}
+		select {
+		case <-time.After(defaultServerVersionInterval):
+		case <-ctx.Done():
+			return
+		}
+		v, err = o.serverVersion.ServerVersion()
 		if err != nil {
 			select {
 			case errs <- errors.Wrap(err, "communicating with server failed"):
@@ -232,6 +262,13 @@ func (o *operator) worker(ctx context.Context, loop *QueueInformer) {
 	}
 }
 
+func keyForNamespacedName(item types.NamespacedName) string {
+	if item.Namespace == "" {
+		return item.Name
+	}
+	return item.String()
+}
+
 func (o *operator) processNextWorkItem(ctx context.Context, loop *QueueInformer) bool {
 	queue := loop.queue
 	item, quit := queue.Get()
@@ -244,48 +281,33 @@ func (o *operator) processNextWorkItem(ctx context.Context, loop *QueueInformer)
 	logger := o.logger.WithField("item", item)
 	logger.WithField("queue-length", queue.Len()).Trace("popped queue")
 
-	event, ok := item.(kubestate.ResourceEvent)
-	if !ok || event.Type() != kubestate.ResourceDeleted {
-		// Get the key
-		key, keyable := loop.key(item)
-		if !keyable {
-			logger.WithField("item", item).Warn("could not form key")
-			queue.Forget(item)
-			return true
-		}
+	key := keyForNamespacedName(item)
+	logger = logger.WithField("cache-key", key)
 
-		logger = logger.WithField("cache-key", key)
-
-		var resource interface{}
-		if loop.indexer == nil {
-			resource = event.Resource()
-		} else {
-			// Get the current cached version of the resource
-			var exists bool
-			var err error
-			resource, exists, err = loop.indexer.GetByKey(key)
-			if err != nil {
-				logger.WithError(err).Error("cache get failed")
-				queue.Forget(item)
-				return true
-			}
-			if !exists {
-				logger.WithField("existing-cache-keys", loop.indexer.ListKeys()).Debug("cache get failed, key not in cache")
-				queue.Forget(item)
-				return true
-			}
-		}
-
-		if !ok {
-			event = kubestate.NewResourceEvent(kubestate.ResourceUpdated, resource)
-		} else {
-			event = kubestate.NewResourceEvent(event.Type(), resource)
-		}
+	// Get the current cached version of the resource
+	var exists bool
+	var err error
+	resource, exists, err := loop.indexer.GetByKey(key)
+	if err != nil {
+		logger.WithError(err).Error("cache get failed")
+		queue.Forget(item)
+		return true
+	}
+	if !exists {
+		logger.WithField("existing-cache-keys", loop.indexer.ListKeys()).Debug("cache get failed, key not in cache")
+		queue.Forget(item)
+		return true
+	}
+	obj, ok := resource.(client.Object)
+	if !ok {
+		logger.Warn("cached object is not a kubernetes resource (client.Object)")
+		queue.Forget(item)
+		return true
 	}
 
-	// Sync and requeue on error (throw out failed deletion syncs)
-	err := loop.Sync(ctx, event)
-	if requeues := queue.NumRequeues(item); err != nil && requeues < 8 && event.Type() != kubestate.ResourceDeleted {
+	// Sync and requeue on error
+	err = loop.Sync(ctx, obj)
+	if requeues := queue.NumRequeues(item); err != nil && requeues < 8 {
 		logger.WithField("requeues", requeues).Trace("requeuing with rate limiting")
 		utilruntime.HandleError(errors.Wrap(err, fmt.Sprintf("sync %q failed", item)))
 		queue.AddRateLimited(item)

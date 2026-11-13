@@ -1,24 +1,22 @@
-name: ci
+name: unit
 on:
   push:
     branches:
       - master
   pull_request:
-    paths-ignore:
-    - '**/*.md'
+  workflow_dispatch:
+  merge_group:
+  issue_comment:
+    types: [created]  # Triggers the workflow when a comment is created. see `if` section
 jobs:
   unit:
+    if: >-
+      github.event_name != 'issue_comment' || startsWith(github.event.comment.body, '/retest unit')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-go@v2
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: '~1.16'
-      - name: Install Kubebuilder
-        run: |
-          os=$(go env GOOS)
-          arch=$(go env GOARCH)
-          curl -L https://github.com/kubernetes-sigs/kubebuilder/releases/download/v2.3.1/kubebuilder_2.3.1_${os}_${arch}.tar.gz | tar -xz -C /tmp/
-          sudo mv /tmp/kubebuilder_2.3.1_${os}_${arch} /usr/local/kubebuilder
+          go-version-file: "go.mod"
       - name: Run unit tests
         run: make unit

@@ -47,6 +47,21 @@ func IsMultipleExistingCRDOwnersError(err error) bool {
 	return false
 }
 
+type FatalError struct {
+	error
+}
+
+func NewFatalError(err error) FatalError {
+	return FatalError{err}
+}
+func IsFatal(err error) bool {
+	switch err.(type) {
+	case FatalError:
+		return true
+	}
+	return false
+}
+
 // GroupVersionKindNotFoundError occurs when we can't find an API via discovery
 type GroupVersionKindNotFoundError struct {
 	Group   string
@@ -56,4 +71,22 @@ type GroupVersionKindNotFoundError struct {
 
 func (g GroupVersionKindNotFoundError) Error() string {
 	return fmt.Sprintf("Unable to find GVK in discovery: %s %s %s", g.Group, g.Version, g.Kind)
+}
+
+// RetryableError indicates a temporary error that should be retried.
+// This is used for expected transient failures like pod disruptions during cluster upgrades.
+type RetryableError struct {
+	error
+}
+
+func NewRetryableError(err error) RetryableError {
+	return RetryableError{err}
+}
+
+func IsRetryable(err error) bool {
+	switch err.(type) {
+	case RetryableError:
+		return true
+	}
+	return false
 }

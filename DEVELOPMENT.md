@@ -15,10 +15,8 @@
 
 | Requirement | install docs         |
 |-------------|----------------------|
-| Minikube    | [Minikube docs]      |
 | Kind        | [Kind docs]          |
 
-[Minikube docs]: https://minikube.sigs.k8s.io/docs/start
 [Kind docs]: https://kind.sigs.k8s.io/docs/user/quick-start
 
 ### Usage
@@ -26,6 +24,8 @@
 #### Testing
 
 This project uses the built-in testing support for golang.
+
+Envtest is also used and needs to be set up. Follow [controller-runtime instructions] and set `KUBEBUILDER_ASSETS` environment variable to point to the installation directory, for instance: `/usr/local/kubebuilder/bin`.
 
 To run the tests for all go packages outside of the vendor directory, run:
 ```sh
@@ -38,7 +38,7 @@ To run the e2e tests locally:
 $ make e2e-local
 ```
 
-**NOTE:** Command `make e2e-local` supports Minikube and Kind environments. If you want to run the e2e tests on Minikube, you need to make sure Minikube is deployed in the local environment. If you want to run the e2e tests on Kind, you need to make sure Kind is deployed in the local environment and switch the kubeconfig to an existing Kind cluster.
+**NOTE:** If you want to run the e2e tests, you need to make sure Kind is deployed in the local environment and switch the kubeconfig to an existing Kind cluster.
 
 To run a specific e2e test locally:
 
@@ -46,11 +46,22 @@ To run a specific e2e test locally:
 $ make e2e-local TEST=TestCreateInstallPlanManualApproval
 ```
 
+##### Updating test images
+
+Sometimes you will need to update the index or bundle images used in the unit or e2e tests. To update those images, you will need to be logged into quay.io with membership in the `olmtest` organization. Then simply run `./scripts/build_e2e_test_images.sh` which will build all the required bundle images, push those to quay.io, build all the index images, and push those to quay.io as well.
+
+Please be aware that these scripts push directly to the image tags used by the actual e2e tests.
+
+The contents and Containerfiles of these bundles can be found in `./test/images/`.
+
+[controller-runtime instructions]: https://pkg.go.dev/sigs.k8s.io/controller-runtime/tools/setup-envtest#section-readme
+
 #### Building
 
-Ensure your version of go is up to date; check that you're running v1.9 with the
-command:
+Ensure your version of go is up to date; check that you're running the same version as in go.mod with the
+commands:
 ```sh
+$ head go.mod
 $ go version
 ```
 
